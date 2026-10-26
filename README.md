@@ -1,11 +1,11 @@
-# streammoe
+# streamoe
 
 **Big models. Small machines. Hard limits.**
 
-streammoe is a pure-Rust Mixture-of-Experts inference engine for Apple
+streamoe is a pure-Rust Mixture-of-Experts inference engine for Apple
 Silicon, built on one conviction: *the size of a model should not
 decide which machine can run it — your memory budget should.* You set a
-cap; streammoe plans every byte at open, streams experts from SSD
+cap; streamoe plans every byte at open, streams experts from SSD
 through a hot tier it manages itself, and never takes memory it did
 not plan for.
 
@@ -22,7 +22,7 @@ the same greedy choices as the MLX reference.
   <b>5.9 tok/s</b> · 3.73 GiB peak · <a href="#chat-page">more samples</a></sub>
 </p>
 
-> **Lineage.** streammoe grew out of
+> **Lineage.** streamoe grew out of
 > [moeflux](https://github.com/mdegans/moeflux), which grew out of
 > [flash-moe](https://github.com/danveloper/flash-moe); the revamp
 > started on the author's moeflux fork,
@@ -34,7 +34,7 @@ the same greedy choices as the MLX reference.
 > requests in flight, compact KV caches and vision input. Git
 > history keeps the whole lineage; see [Provenance](#provenance).
 >
-> **License.** streammoe is source-available: free for personal,
+> **License.** streamoe is source-available: free for personal,
 > academic and other noncommercial use; commercial use needs a license
 > from the author. Code inherited from moeflux and flash-moe stays MIT.
 > See [License](#license).
@@ -42,7 +42,7 @@ the same greedy choices as the MLX reference.
 ## Direction
 
 Inference engines usually ask *"how much memory does this model need?"*
-and stop there. streammoe turns the question around: *"here is the
+and stop there. streamoe turns the question around: *"here is the
 memory you may use — make the model fit, and make it fast."* Everything
 in the design follows from that inversion.
 
@@ -124,7 +124,7 @@ flowchart TB
 
 ### Memory: planned, not hoped for
 
-At open, streammoe sizes every account for the context you asked for —
+At open, streamoe sizes every account for the context you asked for —
 `n_ctx`, KV format, request slots, checkpoints, host buffers — and the
 expert hot tier takes exactly what is left. The plan for Qwen3.6-35B-A3B
 under a 4 GiB cap (n_ctx 4096, F32 KV), as measured on an M3 Pro:
@@ -672,7 +672,7 @@ quantized `kv_format`.
 
 ## Provenance
 
-streammoe is built on [mdegans/moeflux](https://github.com/mdegans/moeflux)
+streamoe is built on [mdegans/moeflux](https://github.com/mdegans/moeflux)
 (history up to moeflux `0.1.0-pre.4`, commit `a36ae3b`, is upstream's
 work). The revamp began on the author's fork,
 [transybao1393/moeflux](https://github.com/transybao1393/moeflux), where
@@ -683,21 +683,21 @@ was rewritten in Rust to the point of being a distinct codebase. The host-side e
 Rust on `metal-rs`; the original C/Objective-C functions served as
 differential oracles during that rewrite. The Metal
 streaming-experts kernels were authored by **Claude Opus 4.6**
-(Anthropic) for flash-moe and carry over here. streammoe adds the
+(Anthropic) for flash-moe and carry over here. streamoe adds the
 memory cap, streaming, pipeline, KV-format, vision and tooling work
 described above on top of that. The math is the same linear
-algebra every inference engine runs; what streammoe contributes is the
+algebra every inference engine runs; what streamoe contributes is the
 systems design around it — the memory contract, the tiering, the
 speculation that never changes the output, and the pipeline.
 
 ## License
 
-streammoe is licensed in two parts; [`NOTICE`](NOTICE) has the exact
+streamoe is licensed in two parts; [`NOTICE`](NOTICE) has the exact
 boundary.
 
 - **MIT** ([`LICENSE-MIT`](LICENSE-MIT)) — everything in the repository
   as of commit `7d73350`: the flash-moe and moeflux code it was built
-  on, and the streammoe work published under MIT up to that commit on
+  on, and the streamoe work published under MIT up to that commit on
   [transybao1393/moeflux](https://github.com/transybao1393/moeflux). Also
   `crates/streammoe-metal/` (vendored MLX and llama.cpp kernels; see its
   own `NOTICE`) and `paper/`. Check out `7d73350` for the MIT-only code.
@@ -712,7 +712,7 @@ and government bodies.
 or for work done for a business — needs a commercial license. Contact
 [@transybao1393](https://github.com/transybao1393).
 
-streammoe is source-available, not open source in the OSI sense. See
+streamoe is source-available, not open source in the OSI sense. See
 also [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
 
 ## Acknowledgements
@@ -720,13 +720,13 @@ also [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
 - **@danveloper** — for building the thing the hard way, writing it
   up, and publishing everything openly. moeflux started as flash-moe
   and git history reflects that.
-- **@mdegans** — for moeflux, the Rust rewrite streammoe builds on.
+- **@mdegans** — for moeflux, the Rust rewrite streamoe builds on.
 - **[transybao1393/moeflux](https://github.com/transybao1393/moeflux)**
   — the author's moeflux fork, where the revamp began: the memory cap,
   `F_NOCACHE` streaming and hot tier, the layer-range pipeline, KV
   formats, decode attention threads and the chat page were built and
   published there under MIT (up to commit `7d73350`) before development
-  moved to streammoe.
+  moved to streamoe.
 - **Claude Opus 4.6** — for the Metal streaming-experts kernels and
   the architecture that made all of this run.
 - **Anthropic** — for making Claude available to do work like this in
