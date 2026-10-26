@@ -16,7 +16,9 @@ moeflux. The code still uses the `moeflux` names until the rename.
   were public on the old fork under MIT. The vision work (`b356c5d`
   onward) was never on the old fork.
 - **Open tasks, in order:**
-  1. **License.** The user wants personal / academic use free and
+  1. **License.** *Drafted 2026-10-26 with PolyForm Noncommercial —
+     `LICENSE`, `LICENSE-MIT`, `NOTICE`, Cargo `license`, README;
+     awaiting the user's review.* The user wants personal / academic use free and
      commercial use only by them. Pick with the user: PolyForm
      Noncommercial 1.0.0 (recommended) or BSL 1.1 with a change date.
      The new license covers only commits after `7d73350`; upstream code
