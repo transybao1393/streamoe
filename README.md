@@ -98,13 +98,27 @@ larger than the shield — fast.
 
 <p align="center">
   <img src="docs/media/aegis-dataflow.svg" width="100%"
-       alt="AEGIS data flow, left to right: the application sends a prompt or image to Ctx and the budget plan, then attention, router, expert kernels and the LM head inside the red memory-cap rim, looping over 40 layers; the next token returns to the application. Below, the router's picks go to the adaptive guesser, which prefetches into the slot ring; the slot ring and the hot tier bind experts to the kernels; non-expert weights and the KV cache feed attention. Outside the rim, the SSD streams expert bytes into the slot ring with F_NOCACHE reads.">
+       alt="AEGIS data flow, left to right: the application sends a prompt to Ctx and the budget plan and an image to the vision encoder; tokens then pass through attention, router, expert kernels and the LM head inside the red memory-cap rim, looping over 40 layers, and the next token returns to the application. Below, the residual and the router's picks go to the adaptive guesser, which prefetches into the slot ring; the slot ring and the hot tier bind experts to the kernels; non-expert weights and the KV cache and linear-attention state feed attention. Outside the rim, the SSD streams missed and prefetched experts into the slot ring and the vision weights into the encoder, all with F_NOCACHE reads.">
 </p>
 
-Tokens (indigo) run left to right through each of the 40 layers and
-come back as the next token. The red rim is the memory cap: only the
-SSD sits outside it, and the only traffic across the rim is expert
-bytes coming in through the slot ring (grey).
+One decode step, by the numbers on the diagram:
+
+1. The application sends a prompt token to `Ctx` (an image goes to the
+   vision encoder first, which hands its embeddings to attention).
+2. Attention reads the non-expert weights and updates the KV cache or
+   the linear-attention state.
+3. The router picks 8 of 256 experts on the model's own logits.
+4. The adaptive layer guesses the next layer's experts from the
+   residual and prefetches them into the slot ring.
+5. Missed and prefetched experts stream in from the SSD with
+   `F_NOCACHE` reads — with the vision weights (once per image), the
+   only bytes that cross the red rim, the memory cap.
+6. The hot tier and the slot ring bind experts to the kernels in
+   place; hotter misses are admitted to the hot tier.
+7. The expert kernels run (hot experts first) and the step loops over
+   all 40 layers.
+8. The LM head turns the last hidden state into logits and the next
+   token goes back to the caller.
 
 ### G · Guarded: memory planned, not hoped for
 
