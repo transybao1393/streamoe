@@ -3,6 +3,7 @@ name = "streammoe-chat"
 version = "0.0.0"
 edition = "2021"
 publish = false
+default-run = "streammoe-chat"
 license = "MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0"
 description = "Local chat page for trying a streammoe model under a memory cap"
 
