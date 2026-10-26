@@ -17,6 +17,11 @@
 # Generated model files (recreate with scripts/ and repack_experts.py)
 model_weights.bin
 model_weights.json
+# Vision tower (tools/export_vision.py) and encoder reference data
+vision_weights.bin
+vision_weights.json
+*.rgb
+*.emb
 vocab.bin
 tokenizer.bin
 packed_experts/

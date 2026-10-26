@@ -129,8 +129,10 @@ Details — memory accounts, the per-token data path, phases — are in
 - `tools/` — model converters (`convert_olmoe.py`,
   `convert_cogito_v2.py`), a NumPy reference forward for OLMoE
   (`olmoe_ref.py`), an expert-cache simulator that replays routing
-  traces (`sim_expert_cache.py`), `gen_expert_index.py`, `chat/` (a
-  local chat page for Qwen3.6-35B-A3B under a cap), and
+  traces (`sim_expert_cache.py`), `gen_expert_index.py`,
+  `export_vision.py` (the Qwen3.5 / 3.6 vision tower for
+  `riir::vision`), `chat/` (a local chat page for Qwen3.6-35B-A3B under
+  a cap, with images and a live CPU / RAM bar), and
   `mlx_reference/` — the MLX reference diff harness
   (`crates/moeflux/tests/mlx_regression.rs` regenerates its goldens).
 - `docs/` — design notes and the upgrade plan.
@@ -256,6 +258,7 @@ python3 -I scripts/extract_weights.py --model $M/mlx-4bit --output $M/artifacts
 python3 -I scripts/export_vocab.py $M/mlx-4bit/tokenizer.json $M/artifacts/vocab.bin
 python3 -I tools/gen_expert_index.py --mlx-path $M/mlx-4bit --out $M/expert_index.json
 python3 -I repack_experts.py --index $M/expert_index.json --output-dir $M/root/packed_experts
+python3 -I tools/export_vision.py --model $M/mlx-4bit --out $M/artifacts   # optional: images
 ```
 
 Conversion needs Python with NumPy, peaks under 0.3 GiB of RAM and
@@ -267,6 +270,12 @@ n_ctx: 4096, max_checkpoints: 0, .. }` — or point the tests at it:
 ```bash
 export MOEFLUX_SMOKE_ARTIFACTS=$M/artifacts MOEFLUX_SMOKE_ROOT=$M/root MOEFLUX_SMOKE_MLX=$M/mlx-4bit
 ```
+
+`tests/mrope.rs` (multimodal positions) runs the model under a 3 GiB
+cap. `tests/vision.rs` checks the vision encoder against reference
+embeddings from transformers: set `MOEFLUX_VISION_DIR=$M/artifacts` and
+`MOEFLUX_VISION_REF` to a folder of `<name>.rgb` (resized RGB bytes),
+`<name>.emb` (f32 rows) and `meta.json` (`{name: {h, w}}`).
 
 The a3b oracle suites (`--include-ignored`) open the model *without* a
 cap and need ≥ 8 GiB reclaimable; `check_test_host.sh` says whether this
@@ -291,6 +300,36 @@ prefill speed, hot-tier hits and disk MiB per token. Thinking can be
 toggled. It defaults to the cross-layer guess with 6 experts prefetched
 (≈ 7 tok/s on a 115-token answer at a 4 GiB cap). Stop the server
 (Ctrl-C) to give the memory back.
+
+A bar under the header shows the process's CPU (as cores used), its
+memory against the cap with the peak, and the host's reclaimable
+memory, sampled every second; it keeps updating while an answer is
+generated. Each answer also reports its average CPU.
+
+**Images.** With `artifacts/vision_weights.bin` exported, an *Image…*
+button appears (paste works too). The page resizes the picture so both
+sides are multiples of 32 and the area is at most `--vision-max-pixels`
+(default 640 × 640 = 400 image tokens); the CPU vision encoder
+(`moeflux::riir::vision`, Accelerate GEMMs, `--vision-threads` default
+4) turns it into embeddings, and the model reads them at their M-RoPE
+positions (`Ctx::eval_stage_mrope`). The encoder streams its 0.85 GiB
+of BF16 weights from disk for each image and keeps 137 MiB of buffers,
+counted in the cap (`OpenConfig::host_buffers`). `--no-vision` turns it
+off. Measured at a 4 GiB cap on the M3 Pro:
+
+| Image | Image tokens | Encode | Prefill (whole turn) | Process memory | CPU (peak, whole run) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 448 × 320 | 140 | 1.1 s | 5.3 s | 3.69 GiB | ≤ 2.1 cores |
+| 512 × 512 | 256 | 1.9 s | 5.7 s | 3.69 GiB | ≤ 2.1 cores |
+| 640 × 640 (cap) | 400 | 3.2 s | 5.3 s | 3.71 GiB | ≤ 2.1 cores |
+
+Decode after an image runs at the usual speed. Scenes, colors, layout
+and counting work (a 2 × 2 color grid, five dots, shapes and their
+positions, a photo); reading small or short printed text is
+unreliable. MLX makes the same mistakes when given the same image
+embeddings (see `docs/known-issues.md`), so this comes from the model,
+not the engine. Larger images help: "7780" read correctly at 640 × 320
+and not at 512 × 256.
 
 ### Qwen3-30B-A3B
 

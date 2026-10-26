@@ -9,6 +9,18 @@
 - `tools/chat`: a local chat page for Qwen3.6-35B-A3B under a cap.
 - README guide for running Qwen3.6-35B-A3B on a small Mac, with measured
   memory and speed (≈ 5 tok/s at a 4 GiB cap on an M3 Pro).
+- Multimodal RoPE for Qwen3.5 / 3.6 (`MROPE_SECTION`, interleaved
+  `[11, 11, 10]`): `Ctx::eval_stage_mrope` takes per-token `[t, h, w]`
+  positions; CPU `apply_mrope` and the Metal `rope_n_tokens_mrope`
+  kernel. `[p, p, p]` rows are bit-identical to the plain path.
+- `riir::vision`: a CPU vision encoder for Qwen3.5 / 3.6 (Accelerate
+  GEMMs, weights streamed per matrix with `F_NOCACHE`, all buffers
+  preallocated and reported by `bytes()` for `host_buffers`), plus
+  `smart_resize` and `image_rope_positions`. Matches transformers'
+  `Qwen3_5MoeVisionModel` (cosine 1.000000 per row) and mlx_vlm (0.997,
+  bf16). `tools/export_vision.py` writes `vision_weights.{bin,json}`.
+- `tools/chat`: images (upload or paste) and a live CPU / RAM bar
+  (`/stats`, served while a turn runs).
 
 ### Fixed
 
