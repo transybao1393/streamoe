@@ -341,6 +341,9 @@ impl Chat {
         out.flush()?;
 
         let t1 = Instant::now();
+        let st0 = self.ctx.expert_io_stats();
+        let cpu_dec0 = cpu_secs();
+        let cpu_pre_cores = (cpu_dec0 - cpu0) / t_turn.elapsed().as_secs_f64();
         let mut generated: Vec<i32> = Vec::new();
         let mut shown = 0usize; // bytes of decoded text already sent
         let mut stop = "length";
@@ -381,8 +384,26 @@ impl Chat {
                    "hit_rate": h.hits as f64 / (h.hits + h.misses).max(1) as f64,
                    "resident": h.resident, "capacity": h.capacity})
         });
+        // Per decode token this turn: forward wall time, the part of it
+        // spent waiting on expert reads, and where the experts came from.
+        let per_tok = |a: u64, b: u64| (a - b) as f64 / generated.len().max(1) as f64;
+        let io = json!({
+            "forward_ms": per_tok(st.decode_ns, st0.decode_ns) / 1e6,
+            "io_wait_ms": per_tok(st.io_wait_ns, st0.io_wait_ns) / 1e6,
+            "demand_reads": per_tok(st.demand.reads, st0.demand.reads),
+            "prefetch_reads": per_tok(st.prefetch.reads, st0.prefetch.reads),
+            "prefetch_hits": per_tok(st.prefetch_hits, st0.prefetch_hits),
+            // Prefill this turn: total and expert-staging time, and CPU
+            // cores busy (process CPU time / wall) in each phase.
+            // (the counters were reset just before this turn's prefill).
+            "prefill_ms": st0.prefill_ns as f64 / 1e6,
+            "prefill_io_ms": st0.prefill_io_ns as f64 / 1e6,
+            "prefill_cpu_cores": cpu_pre_cores,
+            "decode_cpu_cores": (cpu_secs() - cpu_dec0) / decode_s.max(1e-9),
+        });
         let done = json!({
             "stop": stop,
+            "io": io,
             "tokens": generated.len(),
             "decode_secs": decode_s,
             "tok_s": generated.len() as f64 / decode_s.max(1e-9),
