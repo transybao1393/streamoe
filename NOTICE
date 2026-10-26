@@ -1,0 +1,65 @@
+streamoe — NOTICE
+=================
+
+Required Notice: Copyright 2026 transybao1393 (https://github.com/transybao1393)
+
+streamoe grew out of moeflux, which grew out of flash-moe. The
+repository is licensed in two parts. Git history marks the boundary.
+
+1. MIT License — see LICENSE-MIT
+--------------------------------
+
+  a. Everything in the repository as of commit 7d73350 (2026-10-26).
+     That covers:
+       - upstream history up to commit a36ae3b (moeflux 0.1.0-pre.4):
+         flash-moe by Dan Woods (https://github.com/danveloper/flash-moe)
+         and moeflux by Michael de Gans
+         (https://github.com/mdegans/moeflux), including the Metal
+         kernels authored by Claude Opus 4.6 / 4.7 (Anthropic);
+       - transybao1393's commits a36ae3b..7d73350, which were published
+         under the MIT License and remain under it.
+  b. crates/moeflux-metal/, including later changes to it. It vendors
+     MLX and llama.cpp kernel source under their MIT licenses; see
+     crates/moeflux-metal/NOTICE and crates/moeflux-metal/LICENSE.
+  c. paper/ — the flash-moe paper by Dan Woods.
+
+  To get the MIT-only code, check out commit 7d73350.
+
+2. PolyForm Noncommercial License 1.0.0 — see LICENSE
+-----------------------------------------------------
+
+  Every change made after commit 7d73350, outside the paths listed in
+  1b and 1c, by transybao1393. That includes the multimodal RoPE
+  (eval_stage_mrope), the vision encoder (riir/vision.rs),
+  tools/export_vision.py, image input in tools/chat, and all later work.
+
+  The PolyForm terms allow use for any noncommercial purpose: personal
+  study, research, experiment, testing, hobby projects, and use by
+  educational institutions, public research organizations, charities
+  and government institutions. Commercial use of this part requires a
+  separate commercial license from transybao1393.
+
+What this means for a copy of the current tree
+----------------------------------------------
+
+The current tree combines both parts. You may use the MIT parts under
+the MIT License. Using the tree as a whole — or any part covered by
+section 2 — for a commercial purpose needs a commercial license.
+
+Commercial licensing
+--------------------
+
+Contact transybao1393 through https://github.com/transybao1393.
+
+Other references
+----------------
+
+- riir/vision.rs is an independent Rust implementation of the Qwen3.5 /
+  Qwen3.6 vision tower, written to match the reference implementation
+  `Qwen3_5MoeVisionModel` in Hugging Face transformers
+  (https://github.com/huggingface/transformers, Apache License 2.0).
+  No transformers source is included.
+- Model weights are not part of this repository. Each model is
+  distributed under its own license, which applies to your use of it.
+- Parts of this code were written with AI assistance (Anthropic's
+  Claude); see CONTRIBUTORS.md.

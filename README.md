@@ -22,12 +22,14 @@ Macs.
 > The full design and phase plan is in
 > [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md); the
 > motivation is in
-> [`docs/moeflux fork proposed changes.md`](docs/moeflux%20fork%20proposed%20changes.md). The full design and phase plan is in
-> [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md); the
-> motivation is in
 > [`docs/moeflux fork proposed changes.md`](docs/moeflux%20fork%20proposed%20changes.md).
 > The revamp is in progress — see [Status](#status) for what exists
 > today and what is planned.
+>
+> **License.** streamoe is source-available: free for personal,
+> academic and other noncommercial use; commercial use needs a license
+> from the author. Code inherited from moeflux and flash-moe stays MIT.
+> See [License](#license).
 
 ## Goals
 
@@ -378,7 +380,27 @@ claimed as novel.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). See also [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
+streamoe is licensed in two parts; [`NOTICE`](NOTICE) has the exact
+boundary.
+
+- **MIT** ([`LICENSE-MIT`](LICENSE-MIT)) — everything in the repository
+  as of commit `7d73350`: the flash-moe and moeflux code it was built
+  on, and the streamoe work published under MIT up to that commit. Also
+  `crates/moeflux-metal/` (vendored MLX and llama.cpp kernels; see its
+  own `NOTICE`) and `paper/`. Check out `7d73350` for the MIT-only code.
+- **PolyForm Noncommercial 1.0.0** ([`LICENSE`](LICENSE)) — every change
+  after `7d73350`, starting with vision input, and all future work.
+
+**Free:** personal study, research, experiments, hobby projects, and
+use by schools, universities, public research organizations, charities
+and government bodies.
+
+**Commercial use** of the current tree — inside a product or service,
+or for work done for a business — needs a commercial license. Contact
+[@transybao1393](https://github.com/transybao1393).
+
+streamoe is source-available, not open source in the OSI sense. See
+also [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
 
 ## Acknowledgements
 

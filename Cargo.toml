@@ -10,9 +10,10 @@ members = [
 version       = "0.2.0-alpha.1"
 edition       = "2024"
 rust-version  = "1.89"
-license       = "MIT"
-repository    = "https://github.com/mdegans/moeflux"
+license       = "MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0"
+repository    = "https://github.com/transybao1393/streamoe"
 authors       = [
+    "transybao1393 <transybao93@gmail.com>",
     "Michael de Gans <michael.john.degans@gmail.com>",
     "Claude Opus 4.6 (Anthropic) <noreply@anthropic.com>",
     "Claude Opus 4.7 (Anthropic) <noreply@anthropic.com>",

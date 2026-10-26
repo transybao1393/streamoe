@@ -3,6 +3,7 @@ name = "moeflux-chat"
 version = "0.0.0"
 edition = "2021"
 publish = false
+license = "MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0"
 description = "Local chat page for trying a moeflux model under a memory cap"
 
 [dependencies]
