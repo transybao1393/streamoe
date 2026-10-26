@@ -174,6 +174,7 @@ impl GpuLmHead {
         encode_matvec(cmdbuf, &self.pipelines, wf_buf, &spec);
         cmdbuf.commit();
         cmdbuf.wait_until_completed();
+        crate::riir::backend::gpu::gpu_timing::record("lm_head", cmdbuf);
 
         // Read back into caller-supplied `logits`. Shared storage
         // means this is a memcpy out of the same pages the GPU just

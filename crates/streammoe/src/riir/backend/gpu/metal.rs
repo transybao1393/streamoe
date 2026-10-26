@@ -173,9 +173,9 @@ pub const ALL_KERNELS: &[&str] = &[
 /// Per-label cmdbuf submission stats. Aggregated under
 /// [`MetalContext::cmdbuf_stats`] via the labeled commit+wait wrapper.
 ///
-/// `gpu_ns` is reserved for a future port to a metal-rs version that
-/// surfaces `gpu_start_time` / `gpu_end_time`; for now it stays at
-/// zero and consumers should ignore it.
+/// `gpu_ns` is GPU execution time (`GPUEndTime − GPUStartTime`, read
+/// through the Objective-C runtime since metal-rs does not surface it;
+/// see [`super::gpu_timing`]).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CmdbufStat {
     pub count: u64,
@@ -371,6 +371,10 @@ impl MetalContext {
             );
         }
 
+        super::gpu_timing::record(label, cmdbuf);
+        let (gpu_start, gpu_end) = super::gpu_timing::gpu_span(cmdbuf);
+        let gpu_ns = ((gpu_end - gpu_start).max(0.0) * 1e9) as u64;
+
         let mut stats = self
             .cmdbuf_stats
             .lock()
@@ -378,6 +382,7 @@ impl MetalContext {
         let entry = stats.entry(label).or_default();
         entry.count += 1;
         entry.cpu_wait_ns += cpu_wait_ns;
+        entry.gpu_ns += gpu_ns;
     }
 
     /// Snapshot the per-label cmdbuf stats. Returns `(label, stat)`

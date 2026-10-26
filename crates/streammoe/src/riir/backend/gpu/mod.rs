@@ -14,6 +14,7 @@ pub mod encoder;
 pub mod gpu_ctx;
 pub mod gpu_matvec;
 pub mod gpu_norm;
+pub mod gpu_timing;
 pub mod metal;
 
 use super::buftype::Buf;

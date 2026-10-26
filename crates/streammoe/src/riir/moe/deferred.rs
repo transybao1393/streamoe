@@ -43,6 +43,7 @@
 
 use std::collections::VecDeque;
 
+use crate::riir::backend::gpu::gpu_timing;
 use crate::riir::backend::gpu::metal::{MetalContext, buffer_as_slice};
 use crate::riir::backend::{Backend as _, BufferPool as _, MetalBackend, MetalBufferPool};
 use crate::riir::moe::expert_forward::{
@@ -356,6 +357,7 @@ pub(crate) fn complete_deferred_experts_into(
         return Ok(());
     };
     state.cmd_buffer.wait_until_completed();
+    gpu_timing::record("moe.experts", &state.cmd_buffer);
     match state.mode {
         DeferredMode::Gpu => {
             hidden_out.copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
@@ -393,6 +395,7 @@ pub(crate) fn complete_deferred_experts_chained(
         return Ok(());
     };
     state.cmd_buffer.wait_until_completed();
+    gpu_timing::record("moe.experts_chained", &state.cmd_buffer);
     Ok(())
 }
 
@@ -468,6 +471,7 @@ fn cpu_combine(
 pub(crate) fn discard_deferred_experts_in(ring: &mut DeferredRing) {
     while let Some(state) = ring.pop_oldest() {
         state.cmd_buffer.wait_until_completed();
+        gpu_timing::record("moe.experts_discard", &state.cmd_buffer);
     }
 }
 
