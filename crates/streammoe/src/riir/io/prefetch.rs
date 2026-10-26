@@ -34,8 +34,11 @@
 //!   no shared file position).
 //! - **No aliasing of `data_prefetch[slot]`**: the K dispatched
 //!   tasks each get a *disjoint* slot pointer (one per slot index);
-//!   no GPU dispatch reads from `data_prefetch[slot]` until the
-//!   prefetch has been [`PrefetchState::wait_for`]ed.
+//!   no GPU dispatch reads from `data_prefetch[slot]` until that
+//!   slot has been waited for ([`PrefetchState::wait_slot`] or
+//!   [`PrefetchState::wait_for`]). Slots the layer does not bind (a
+//!   wrong guess) may still be in flight; the next dispatch into the
+//!   same set drains them before reusing their buffers.
 //! - **No use-after-free**: the drain points
 //!   ([`PrefetchState::wait_for`], [`PrefetchState::invalidate_all`],
 //!   [`PrefetchState::drain`], and [`PrefetchState`]'s `Drop` impl)
@@ -144,8 +147,37 @@ struct InFlight {
     loaded_indices: [i32; MAX_K],
     /// Number of K tasks dispatched (= K-active for the layer).
     k: usize,
-    /// Per-task completion channel.
-    rx: Receiver<Result<(), ExpertIoError>>,
+    /// Per-task completion channel: `(slot, result)`.
+    rx: Receiver<(usize, Result<(), ExpertIoError>)>,
+    /// Per-slot outcome received so far: `None` = still in flight.
+    done: [Option<bool>; MAX_K],
+    /// Completions not yet received.
+    pending: usize,
+}
+
+impl InFlight {
+    /// Receive one completion. `false` if the channel is gone (a
+    /// worker panicked), which leaves every pending slot failed.
+    fn recv_one(&mut self) -> bool {
+        match self.rx.recv() {
+            Ok((slot, r)) => {
+                self.done[slot] = Some(r.is_ok());
+                self.pending -= 1;
+                true
+            }
+            Err(_) => {
+                for d in self.done[..self.k].iter_mut().filter(|d| d.is_none()) {
+                    *d = Some(false);
+                }
+                self.pending = 0;
+                false
+            }
+        }
+    }
+
+    fn drain(&mut self) {
+        while self.pending > 0 && self.recv_one() {}
+    }
 }
 
 /// Result of [`PrefetchState::wait_for`] when a prefetch was both
@@ -339,10 +371,8 @@ impl PrefetchState {
 
     /// Drain the in-flight prefetch of one set, if any.
     fn drain_set(&mut self, set: usize) {
-        if let Some(in_flight) = self.in_flight[set].take() {
-            for _ in 0..in_flight.k {
-                let _ = in_flight.rx.recv();
-            }
+        if let Some(mut in_flight) = self.in_flight[set].take() {
+            in_flight.drain();
         }
     }
 
@@ -368,14 +398,9 @@ impl PrefetchState {
     /// set's in-flight slot is drained and consumed; the other set's
     /// (a lookahead for the next layer) is left running.
     pub fn wait_for(&mut self, layer_idx: usize) -> Option<PrefetchStatus> {
-        let in_flight = self.in_flight[layer_idx % 2].take()?;
-        let mut all_ok = true;
-        for _ in 0..in_flight.k {
-            match in_flight.rx.recv() {
-                Ok(Ok(())) => {}
-                _ => all_ok = false,
-            }
-        }
+        let mut in_flight = self.in_flight[layer_idx % 2].take()?;
+        in_flight.drain();
+        let all_ok = in_flight.done[..in_flight.k].iter().all(|d| *d == Some(true));
         if !all_ok || in_flight.target_layer != layer_idx {
             None
         } else {
@@ -384,6 +409,52 @@ impl PrefetchState {
                 k: in_flight.k,
             })
         }
+    }
+
+    /// Per-slot alternative to [`Self::wait_for`]: return what the
+    /// in-flight prefetch for `layer_idx` is loading *without waiting*,
+    /// so the caller can start its miss reads at once and then
+    /// [`Self::wait_slot`] only the slots it binds. Today's decode
+    /// layer reads ~3 prefetched and ~1.5 missed experts; issuing the
+    /// misses alongside the prefetch instead of after it saves ~0.27
+    /// ms per layer on the M3 Pro SSD (`tests/ssd_read_bench.rs`).
+    ///
+    /// A prefetch for another layer (stale) is drained and `None`
+    /// returned. The prefetch stays in flight otherwise; its unbound
+    /// slots are drained by the next dispatch into the same set (or by
+    /// [`Self::drain`]).
+    pub fn begin_layer(&mut self, layer_idx: usize) -> Option<PrefetchStatus> {
+        let set = layer_idx % 2;
+        match &self.in_flight[set] {
+            Some(f) if f.target_layer == layer_idx => Some(PrefetchStatus {
+                loaded_indices: f.loaded_indices,
+                k: f.k,
+            }),
+            Some(_) => {
+                self.drain_set(set);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Wait until prefetch buffer `buf_idx` of `layer_idx`'s in-flight
+    /// prefetch has landed. `true` if it read without error (its
+    /// buffer may be bound); `false` if it failed or no prefetch for
+    /// `layer_idx` is in flight — read the expert synchronously then.
+    pub fn wait_slot(&mut self, layer_idx: usize, buf_idx: usize) -> bool {
+        let Some(f) = self.in_flight[layer_idx % 2].as_mut() else {
+            return false;
+        };
+        if f.target_layer != layer_idx || buf_idx >= f.k {
+            return false;
+        }
+        while f.done[buf_idx].is_none() {
+            if !f.recv_one() {
+                break;
+            }
+        }
+        f.done[buf_idx] == Some(true)
     }
 
     /// Swap the per-layer predictions with `other` — a request switch
@@ -447,7 +518,7 @@ impl PrefetchState {
         }
         let set = target_layer % 2;
         self.drain_set(set);
-        let (tx, rx) = sync_channel::<Result<(), ExpertIoError>>(MAX_K);
+        let (tx, rx) = sync_channel::<(usize, Result<(), ExpertIoError>)>(MAX_K);
         let efp = ExpertFilesPtr::from_ref(expert_files);
         // Capture the K disjoint slot pointers BEFORE spawning;
         // the borrow checker's `data_prefetch: [&mut [u8]; MAX_K]`
@@ -460,7 +531,7 @@ impl PrefetchState {
             // Negative entries are slots the caller masked out (expert
             // already resident in the hot tier): nothing to read.
             if predicted[slot] < 0 {
-                let _ = tx.send(Ok(()));
+                let _ = tx.send((slot, Ok(())));
                 continue;
             }
             let expert_idx = predicted[slot] as usize;
@@ -473,7 +544,7 @@ impl PrefetchState {
                 let dst = unsafe { dst_ptr.as_mut_slice() };
                 let efs = unsafe { efp.as_ref() };
                 let r = efs.read_expert_disk_as(ReadKind::Prefetch, target_layer, expert_idx, dst);
-                let _ = tx.send(r);
+                let _ = tx.send((slot, r));
             });
         }
         self.in_flight[set] = Some(InFlight {
@@ -481,6 +552,8 @@ impl PrefetchState {
             loaded_indices: predicted,
             k,
             rx,
+            done: [None; MAX_K],
+            pending: k,
         });
     }
 }
@@ -533,12 +606,14 @@ mod tests {
         let mut st = PrefetchState::new(4, ExpertIoMode::Pread);
         assert!(!st.in_flight_for(1));
         let (tx, rx) = sync_channel(MAX_K);
-        tx.send(Ok(())).unwrap();
+        tx.send((0, Ok(()))).unwrap();
         st.in_flight[1] = Some(InFlight {
             target_layer: 1,
             loaded_indices: [7; MAX_K],
             k: 1,
             rx,
+            done: [None; MAX_K],
+            pending: 1,
         });
         assert!(st.in_flight_for(1));
         assert!(!st.in_flight_for(3), "same set, other layer");
@@ -554,5 +629,33 @@ mod tests {
     fn predict_for_out_of_range_layer_is_none() {
         let st = PrefetchState::new(2, ExpertIoMode::Pread);
         assert_eq!(st.predict_for(99), None);
+    }
+
+    #[test]
+    fn wait_slot_waits_only_for_the_bound_slot() {
+        use crate::riir::io::expert_io::ExpertIoError;
+        let mut st = PrefetchState::new(4, ExpertIoMode::Pread);
+        let (tx, rx) = sync_channel(MAX_K);
+        st.in_flight[0] = Some(InFlight {
+            target_layer: 2,
+            loaded_indices: std::array::from_fn(|i| if i < 3 { 5 + i as i32 } else { -1 }),
+            k: 3,
+            rx,
+            done: [None; MAX_K],
+            pending: 3,
+        });
+        let got = st.begin_layer(2).expect("prefetch for layer 2");
+        assert_eq!(got.loaded_indices[..3], [5, 6, 7]);
+        // Slot 2 lands first, slot 1 fails, slot 0 never arrives.
+        tx.send((2, Ok(()))).unwrap();
+        tx.send((1, Err(ExpertIoError::LayerFileMissing { layer: 2 }))).unwrap();
+        assert!(st.wait_slot(2, 2));
+        assert!(!st.wait_slot(2, 1));
+        assert!(!st.wait_slot(3, 2), "other layer");
+        assert!(st.in_flight_for(2), "unbound slot 0 still in flight");
+        // A stale prefetch is drained by begin_layer for another layer.
+        tx.send((0, Ok(()))).unwrap();
+        assert!(st.begin_layer(0).is_none());
+        assert!(!st.in_flight_for(2));
     }
 }

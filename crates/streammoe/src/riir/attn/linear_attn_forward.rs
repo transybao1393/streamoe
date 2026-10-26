@@ -2084,11 +2084,12 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                 }
             }
 
-            // 1. Drain any in-flight prefetch and check whether it
-            //    targeted THIS layer. Everything from here to the end
-            //    of the miss reads is I/O wait on the critical path.
+            // 1. What the in-flight prefetch for THIS layer is loading,
+            //    without waiting for it: the misses below start at once
+            //    and run alongside it. Everything from here to the last
+            //    bound slot landing is I/O wait on the critical path.
             let io_t0 = std::time::Instant::now();
-            let prefetch_status = prefetch.wait_for(layer_idx);
+            let prefetch_status = prefetch.begin_layer(layer_idx);
 
             // 2. Per-slot hit/miss decision. Set-based, not
             //    position-locked: the actual expert at slot `s` may
@@ -2112,10 +2113,6 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                     }
                 }
             }
-            let hot_count = hot_bind[..k].iter().filter(|b| b.is_some()).count() as u64;
-            prefetch.record_outcome(hit_count, k as u64 - hit_count - hot_count);
-            expert_files.counters().record_decode_layer(layer_idx, hot_count, hit_count);
-
             // 3. Parallel sync-pread the misses into data_synced.
             //    Hoist disjoint-slice array outside the rayon closure
             //    so the closure captures `[&mut [u8]; MAX_K]` (Send)
@@ -2137,6 +2134,21 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                         })
                 },
             )?;
+            // 3a. Wait for the prefetch slots this layer binds (wrong
+            //     guesses keep reading in the background). A slot that
+            //     failed is read synchronously instead.
+            for slot in 0..k {
+                if let SlotSource::Prefetched(buf_idx) = data_set_per_slot[slot] {
+                    if !prefetch.wait_slot(layer_idx, buf_idx) {
+                        expert_files.read_expert_disk(layer_idx, indices[slot] as usize, dsts[slot])?;
+                        data_set_per_slot[slot] = SlotSource::Synced;
+                        hit_count -= 1;
+                    }
+                }
+            }
+            let hot_count = hot_bind[..k].iter().filter(|b| b.is_some()).count() as u64;
+            prefetch.record_outcome(hit_count, k as u64 - hit_count - hot_count);
+            expert_files.counters().record_decode_layer(layer_idx, hot_count, hit_count);
             expert_files.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
 
             // 3b. Cross-layer guesses (plan phase 6): keep this layer's
