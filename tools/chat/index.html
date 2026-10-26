@@ -70,6 +70,18 @@ textarea {
 .row input[type=number] { width: 70px; font: inherit; padding: 3px 5px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
 .row .sp { flex: 1; }
 #settings { display: none; margin-top: 8px; }
+#sys {
+  display: flex; gap: 14px; flex-wrap: wrap; padding: 6px 16px; font-size: 12px;
+  color: var(--muted); border-bottom: 1px solid var(--line); background: var(--panel);
+  font-variant-numeric: tabular-nums;
+}
+#sys .meter { display: inline-flex; align-items: center; gap: 6px; }
+#sys .bar { width: 70px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+#sys .bar i { display: block; height: 100%; background: var(--accent); width: 0; }
+#sys .bar.hot i { background: var(--warn); }
+.msg.user img { display: block; max-width: 240px; max-height: 240px; border-radius: 8px; margin: 0 0 6px auto; }
+#attach-preview { display: none; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12.5px; color: var(--muted); }
+#attach-preview img { max-height: 56px; border-radius: 6px; border: 1px solid var(--line); }
 #settings textarea { min-height: 60px; font-size: 13px; }
 </style>
 </head>
@@ -80,11 +92,19 @@ textarea {
   <span class="sp"></span>
   <button id="newchat">New chat</button>
 </header>
+<div id="sys">
+  <span class="meter">CPU <span class="bar" id="cpu-bar"><i></i></span> <span id="cpu">–</span></span>
+  <span class="meter">RAM <span class="bar" id="ram-bar"><i></i></span> <span id="ram">–</span></span>
+  <span id="host">–</span>
+</div>
 <main id="scroll"><div id="log"></div></main>
 <footer>
   <div class="composer">
+    <div id="attach-preview"><img id="attach-img" alt=""><span id="attach-info"></span><button id="attach-clear">Remove</button></div>
     <textarea id="input" placeholder="Message the model — Enter to send, Shift+Enter for a new line" rows="2"></textarea>
     <div class="row">
+      <button id="attach" title="Attach an image" style="display:none">Image…</button>
+      <input type="file" id="file" accept="image/*" style="display:none">
       <label><input type="checkbox" id="think"> Thinking</label>
       <label>Temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
       <label>Max tokens <input type="number" id="maxtok" value="512" step="64" min="16"></label>
@@ -101,6 +121,8 @@ textarea {
 const $ = (id) => document.getElementById(id);
 const log = $("log"), scroll = $("scroll");
 let busy = false, started = false;
+let vision = null;   // {factor, min_pixels, max_pixels} when the server has an encoder
+let image = null;    // {w, h, rgb, url} of the attached, resized image
 
 function esc(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -141,6 +163,8 @@ async function refresh() {
   try {
     const r = await fetch("/info").then(r => r.json());
     window.modelName = `${r.info.model} · ${r.info.kv_format} KV`;
+    vision = r.info.vision;
+    $("attach").style.display = vision ? "" : "none";
     showMemory(r.memory);
   } catch (e) { $("status").textContent = "server not reachable"; }
 }
@@ -157,14 +181,51 @@ function render(el, text, think) {
   body.innerHTML = `<details class="think"${open}><summary>${end < 0 ? "Thinking…" : "Thoughts"}</summary>${esc(thought.trim())}</details>` + md(answer);
 }
 
+// Qwen2-VL smart_resize: sides multiples of `factor`, area in range.
+function smartResize(h, w, f, minPx, maxPx) {
+  const round = (x) => Math.max(f, Math.round(x / f) * f);
+  let hb = round(h), wb = round(w);
+  if (hb * wb > maxPx) {
+    const b = Math.sqrt(h * w / maxPx);
+    hb = Math.max(f, Math.floor(h / b / f) * f); wb = Math.max(f, Math.floor(w / b / f) * f);
+  } else if (hb * wb < minPx) {
+    const b = Math.sqrt(minPx / (h * w));
+    hb = Math.ceil(h * b / f) * f; wb = Math.ceil(w * b / f) * f;
+  }
+  return [hb, wb];
+}
+async function attach(file) {
+  const bmp = await createImageBitmap(file);
+  const [h, w] = smartResize(bmp.height, bmp.width, vision.factor, vision.min_pixels, vision.max_pixels);
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  g.imageSmoothingQuality = "high";
+  g.drawImage(bmp, 0, 0, w, h);
+  const px = g.getImageData(0, 0, w, h).data;
+  const rgb = new Uint8Array(w * h * 3);
+  for (let i = 0, j = 0; i < px.length; i += 4) { rgb[j++] = px[i]; rgb[j++] = px[i + 1]; rgb[j++] = px[i + 2]; }
+  let bin = "";
+  for (let i = 0; i < rgb.length; i += 0x8000) bin += String.fromCharCode.apply(null, rgb.subarray(i, i + 0x8000));
+  image = { w, h, rgb: btoa(bin), url: c.toDataURL("image/jpeg", 0.85) };
+  const tokens = (w / vision.factor) * (h / vision.factor);
+  $("attach-img").src = image.url;
+  $("attach-info").textContent = `${bmp.width}×${bmp.height} → ${w}×${h} · ${tokens} image tokens`;
+  $("attach-preview").style.display = "flex";
+}
+function clearImage() { image = null; $("attach-preview").style.display = "none"; $("file").value = "" }
+
 async function send() {
-  const text = $("input").value.trim();
-  if (!text || busy) return;
+  let text = $("input").value.trim();
+  if ((!text && !image) || busy) return;
+  if (!text) text = "Describe this image.";
   $("input").value = "";
-  const u = add("user"); u.querySelector(".body").textContent = text;
+  const img = image; clearImage();
+  const u = add("user");
+  if (img) { const el = document.createElement("img"); el.src = img.url; u.querySelector(".body").before(el); }
+  u.querySelector(".body").textContent = text;
   const a = add("assistant");
   const think = $("think").checked;
-  a.querySelector(".stats").textContent = "reading prompt…";
+  a.querySelector(".stats").textContent = img ? "looking at the image…" : "reading prompt…";
   setBusy(true);
   let out = "", prefill = null;
   const req = {
@@ -173,6 +234,7 @@ async function send() {
     max_tokens: parseInt($("maxtok").value, 10),
     top_p: think ? 0.95 : 0.8, top_k: 20,
     system: started ? "" : $("system").value.trim(),
+    image: img ? { w: img.w, h: img.h, rgb: img.rgb } : null,
   };
   started = true;
   try {
@@ -197,14 +259,18 @@ async function send() {
         const d = JSON.parse(data);
         const stick = atBottom();
         if (ev === "message") { out += d.t; render(a, out, think); }
-        else if (ev === "prefill") {
+        else if (ev === "vision") {
+          a.querySelector(".stats").textContent = `image ${d.w}×${d.h} → ${d.tokens} tokens in ${d.secs.toFixed(1)} s · reading prompt…`;
+        } else if (ev === "prefill") {
           prefill = d;
           a.querySelector(".stats").textContent = `prompt ${d.tokens} tok in ${d.secs.toFixed(1)} s · generating…`;
         } else if (ev === "done") {
           const hot = d.hot ? ` · hot-tier hits ${(d.hot.hit_rate * 100).toFixed(0)}%` : "";
           const disk = d.disk_mib_per_tok != null ? ` · ${d.disk_mib_per_tok.toFixed(0)} MiB/tok from disk` : "";
+          const imgs = d.image_tokens ? ` (${d.image_tokens} image)` : "";
+          const cpu = d.turn_cpu_pct != null ? ` · avg CPU ${d.turn_cpu_pct.toFixed(0)}%` : "";
           a.querySelector(".stats").textContent =
-            `${d.tokens} tok · ${d.tok_s.toFixed(1)} tok/s · prompt ${d.prefill_tokens} tok at ${d.prefill_tok_s.toFixed(0)} tok/s${hot}${disk}` +
+            `${d.tokens} tok · ${d.tok_s.toFixed(1)} tok/s · prompt ${d.prefill_tokens} tok${imgs} at ${d.prefill_tok_s.toFixed(0)} tok/s${hot}${disk}${cpu}` +
             (d.stop === "length" ? " · hit max tokens" : "");
           showMemory(d.memory);
           finished = true;
@@ -237,6 +303,36 @@ $("toggle-settings").onclick = (e) => {
   e.preventDefault();
   const s = $("settings"); s.style.display = s.style.display === "block" ? "none" : "block";
 };
+$("attach").onclick = () => $("file").click();
+$("file").onchange = (e) => { const f = e.target.files[0]; if (f) attach(f).catch(err => alert("image: " + err)); };
+$("attach-clear").onclick = clearImage;
+document.addEventListener("paste", (e) => {
+  if (!vision) return;
+  const it = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith("image/"));
+  if (it) { e.preventDefault(); attach(it.getAsFile()); }
+});
+// Live CPU / RAM, sampled by the server every second (answered even mid-turn).
+function meter(id, frac) {
+  const b = $(id); b.firstElementChild.style.width = Math.min(100, frac * 100) + "%";
+  b.classList.toggle("hot", frac > 0.85);
+}
+async function stats() {
+  try {
+    const s = await fetch("/stats").then(r => r.json());
+    if (s.cpu_pct != null) {
+      $("cpu").textContent = `${s.cpu_pct.toFixed(0)}% (${(s.cpu_pct / 100).toFixed(1)} of ${s.cores} cores)`;
+      meter("cpu-bar", s.cpu_pct / 100 / s.cores);
+    }
+    if (s.ram_gib != null) {
+      const cap = s.cap_gib ? ` / cap ${s.cap_gib.toFixed(2)}` : "";
+      $("ram").textContent = `${s.ram_gib.toFixed(2)}${cap} GiB · peak ${s.ram_peak_gib.toFixed(2)}`;
+      meter("ram-bar", s.cap_gib ? s.ram_gib / s.cap_gib : 0);
+    }
+    if (s.host_free_gib != null) $("host").textContent = `host reclaimable ${s.host_free_gib.toFixed(1)} GiB`;
+  } catch (e) {}
+}
+setInterval(stats, 1000);
+stats();
 refresh();
 $("input").focus();
 </script>
