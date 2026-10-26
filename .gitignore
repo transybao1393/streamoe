@@ -4,8 +4,10 @@
 *.swp
 *.swo
 
-# Claude Code per-user settings and agent worktrees (shared memory
-# notes stay tracked)
+# Claude Code: agent guide, session notes, per-user settings and
+# worktrees. Local working notes, not published.
+CLAUDE.md
+.claude/memory/
 .claude/settings.local.json
 .claude/worktrees/
 

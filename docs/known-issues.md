@@ -3,8 +3,8 @@
 What has been fixed, what is still open, and what to watch out for in
 the fork revamp (`docs/fork-upgrade-plan.md`). Add an entry when a bug
 is fixed or a trap is found; move open items to *Fixed* when they land.
-Older engine history (graph mode, prefill, kernels) is in
-`.claude/memory/`.
+Older engine history (graph mode, prefill, kernels) is in the git
+history of `.claude/memory/`, which is no longer tracked.
 
 ## Open
 
