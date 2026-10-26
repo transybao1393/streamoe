@@ -1,15 +1,28 @@
-# moeflux
+# streamoe
 
 Pure-Rust streaming-experts Mixture-of-Experts inference for Apple
-Silicon — **revamped** to run large MoE models inside a hard,
-user-set memory cap, on one Mac or across a small cluster of Macs.
+Silicon: run large MoE models — including their vision input — inside
+a hard, user-set memory cap, on one Mac or across a small cluster of
+Macs.
 
-> **This fork is a whole-system revamp.** It keeps moeflux's engine
-> and Metal kernels, and rebuilds everything around them: memory is
-> governed by a strict budget, experts stream from SSD through a
-> fixed-size hot tier with no OS page cache, a model can be split by
-> layer range across nodes, and several requests can share the
-> pipeline. The full design and phase plan is in
+> **streamoe grew out of [moeflux](https://github.com/mdegans/moeflux).**
+> It keeps moeflux's engine and Metal kernels and rebuilds everything
+> around them: memory is governed by a strict budget, experts stream
+> from SSD through a fixed-size hot tier with no OS page cache, a model
+> can be split by layer range across nodes, several requests can share
+> the pipeline, and Qwen3.5 / 3.6 can take images. Git history keeps
+> the whole lineage (flash-moe → moeflux → streamoe); see
+> [Provenance](#provenance).
+>
+> **Naming in the code.** The crates, binaries and Cargo features still
+> carry the `moeflux` name (`crates/moeflux`, `use moeflux::Ctx`,
+> `moeflux-node`); the rename to `streamoe` comes in a later release.
+> Commands and code below use the names as they are today.
+>
+> The full design and phase plan is in
+> [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md); the
+> motivation is in
+> [`docs/moeflux fork proposed changes.md`](docs/moeflux%20fork%20proposed%20changes.md). The full design and phase plan is in
 > [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md); the
 > motivation is in
 > [`docs/moeflux fork proposed changes.md`](docs/moeflux%20fork%20proposed%20changes.md).
@@ -32,7 +45,10 @@ user-set memory cap, on one Mac or across a small cluster of Macs.
 - **Router hook.** After routing, the engine hands each layer's
   picked experts and gate weights to a policy, which decides per
   expert whether to run it at 4-bit, run it at 2-bit, or skip it.
-  The policy can live outside moeflux; the engine exposes the hook.
+  The policy can live outside the engine; the engine exposes the hook.
+- **Vision input.** Qwen3.5 / 3.6 images run through a CPU vision
+  encoder whose buffers are counted in the cap, and reach the model at
+  their multimodal (M-RoPE) positions.
 - **Two modes, one code path.**
   - *Mode A — single node:* Mac mini M4 24 GB, experts on an external
     SSD, 10 GB cap.
@@ -139,7 +155,7 @@ Details — memory accounts, the per-token data path, phases — are in
 
 ## Status
 
-**Alpha** — `0.2.0-alpha.1`, the first release of the revamp, based on moeflux `0.1.0-pre.4`. APIs may still change; changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
+**Alpha** — `0.2.0-alpha.1` (unreleased changes since then in the changelog), based on moeflux `0.1.0-pre.4`. APIs may still change; changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
 
 | Area | State |
 | --- | --- |
@@ -155,6 +171,7 @@ Details — memory accounts, the per-token data path, phases — are in
 | Streaming improvements: telemetry (`ExpertIoStats`, CSV), bounded I/O (`io_queue_depth`, `io_bytes_per_sec`), in-place coalesced prefill reads, cross-layer guesses, lookahead prefetch, `fast_experts_dir` disk tier, `prefetch_experts` (prefetch width) | Implemented — Phase 6; knobs default off except `prefetch_experts` = 4 under a cap (measured on OLMoE-1B-7B, +4–15% tok/s); a3b/a17b model tests pending |
 | KV cache formats (`kv_format`: F32, F16, TurboQuant 4/3-bit; snapshot v4) | Implemented — F32 default; on OLMoE-1B-7B at a 3 GiB cap and n_ctx 4096, F16 / Turbo4 shrink KV 1.00 → 0.56 / 0.19 GiB (incl. prefill scratch) and decode +29% / +44% faster (the freed memory goes to the hot tier); answers correct in every format. MLA (Cogito) stays F32 |
 | Decode attention threads (`attn_threads`, default 4) | Implemented — bit-identical output; on OLMoE at 2.7k context decode +55–58% tok/s (F32 and Turbo4) |
+| Vision for Qwen3.5 / 3.6 (`riir::vision` CPU encoder, `eval_stage_mrope`, `tools/export_vision.py`) | Implemented — encoder matches transformers exactly and mlx_vlm to 0.997; whole pipeline checked layer by layer against MLX on a3b under a 4 GiB cap (encoder 137 MiB, ~1–3 s per image). Small printed text reads poorly, as it does in MLX |
 | Router policy, 2-bit | Planned — Phases 7–8 |
 
 Build with exactly one model feature (`model-qwen3-6-35b-a3b`,
@@ -345,15 +362,17 @@ quantized `kv_format`.
 
 ## Provenance
 
-moeflux began as a fork of
+streamoe is built on [mdegans/moeflux](https://github.com/mdegans/moeflux)
+(history up to moeflux `0.1.0-pre.4`, commit `a36ae3b`, is upstream's
+work). moeflux itself began as a fork of
 [danveloper/flash-moe](https://github.com/danveloper/flash-moe) and
-was rewritten in Rust by [mdegans/moeflux](https://github.com/mdegans/moeflux)
-to the point of being a distinct codebase. The host-side engine is
+was rewritten in Rust to the point of being a distinct codebase. The host-side engine is
 Rust on `metal-rs`; the original C/Objective-C functions served as
 differential oracles during that rewrite. The Metal
 streaming-experts kernels were authored by **Claude Opus 4.6**
-(Anthropic) for flash-moe and carry over here. This fork builds the
-revamp described above on top of that work. The math is the same
+(Anthropic) for flash-moe and carry over here. streamoe adds the
+memory cap, streaming, pipeline, KV-format, vision and tooling work
+described above on top of that. The math is the same
 linear algebra every inference engine runs — nothing here is
 claimed as novel.
 
@@ -366,7 +385,7 @@ MIT — see [`LICENSE`](LICENSE). See also [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
 - **@danveloper** — for building the thing the hard way, writing it
   up, and publishing everything openly. moeflux started as flash-moe
   and git history reflects that.
-- **@mdegans** — for the Rust rewrite this fork builds on.
+- **@mdegans** — for moeflux, the Rust rewrite streamoe builds on.
 - **Claude Opus 4.6** — for the Metal streaming-experts kernels and
   the architecture that made all of this run.
 - **Anthropic** — for making Claude available to do work like this in
