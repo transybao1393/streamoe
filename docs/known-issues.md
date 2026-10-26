@@ -10,7 +10,7 @@ Older engine history (graph mode, prefill, kernels) is in
 
 | Issue | Impact | Plan |
 | --- | --- | --- |
-| A 128-token decode after a ~130-token prompt goes over a 4 or 5 GiB cap (`OverBudget` in `eval_token`, footprint = cap). | The plan gives the hot tier everything left under the cap. On longer runs the unplanned footprint grows past the 512 MiB `runtime_overhead`. 8 tokens peak at 3.89 GiB; 48 tokens after a 25-token prompt fit. `eval_tokens` adds ~0.21 GiB of unplanned buffers (step sets, extra synced slots, rollback recurrence copies). | Find what grows (pool is flat at 0.83 GiB; likely driver / file-backed pages). Until then `runtime_overhead` 768 MiB fits (`spec_bench` default). Put the `eval_tokens` buffers in the plan. |
+| A 128-token decode after a ~130-token prompt goes over a 4 or 5 GiB cap (`OverBudget` in `eval_token`, footprint = cap). | The plan gives the hot tier everything left under the cap. On longer runs the unplanned footprint grows past the 512 MiB `runtime_overhead`. 8 tokens peak at 3.89 GiB; 48 tokens after a 25-token prompt fit. The multi-token buffers are now planned (`max_decode_tokens`, `multi_decode` account). | Find what grows (pool is flat at 0.83 GiB; likely driver / file-backed pages). Until then `runtime_overhead` 768 MiB fits (`spec_bench` default). |
 | Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) is slower than plain decode: 0.79× / 0.92× on rewrite / code prompts, 1.02× on free text (packed 3-bit, 4 GiB cap, `spec_bench`). Output is token-identical. | A verify pass of ~4 tokens costs ~425 ms in real use (310 ms in `verify_bench`, where every draft is right) and yields 2.4–2.9 tokens; break-even is ~310–370 ms. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; draft only on long matches. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
 | The uncapped a3b oracle suites and all a17b model tests have not run (this host has 5–7 GiB reclaimable; they need ≥ 8 GiB). | a3b runs under a 3–5 GiB cap: answers correct, argmax matches the MLX golden, top-20 overlap 20/20 (F32 KV) / 19/20 (Turbo4), peak within the cap (README, *Running Qwen3.6-35B-A3B on a small Mac*). Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are otherwise verified on OLMoE-1B-7B, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
@@ -222,7 +222,8 @@ Older engine history (graph mode, prefill, kernels) is in
 - **Parallel decoding pays; speculative decoding does not yet.**
   `batch_bench` (4 requests × 64 tokens, packed 3-bit): batches of
   2 / 3 / 4 give 1.18 / 1.12 / 1.25× total tok/s at a 5 GiB cap and
-  1.22 / 1.47 / 1.35× at 7 GiB (one run each), every output identical
+  1.22 / 1.47 / 1.35× at 7 GiB (one run each), 1.16–1.23 / 1.28–1.29 /
+  1.30–1.33× at 6 GiB (three runs), every output identical
   to one-at-a-time decode; each request then gets 3–5.7 tok/s instead
   of ~9. A bigger cap helps batches more than plain decode, since the
   pass's distinct experts hit RAM more. What a 4-token pass adds over

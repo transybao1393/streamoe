@@ -28,7 +28,7 @@ pub mod attn;
 pub mod backend;
 pub mod budget;
 pub mod config;
-mod decode_multi;
+pub(crate) mod decode_multi;
 pub mod gpu_capture;
 pub mod io;
 pub mod moe;
@@ -49,6 +49,7 @@ pub use io::embedding::{EmbeddingError, bf16_to_f32, embed_lookup};
 pub use io::expert_io::{ExpertFiles, ExpertIoError};
 pub use io::io_stats::{ExpertIoStats, GuessStats, LayerIoStats, ReadStats};
 pub use io::gpu_lm_head::{GpuLmHead, GpuLmHeadError};
+pub use decode_multi::MAX_DECODE_TOKENS;
 pub use moe::deferred::{DeferredError, DeferredRing, DeferredState};
 pub use moe::expert_forward::{
     ExpertForwardError, MAX_K, MoeBuffers, gpu_batched_experts_forward, gpu_expert_forward,
@@ -294,8 +295,11 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     layer_range: std::ops::Range<usize>,
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
-    /// Extra per-token buffers for [`Self::eval_tokens`], built on first use.
+    /// Extra per-token buffers for [`Self::eval_tokens`] /
+    /// [`Self::eval_requests`], built on first use.
     multi_decode: Option<decode_multi::MultiDecodeBuffers>,
+    /// [`OpenConfig::max_decode_tokens`]: the longest pass they fit.
+    max_decode_tokens: usize,
     /// S10b-2: run-lifetime scratch BufIds for the batched linear-attn
     /// `graph1` (allocated once at max chunk width, reused every step /
     /// layer). Built by [`Self::ensure_linear_resources`].
@@ -633,6 +637,12 @@ impl RsCtx<MetalBackend> {
                 budget::Account::Checkpoints,
                 (config.max_checkpoints * checkpoint_slot_bytes) as u64,
             );
+            if config.max_decode_tokens > 1 && VARIANT.attn_kind != variants::AttnKind::Mla {
+                plan.set(
+                    budget::Account::MultiDecode,
+                    budget::multi_decode_bytes(VARIANT, config.max_decode_tokens, expert_size as u64, &layer_range),
+                );
+            }
             if config.kv_format != KvFormat::F32 {
                 let reqs = config.max_requests.max(1) as u64;
                 let kv = budget::kv_bytes_per_token_fmt(VARIANT, &layer_range, config.kv_format);
@@ -749,6 +759,7 @@ impl RsCtx<MetalBackend> {
             layer_range,
             linear_buffers: None,
             multi_decode: None,
+            max_decode_tokens: config.max_decode_tokens,
             linear_attn_graph_scratch: None,
             full_attn_graph_scratch: None,
             moe_graph_scratch: None,

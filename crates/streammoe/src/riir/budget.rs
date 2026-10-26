@@ -68,6 +68,10 @@ pub enum Account {
     /// Batched-prefill scratch sized by the context's prefill chunk
     /// ([`prefill_scratch_bytes`]).
     PrefillScratch,
+    /// Buffers for multi-token decode passes
+    /// ([`crate::riir::OpenConfig::max_decode_tokens`],
+    /// [`multi_decode_bytes`]).
+    MultiDecode,
     /// Metal/driver/runtime overhead and scratch.
     RuntimeOverhead,
     /// RAM hot tier of experts (sized from what the cap leaves).
@@ -89,6 +93,7 @@ impl Account {
             Account::ExpertSlots => "expert_slots",
             Account::PrefillStaging => "prefill_staging",
             Account::PrefillScratch => "prefill_scratch",
+            Account::MultiDecode => "multi_decode",
             Account::RuntimeOverhead => "runtime_overhead",
             Account::HotTier => "hot_tier",
             Account::HostBuffers => "host_buffers",
@@ -159,6 +164,45 @@ pub fn linear_state_bytes_in(v: Variant, range: &Range<usize>) -> u64 {
     let conv = ((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim()) as u64;
     let ssm = (v.linear_num_v_heads * Variant::LINEAR_VALUE_DIM * Variant::LINEAR_KEY_DIM) as u64;
     2 * linear_layers * (conv + ssm) * f32b
+}
+
+/// Bytes one per-token step set (`LayerForwardBuffers::new_step_set`,
+/// no recurrence of its own) requests: mirrors `new_for_range` term
+/// for term.
+fn step_set_bytes(v: Variant) -> u64 {
+    let q_dim = v.num_attn_heads * v.head_dim;
+    let kv_dim = v.num_kv_heads * v.head_dim;
+    let floats = 6 * v.hidden_dim // input, normed, residual, h_mid, output, shared_out
+        + 2 * v.linear_conv_dim() // qkv, conv_output
+        + 2 * v.linear_total_value() // z, delta_output
+        + 4 * v.linear_num_v_heads // beta, alpha, g_decay, delta_beta
+        + v.num_experts // gate logits
+        + 2 // shared gate, sum_sq
+        + v.linear_total_value().max(q_dim) // o_proj input
+        + 3 * v.shared_intermediate // shared gate / up / act
+        + v.q_proj_dim()
+        + 2 * kv_dim
+        + 3 * q_dim // gpu_attn q / out / gate
+        + v.num_attn_heads * crate::riir::variants::GPU_KV_SEQ; // gpu_attn scores
+    (floats * std::mem::size_of::<f32>()) as u64
+}
+
+/// Bytes a multi-token decode pass of up to `tokens` tokens needs on
+/// top of single-token decode (`decode_multi::MultiDecodeBuffers`):
+/// `tokens - 1` step sets and GPU recurrence copies (for
+/// `rewind_tokens`), a combine-params buffer per token, and the miss
+/// slots past `MAX_K` that `tokens × K` routed experts can need
+/// (2 MiB-aligned, like [`Account::ExpertSlots`]). 0 for one token.
+/// `multi_decode_matches_pool` keeps it in step with the pool.
+pub fn multi_decode_bytes(v: Variant, tokens: usize, expert: u64, range: &Range<usize>) -> u64 {
+    if tokens < 2 {
+        return 0;
+    }
+    let t = tokens as u64;
+    let extra_slots = (tokens * v.num_experts_per_tok).saturating_sub(MAX_K) as u64;
+    (t - 1) * (step_set_bytes(v) + linear_state_bytes_in(v, range) / 2)
+        + t * 18 * std::mem::size_of::<f32>() as u64
+        + extra_slots * round_up(expert, TWO_MIB)
 }
 
 /// Bytes the batched-prefill scratch structs request from the pool
@@ -512,6 +556,35 @@ mod tests {
             let phys = pool.total_bytes();
             assert!(phys >= want && phys - want <= TWO_MIB, "chunk {chunk}: phys {phys} want {want}");
         }
+    }
+
+    /// `multi_decode_bytes` equals what `MultiDecodeBuffers` requests
+    /// from a real Metal pool (aligned slots counted rounded, as
+    /// planned).
+    #[test]
+    fn multi_decode_matches_pool() {
+        use crate::riir::LayerForwardBuffers;
+        use crate::riir::backend::MetalBufferPool;
+        use crate::riir::decode_multi::MultiDecodeBuffers;
+
+        let v = VARIANT;
+        if v.attn_kind == AttnKind::Mla {
+            return;
+        }
+        let device = metal::Device::system_default().expect("Metal device");
+        let range = 0..v.num_layers;
+        let expert = v.expert_size_4bit();
+        for t in 2..=crate::riir::MAX_DECODE_TOKENS {
+            let mut pool = MetalBufferPool::new(device.clone());
+            let main = LayerForwardBuffers::new(&mut pool);
+            let before = pool.requested_bytes();
+            let _m = MultiDecodeBuffers::new(&mut pool, &main, expert, t, &range);
+            let extra = (t * v.num_experts_per_tok).saturating_sub(MAX_K) as u64;
+            let rounding = extra * (round_up(expert as u64, TWO_MIB) - expert as u64);
+            let got = pool.requested_bytes() - before + rounding;
+            assert_eq!(got, multi_decode_bytes(v, t, expert as u64, &range), "tokens {t}");
+        }
+        assert_eq!(multi_decode_bytes(v, 1, expert as u64, &range), 0);
     }
 
     #[test]

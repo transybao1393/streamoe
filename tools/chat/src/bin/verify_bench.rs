@@ -104,8 +104,7 @@ fn main() {
         max_checkpoints: 0,
         prefetch_guess: PrefetchGuess::CrossLayer,
         prefetch_experts: Some(6),
-        // The T-token buffers are not in the budget plan yet.
-        runtime_overhead: 768 << 20,
+        max_decode_tokens: 4,
         ..OpenConfig::default()
     };
     let art = base.join("artifacts");

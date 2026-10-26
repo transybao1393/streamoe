@@ -55,8 +55,8 @@ pub(crate) struct MultiDecodeBuffers {
     /// route to up to `T × K` distinct experts in a layer.
     extra_synced: Vec<BufId<DeprecatedCogitoBuf>>,
     /// Linear-attention recurrence after token `t` of the last pass,
-    /// for `t < n - 1`: what [`RsCtx::rewind_tokens`] restores. Grown on
-    /// the first pass that needs another set (~63 MB each on a3b).
+    /// for `t < n - 1`: what [`RsCtx::rewind_tokens`] restores (~63 MB
+    /// each on a3b).
     rollback: Vec<Recurrence>,
     /// `(start_pos, n)` of the last pass, until it is rewound or another
     /// eval runs.
@@ -66,16 +66,26 @@ pub(crate) struct MultiDecodeBuffers {
 type Recurrence = (RangeVec<BufId<ConvStateBuf>>, RangeVec<BufId<DeltaStateBuf>>);
 
 impl MultiDecodeBuffers {
-    fn new(pool: &mut MetalBufferPool, main: &LayerForwardBuffers, expert_size: usize) -> Self {
+    /// Everything a pass of up to `tokens` tokens needs, for the
+    /// linear-attention layers in `range`. Sized exactly as
+    /// [`super::budget::multi_decode_bytes`] plans it.
+    pub(crate) fn new(
+        pool: &mut MetalBufferPool,
+        main: &LayerForwardBuffers,
+        expert_size: usize,
+        tokens: usize,
+        range: &std::ops::Range<usize>,
+    ) -> Self {
         const TWO_MIB: usize = 2 * 1024 * 1024;
-        let steps = (1..MAX_DECODE_TOKENS).map(|_| LayerForwardBuffers::new_step_set(pool, main)).collect();
-        let params = (0..MAX_DECODE_TOKENS)
+        let steps = (1..tokens).map(|_| LayerForwardBuffers::new_step_set(pool, main)).collect();
+        let params = (0..tokens)
             .map(|_| pool.alloc(18 * 4, "multi.combine_params", true).expect("pool.alloc multi.combine_params"))
             .collect();
-        let extra = (MAX_DECODE_TOKENS * VARIANT.num_experts_per_tok).saturating_sub(MAX_K);
+        let extra = (tokens * VARIANT.num_experts_per_tok).saturating_sub(MAX_K);
         let extra_synced =
             (0..extra).map(|_| pool.alloc_aligned(expert_size, TWO_MIB, "multi.data_synced", true)).collect();
-        Self { steps, params, extra_synced, rollback: Vec::new(), last_pass: None }
+        let rollback = (1..tokens).map(|_| alloc_recurrence(pool, range)).collect();
+        Self { steps, params, extra_synced, rollback, last_pass: None }
     }
 }
 
@@ -97,9 +107,10 @@ impl RsCtx<MetalBackend> {
     pub fn eval_tokens(&mut self, tokens: &[i32], start_pos: usize, logits: &mut [f32]) -> Result<(), RsError> {
         let v = VARIANT;
         let n = tokens.len();
-        if n > MAX_DECODE_TOKENS || logits.len() != n * v.vocab_size {
+        if logits.len() != n * v.vocab_size {
             return Err(RsError::EvalFailed);
         }
+        self.check_decode_tokens(n)?;
         if n <= 1 || matches!(v.attn_kind, variants::AttnKind::Mla) {
             for (t, (&tok, row)) in tokens.iter().zip(logits.chunks_mut(v.vocab_size)).enumerate() {
                 self.eval_token(tok, start_pos + t, 0, row)?;
@@ -120,6 +131,20 @@ impl RsCtx<MetalBackend> {
             self.experts.counters().record_decode(ns);
         }
         self.check_cap("eval_tokens")
+    }
+
+    /// A pass of `n` tokens must fit `OpenConfig::max_decode_tokens`:
+    /// its buffers are planned (and built) for that many.
+    fn check_decode_tokens(&self, n: usize) -> Result<(), RsError> {
+        if n > 1 && n > self.max_decode_tokens && !matches!(VARIANT.attn_kind, variants::AttnKind::Mla) {
+            return Err(RsError::InvalidConfig {
+                detail: format!(
+                    "a {n}-token pass needs OpenConfig::max_decode_tokens >= {n} (it is {})",
+                    self.max_decode_tokens
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Keep only the first `keep` tokens of the last [`Self::eval_tokens`]
@@ -173,9 +198,10 @@ impl RsCtx<MetalBackend> {
     pub fn eval_requests(&mut self, batch: &[(ReqId, i32, usize)], logits: &mut [f32]) -> Result<(), RsError> {
         let v = VARIANT;
         let n = batch.len();
-        if n == 0 || n > MAX_DECODE_TOKENS || logits.len() != n * v.vocab_size {
+        if n == 0 || logits.len() != n * v.vocab_size {
             return Err(RsError::EvalFailed);
         }
+        self.check_decode_tokens(n)?;
         let mut slots = Vec::with_capacity(n);
         for &(req, _, _) in batch {
             let slot = self.requests.slot_of(req).ok_or(RsError::UnknownRequest { req: req.0 })?;
@@ -221,20 +247,13 @@ impl RsCtx<MetalBackend> {
         self.ensure_linear_resources()?;
         if self.multi_decode.is_none() {
             let expert_size = self.experts.expert_size();
-            let Self { backend, linear_buffers, multi_decode, .. } = self;
+            let tokens = self.max_decode_tokens;
+            let Self { backend, linear_buffers, multi_decode, layer_range, .. } = self;
             let pool = backend.as_mut().expect("ensure_linear_resources").pool_mut();
             let main = linear_buffers.as_ref().expect("ensure_linear_resources");
-            *multi_decode = Some(MultiDecodeBuffers::new(pool, main, expert_size));
+            *multi_decode = Some(MultiDecodeBuffers::new(pool, main, expert_size, tokens, layer_range));
         }
-        {
-            let Self { backend, multi_decode, layer_range, .. } = self;
-            let pool = backend.as_mut().expect("ensure_linear_resources").pool_mut();
-            let multi = multi_decode.as_mut().expect("just built");
-            while slots.is_none() && multi.rollback.len() < n - 1 {
-                multi.rollback.push(alloc_recurrence(pool, layer_range));
-            }
-            multi.last_pass = None;
-        }
+        self.multi_decode.as_mut().expect("just built").last_pass = None;
         self.lend_staging_to_hot_tier();
         let k_active = self.k_active;
         let expert_io_mode = self.expert_io_mode;

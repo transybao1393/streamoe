@@ -76,9 +76,9 @@ fn main() {
         max_checkpoints: 0,
         prefetch_guess: PrefetchGuess::CrossLayer,
         prefetch_experts: Some(6),
-        // Above the 512 MiB default: the T-token buffers (~0.2 GiB) are
-        // not in the budget plan yet, and both modes get the same
-        // (smaller) hot tier.
+        max_decode_tokens: max_draft + 1,
+        // Above the 512 MiB default: long runs outgrow it (see
+        // docs/known-issues.md); both modes get the same hot tier.
         runtime_overhead: arg(&args, "--overhead-mib").map_or(768, |v| v.parse::<u64>().unwrap()) << 20,
         ..OpenConfig::default()
     };

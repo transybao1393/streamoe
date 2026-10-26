@@ -28,6 +28,10 @@
   perplexity, scored tasks against a reference run).
 - `STREAMMOE_GPU_TIMING`: GPU timestamps per command buffer;
   `CmdbufStat::gpu_ns` is now real GPU time.
+- `OpenConfig::max_decode_tokens` (default 1): the longest
+  `eval_tokens` / `eval_requests` pass. Its buffers are planned under
+  a cap (`multi_decode` account, 0.22 GiB at 4 on a3b, exact — a pool
+  test keeps the formula in step); a longer pass is refused.
 - `Ctx::eval_tokens`: decode with T ≤ 4 tokens in one forward pass —
   decode's kernels and expert streaming, each layer's attention for all
   T tokens in one command buffer, the experts of all T read once —

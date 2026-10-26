@@ -75,6 +75,7 @@ fn main() {
         kv_format: KvFormat::F32,
         max_checkpoints: 0,
         max_requests: N_REQ,
+        max_decode_tokens: N_REQ,
         prefetch_guess: PrefetchGuess::CrossLayer,
         prefetch_experts: Some(6),
         runtime_overhead: arg(&args, "--overhead-mib").map_or(768, |v| v.parse::<u64>().unwrap()) << 20,

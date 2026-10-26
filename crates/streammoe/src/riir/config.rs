@@ -190,6 +190,14 @@ pub struct OpenConfig {
     /// past this under a cap. Default
     /// [`crate::riir::DEFAULT_MAX_CHECKPOINTS`].
     pub max_checkpoints: usize,
+    /// Most tokens one [`crate::riir::RsCtx::eval_tokens`] /
+    /// [`crate::riir::RsCtx::eval_requests`] pass may take, 1..=4.
+    /// `1` (the default) turns multi-token passes off. Above 1, their
+    /// buffers — per-token step sets, extra expert slots, the
+    /// recurrence copies `rewind_tokens` restores — are planned under
+    /// `mem_cap` (`multi_decode` account, ~0.2 GiB at 4 on a3b) and
+    /// built on the first pass; a longer pass is refused.
+    pub max_decode_tokens: usize,
 }
 
 impl Default for OpenConfig {
@@ -215,6 +223,7 @@ impl Default for OpenConfig {
             kv_format: KvFormat::F32,
             attn_threads: DEFAULT_ATTN_THREADS,
             max_checkpoints: crate::riir::DEFAULT_MAX_CHECKPOINTS,
+            max_decode_tokens: 1,
         }
     }
 }
@@ -233,6 +242,13 @@ impl OpenConfig {
         }
         if self.max_requests == 0 {
             return Err("max_requests must be ≥ 1".into());
+        }
+        if !(1..=crate::riir::MAX_DECODE_TOKENS).contains(&self.max_decode_tokens) {
+            return Err(format!(
+                "max_decode_tokens {} out of range 1..={}",
+                self.max_decode_tokens,
+                crate::riir::MAX_DECODE_TOKENS
+            ));
         }
         if self.prefill_chunk == Some(0) {
             return Err("prefill_chunk must be ≥ 1".into());
