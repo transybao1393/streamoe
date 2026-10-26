@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>AEGIS data flow: one decode step inside the memory cap</title>
+  <style>
+    .bg { fill: #ffffff; }
+    .lbl { fill: #334155; font-size: 12px; }
+    .rim-lbl { fill: #b91c1c; font-size: 13px; font-weight: 700; letter-spacing: .04em; }
+    .legend { fill: #334155; font-size: 12px; }
+    .box-t { fill: #ffffff; font-size: 14px; font-weight: 700; }
+    .box-s { fill: #ffffff; font-size: 11.5px; opacity: .92; }
+    .flow { fill: none; stroke-width: 2.5; stroke-dasharray: 9 6; animation: dash 0.9s linear infinite; }
+    .flow.slow { animation-duration: 1.6s; }
+    .flow.thick { stroke-width: 5; stroke-dasharray: 12 7; animation-duration: 0.7s; }
+    .tok { stroke: #4f46e5; } .img { stroke: #0f766e; } .mem { stroke: #b45309; }
+    .ada { stroke: #7c3aed; } .ssd { stroke: #475569; }
+    @keyframes dash { to { stroke-dashoffset: -15; } }
+    @keyframes glow { 0%, 100% { stroke-opacity: .35; } 50% { stroke-opacity: 1; } }
+    .rim { animation: glow 3s ease-in-out infinite; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .lbl, .legend { fill: #cbd5e1; }
+      .rim-lbl { fill: #f87171; }
+      .ssd { stroke: #94a3b8; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .flow, .rim { animation: none; }
+      .packet { display: none; }
+    }
+  </style>
+  <defs>
+    <marker id="a-tok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4f46e5"/></marker>
+    <marker id="a-img" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0f766e"/></marker>
+    <marker id="a-mem" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b45309"/></marker>
+    <marker id="a-ada" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker>
+    <marker id="a-ssd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-opacity=".25"/></filter>
+  </defs>
+
+  <rect class="bg" width="1280" height="640" rx="16"/>
+
+  <!-- G · the memory cap -->
+  <rect class="rim" x="180" y="34" width="880" height="536" rx="18" fill="#b91c1c" fill-opacity=".04" stroke="#b91c1c" stroke-width="4"/>
+  <text class="rim-lbl" x="200" y="60">G · GUARDED — THE MEMORY CAP</text>
+
+  <!-- flows (drawn under the boxes) -->
+  <path class="flow tok" d="M150,240 H206" marker-end="url(#a-tok)"/>
+  <path class="flow tok" d="M340,240 H386" marker-end="url(#a-tok)"/>
+  <path class="flow tok" d="M520,240 H556" marker-end="url(#a-tok)"/>
+  <path class="flow tok" d="M690,240 H726" marker-end="url(#a-tok)"/>
+  <path class="flow tok" d="M860,240 H896" marker-end="url(#a-tok)"/>
+  <path id="p-out" class="flow tok" d="M965,200 V16 H85 V191" marker-end="url(#a-tok)"/>
+  <path class="flow tok slow" d="M795,200 V172 H490 V196" marker-end="url(#a-tok)"/>
+
+  <path class="flow img" d="M275,200 V105 H386" marker-end="url(#a-img)"/>
+  <path class="flow img" d="M455,140 V196" marker-end="url(#a-img)"/>
+
+  <path class="flow mem slow" d="M300,440 V380 H430 V284" marker-end="url(#a-mem)"/>
+  <path class="flow mem slow" d="M480,440 V284" marker-end="url(#a-mem)" marker-start="url(#a-mem)"/>
+  <path class="flow mem" d="M700,500 H756" marker-end="url(#a-mem)"/>
+  <path class="flow mem" d="M700,470 H745 V284" marker-end="url(#a-mem)"/>
+  <path class="flow mem" d="M845,440 V284" marker-end="url(#a-mem)"/>
+
+  <path class="flow ada" d="M625,280 V326" marker-end="url(#a-ada)"/>
+  <path class="flow ada" d="M610,410 V436" marker-end="url(#a-ada)"/>
+
+  <path id="p-ssd" class="flow ssd thick" d="M1180,540 V552 H620 V526" marker-end="url(#a-ssd)"/>
+
+  <!-- packets riding the two main flows -->
+  <circle class="packet" r="5" fill="#a5b4fc" stroke="#4f46e5" stroke-width="2">
+    <animateMotion dur="3.2s" repeatCount="indefinite" path="M150,240 H965 V16 H85 V191"/>
+  </circle>
+  <circle class="packet" r="6" fill="#e2e8f0" stroke="#475569" stroke-width="2">
+    <animateMotion dur="2.2s" repeatCount="indefinite" path="M1180,540 V552 H620 V526"/>
+  </circle>
+
+  <!-- outside the cap -->
+  <g filter="url(#sh)">
+    <rect x="20" y="195" width="130" height="90" rx="12" fill="#4f46e5"/>
+    <text class="box-t" x="85" y="228" text-anchor="middle">Application</text>
+    <text class="box-s" x="85" y="248" text-anchor="middle">drama_llama</text>
+    <text class="box-s" x="85" y="264" text-anchor="middle">tools/chat</text>
+
+    <path d="M1100,436 a80,14 0 0 1 160,0 v92 a80,14 0 0 1 -160,0 z" fill="#475569"/>
+    <ellipse cx="1180" cy="436" rx="80" ry="14" fill="#64748b"/>
+    <text class="box-t" x="1180" y="478" text-anchor="middle">SSD</text>
+    <text class="box-s" x="1180" y="497" text-anchor="middle">every expert</text>
+    <text class="box-s" x="1180" y="513" text-anchor="middle">root/ · root-3bit/</text>
+  </g>
+
+  <!-- compute row -->
+  <g filter="url(#sh)">
+    <rect x="210" y="200" width="130" height="80" rx="12" fill="#b91c1c"/>
+    <text class="box-t" x="275" y="228" text-anchor="middle">Ctx + plan</text>
+    <text class="box-s" x="275" y="247" text-anchor="middle">every account sized</text>
+    <text class="box-s" x="275" y="263" text-anchor="middle">OverBudget at open</text>
+
+    <rect x="390" y="70" width="130" height="70" rx="12" fill="#0f766e"/>
+    <text class="box-t" x="455" y="98" text-anchor="middle">Vision encoder</text>
+    <text class="box-s" x="455" y="118" text-anchor="middle">CPU · image → tokens</text>
+
+    <rect x="390" y="200" width="130" height="80" rx="12" fill="#0f766e"/>
+    <text class="box-t" x="455" y="228" text-anchor="middle">Attention</text>
+    <text class="box-s" x="455" y="247" text-anchor="middle">linear · full · MLA</text>
+    <text class="box-s" x="455" y="263" text-anchor="middle">GPU + CPU heads</text>
+
+    <rect x="560" y="200" width="130" height="80" rx="12" fill="#0f766e"/>
+    <text class="box-t" x="625" y="228" text-anchor="middle">Router</text>
+    <text class="box-s" x="625" y="247" text-anchor="middle">top-8 of 256 on the</text>
+    <text class="box-s" x="625" y="263" text-anchor="middle">model's own logits</text>
+
+    <rect x="730" y="200" width="130" height="80" rx="12" fill="#0f766e"/>
+    <text class="box-t" x="795" y="228" text-anchor="middle">Expert kernels</text>
+    <text class="box-s" x="795" y="247" text-anchor="middle">4-bit · packed 3-bit</text>
+    <text class="box-s" x="795" y="263" text-anchor="middle">hot experts first</text>
+
+    <rect x="900" y="200" width="130" height="80" rx="12" fill="#0f766e"/>
+    <text class="box-t" x="965" y="228" text-anchor="middle">LM head</text>
+    <text class="box-s" x="965" y="247" text-anchor="middle">logits →</text>
+    <text class="box-s" x="965" y="263" text-anchor="middle">next token</text>
+  </g>
+
+  <!-- adaptive -->
+  <g filter="url(#sh)">
+    <rect x="540" y="330" width="140" height="80" rx="12" fill="#7c3aed"/>
+    <text class="box-t" x="610" y="358" text-anchor="middle">Adaptive</text>
+    <text class="box-s" x="610" y="377" text-anchor="middle">cross-layer guess</text>
+    <text class="box-s" x="610" y="393" text-anchor="middle">per-slot waits</text>
+  </g>
+
+  <!-- in-memory row -->
+  <g filter="url(#sh)">
+    <rect x="210" y="440" width="140" height="80" rx="12" fill="#b45309"/>
+    <text class="box-t" x="280" y="468" text-anchor="middle">Weights</text>
+    <text class="box-s" x="280" y="487" text-anchor="middle">non-expert, resident</text>
+    <text class="box-s" x="280" y="503" text-anchor="middle">1.29 GiB (a3b)</text>
+
+    <rect x="390" y="440" width="140" height="80" rx="12" fill="#b45309"/>
+    <text class="box-t" x="460" y="468" text-anchor="middle">KV cache</text>
+    <text class="box-s" x="460" y="487" text-anchor="middle">F32 · F16</text>
+    <text class="box-s" x="460" y="503" text-anchor="middle">Turbo4 · Turbo3</text>
+
+    <rect x="560" y="440" width="140" height="80" rx="12" fill="#b45309"/>
+    <text class="box-t" x="630" y="468" text-anchor="middle">Slot ring</text>
+    <text class="box-s" x="630" y="487" text-anchor="middle">synced +</text>
+    <text class="box-s" x="630" y="503" text-anchor="middle">2 prefetch sets</text>
+
+    <rect x="760" y="440" width="150" height="80" rx="12" fill="#b45309"/>
+    <text class="box-t" x="835" y="468" text-anchor="middle">Hot tier</text>
+    <text class="box-s" x="835" y="487" text-anchor="middle">LFU · zero-copy bind</text>
+    <text class="box-s" x="835" y="503" text-anchor="middle">+ lent prefill staging</text>
+  </g>
+
+  <!-- flow labels -->
+  <text class="lbl" x="525" y="12">next token · logits back to the caller</text>
+  <text class="lbl" x="283" y="98">image</text>
+  <text class="lbl" x="560" y="166">next layer · ×40</text>
+  <text class="lbl" x="310" y="374">weights</text>
+  <text class="lbl" x="486" y="314">read · append</text>
+  <text class="lbl" x="633" y="308">picks</text>
+  <text class="lbl" x="618" y="428">prefetch</text>
+  <text class="lbl" x="706" y="493">admit</text>
+  <text class="lbl" x="752" y="330">bind</text>
+  <text class="lbl" x="851" y="330">bind</text>
+  <text class="lbl" x="800" y="545">expert bytes in · F_NOCACHE pread</text>
+
+  <!-- legend -->
+  <g transform="translate(180,598)">
+    <rect width="14" height="14" rx="3" fill="#7c3aed"/><text class="legend" x="20" y="12">A · Adaptive</text>
+    <rect x="130" width="14" height="14" rx="3" fill="#0f766e"/><text class="legend" x="150" y="12">E · Expert (compute)</text>
+    <rect x="300" width="14" height="14" rx="3" fill="#b91c1c"/><text class="legend" x="320" y="12">G · Guarded</text>
+    <rect x="420" width="14" height="14" rx="3" fill="#b45309"/><text class="legend" x="440" y="12">I · In-memory</text>
+    <rect x="550" width="14" height="14" rx="3" fill="#475569"/><text class="legend" x="570" y="12">S · Streaming</text>
+    <rect x="680" width="14" height="14" rx="3" fill="#4f46e5"/><text class="legend" x="700" y="12">tokens</text>
+  </g>
+</svg>
