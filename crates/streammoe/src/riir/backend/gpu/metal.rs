@@ -373,6 +373,14 @@ impl MetalContext {
             );
         }
 
+        self.record_wait(label, cmdbuf, cpu_wait_ns);
+    }
+
+    /// Record a completed `cmdbuf` that the caller committed and waited
+    /// for itself (the deferred expert dispatch, the LM head): GPU time
+    /// and `cpu_wait_ns` under `label` in [`Self::cmdbuf_stats`], plus
+    /// the `STREAMMOE_GPU_TIMING` line.
+    pub fn record_wait(&self, label: &'static str, cmdbuf: &CommandBufferRef, cpu_wait_ns: u64) {
         super::gpu_timing::record(label, cmdbuf);
         let (gpu_start, gpu_end) = super::gpu_timing::gpu_span(cmdbuf);
         let gpu_ns = ((gpu_end - gpu_start).max(0.0) * 1e9) as u64;

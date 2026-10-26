@@ -1704,6 +1704,7 @@ impl RsCtx<MetalBackend> {
             )
         };
         moe::deferred::complete_deferred_experts_into(
+            metal,
             deferred,
             moe_buffers,
             buffer_pool,
@@ -3288,7 +3289,7 @@ impl RsCtx<MetalBackend> {
             }
 
             if deferred.is_full() {
-                moe::deferred::complete_deferred_experts_chained(deferred)
+                moe::deferred::complete_deferred_experts_chained(metal, deferred)
                     .map_err(|_| RsError::EvalFailed)?;
             }
             io::io_trace::mark('L', layer_idx);
@@ -3437,7 +3438,7 @@ impl RsCtx<MetalBackend> {
         // [layer 0 chained, layer 1 unchained] and the while-loop
         // drains layer 0 once. Generalizes to N layers.
         while deferred.len() > 1 {
-            moe::deferred::complete_deferred_experts_chained(deferred)
+            moe::deferred::complete_deferred_experts_chained(metal, deferred)
                 .map_err(|_| RsError::EvalFailed)?;
         }
         match output {
@@ -3448,6 +3449,7 @@ impl RsCtx<MetalBackend> {
                 // Mid-model range: the unchained last layer's combine
                 // output is the row the next range consumes.
                 moe::deferred::complete_deferred_experts_into(
+                    metal,
                     deferred,
                     moe_buffers,
                     buffer_pool,
@@ -3459,6 +3461,7 @@ impl RsCtx<MetalBackend> {
                 let lm_head_gpu = lm_head_gpu.as_ref().ok_or(RsError::EvalFailed)?;
                 let mut hidden_final = vec![0.0f32; v.hidden_dim];
                 moe::deferred::complete_deferred_experts_into(
+                    metal,
                     deferred,
                     moe_buffers,
                     buffer_pool,

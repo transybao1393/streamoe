@@ -104,3 +104,58 @@ fn decode_experts_packed_3bit_bit_identical_to_nibbles() {
     eprintln!("[packed-3bit] decode: {} outputs bit-identical; {} vs {} bytes per expert",
         a.len(), ExpertLayout::Q3.expert_size(), ExpertLayout::Q4.expert_size());
 }
+
+/// GPU time of one K-expert decode dispatch, 4-bit vs packed 3-bit, at
+/// a3b shapes. Synthetic experts; the timing does not depend on the
+/// values. Reports achieved weight bandwidth (M3 Pro: ~150 GB/s).
+///
+/// ```bash
+/// cargo test -p streammoe --features model-qwen3-6-35b-a3b --release \
+///     --test packed_3bit -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "GPU microbench"]
+fn decode_experts_gpu_time_4bit_vs_packed_3bit() {
+    let v = VARIANT;
+    let k = v.num_experts_per_tok;
+    let mut rng = Rng(0x3B17_DEC0_0002);
+    let (mut nib, mut packed) = (Vec::new(), Vec::new());
+    for _ in 0..k {
+        let (a, b) = expert_pair(&mut rng);
+        nib.extend(a);
+        packed.extend(b);
+    }
+    let h_post: Vec<f32> = (0..v.hidden_dim).map(|_| rng.unit()).collect();
+    let h_mid: Vec<f32> = (0..v.hidden_dim).map(|_| rng.unit()).collect();
+    let shared_out: Vec<f32> = (0..v.hidden_dim).map(|_| 0.1 * rng.unit()).collect();
+    let weights: Vec<f32> = (0..k).map(|i| 1.0 / (i + 2) as f32).collect();
+
+    let mut metal = MetalContext::new().expect("open Metal");
+    let mut pool = MetalBufferPool::new(metal.device().clone());
+    // Twice each, alternating: the first runs also warm the GPU clocks.
+    let cases = [("4-bit", ExpertLayout::Q4, &nib), ("packed 3-bit", ExpertLayout::Q3, &packed)];
+    for (name, layout, data) in cases.iter().chain(cases.iter()).copied() {
+        let mut bufs = MoeBuffers::new_for(&mut pool, layout);
+        let mut out = vec![0f32; v.hidden_dim];
+        let iters = 200;
+        for i in 0..iters + 20 {
+            if i == 20 {
+                metal.reset_cmdbuf_stats();
+            }
+            let payload = ExpertPayload {
+                h_post: &h_post,
+                h_mid: &h_mid,
+                shared_out: &shared_out,
+                expert_weights: &weights,
+                shared_gate_score: 0.3,
+            };
+            gpu_batched_experts_forward(&mut metal, &mut bufs, &pool, k as i32, data, payload, &mut out)
+                .expect("experts forward");
+        }
+        let st = metal.cmdbuf_stats().into_iter().find(|(l, _)| *l == "moe.experts_sync").expect("stats").1;
+        let ms = st.gpu_ns as f64 / 1e6 / iters as f64;
+        let bytes = (k * layout.expert_size()) as f64;
+        eprintln!("[packed-3bit] {name:>12}: {ms:.3} ms GPU per {k}-expert dispatch, {:.1} MB, {:.0} GB/s",
+            bytes / 1e6, bytes / (ms / 1e3) / 1e9);
+    }
+}

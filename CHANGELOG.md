@@ -28,6 +28,9 @@
   perplexity, scored tasks against a reference run).
 - `STREAMMOE_GPU_TIMING`: GPU timestamps per command buffer;
   `CmdbufStat::gpu_ns` is now real GPU time.
+- `MetalContext::record_wait`; `Ctx::cmdbuf_stats` now includes the
+  deferred expert dispatches and the LM head. An ignored expert-kernel
+  GPU-time bench in `tests/packed_3bit.rs`.
 - `STREAMMOE_IO_TRACE` + `tools/io_trace_report.py`: a timeline of
   expert reads and forward-pass phases, summarized as disk busy / idle
   time per phase (costs ~15% decode speed while on).

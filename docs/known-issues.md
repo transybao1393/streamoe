@@ -203,6 +203,20 @@ Older engine history (graph mode, prefill, kernels) is in
   four and 4.4 at most. Decode is bandwidth-bound — a3b at a 4 GiB cap
   reads ~330 MiB per token, ~75 ms of disk at 4.4 GB/s — so fewer bytes
   per token is what speeds it up.
+- **`Ctx::cmdbuf_stats` now counts every waited command buffer.**
+  It used to miss the deferred expert dispatch (`moe.experts_chained`,
+  `moe.experts`) and the LM head, ~37 of ~74 ms GPU per a3b decode
+  token, which made ~40 ms per token look unexplained. Their wait is
+  ~0 (done by the time the next layer drains them), so wall − waits −
+  I/O is CPU time that overlaps expert GPU work, not idle time.
+- **Expert kernels are not the decode bottleneck by themselves**
+  (`tests/packed_3bit.rs` `decode_experts_gpu_time_4bit_vs_packed_3bit`,
+  synthetic, warm GPU): one 8-expert dispatch takes 0.22 ms at 4-bit
+  (64 GB/s) and 0.21 ms packed 3-bit (52 GB/s — the byte unpacking
+  costs some efficiency, so 3-bit saves disk and RAM, not GPU time).
+  Inside decode the same dispatch takes ~0.75 ms: the GPU's slow
+  state between short bursts, not the kernel. The first, cold runs
+  in the bench take 0.56–0.62 ms.
 - Per-turn decode I/O in the chat log: `io` in each `[chat]` line gives
   forward ms per token, the I/O wait inside it, and demand / prefetch
   reads per token.

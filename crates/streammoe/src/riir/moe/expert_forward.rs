@@ -740,8 +740,7 @@ pub fn gpu_batched_experts_forward(
         payload,
         /* gpu_combine = */ true,
     )?;
-    cmdbuf.commit();
-    cmdbuf.wait_until_completed();
+    metal.commit_and_wait_labeled(&cmdbuf, "moe.experts_sync");
     hidden_out.copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
     Ok(())
 }

@@ -342,6 +342,7 @@ pub(crate) fn gpu_batched_experts_begin_mmap(
 /// CPU-side per `infer.m:4106..4129`:
 /// `hidden = h_mid + Σ_k weights[k] × out[k] + sigmoid(gate) × shared_out`.
 pub(crate) fn complete_deferred_experts_into(
+    metal: &MetalContext,
     ring: &mut DeferredRing,
     bufs: &MoeBuffers,
     buffer_pool: &MetalBufferPool,
@@ -356,8 +357,9 @@ pub(crate) fn complete_deferred_experts_into(
     let Some(state) = ring.pop_oldest() else {
         return Ok(());
     };
+    let t0 = std::time::Instant::now();
     state.cmd_buffer.wait_until_completed();
-    gpu_timing::record("moe.experts", &state.cmd_buffer);
+    metal.record_wait("moe.experts", &state.cmd_buffer, t0.elapsed().as_nanos() as u64);
     match state.mode {
         DeferredMode::Gpu => {
             hidden_out.copy_from_slice(&bufs.moe_hidden_to_vec(buffer_pool));
@@ -389,13 +391,15 @@ pub(crate) fn complete_deferred_experts_into(
 /// oldest entry. No readback. Used by the layer loop on iterations
 /// where the previous layer chained.
 pub(crate) fn complete_deferred_experts_chained(
+    metal: &MetalContext,
     ring: &mut DeferredRing,
 ) -> Result<(), DeferredError> {
     let Some(state) = ring.pop_oldest() else {
         return Ok(());
     };
+    let t0 = std::time::Instant::now();
     state.cmd_buffer.wait_until_completed();
-    gpu_timing::record("moe.experts_chained", &state.cmd_buffer);
+    metal.record_wait("moe.experts_chained", &state.cmd_buffer, t0.elapsed().as_nanos() as u64);
     Ok(())
 }
 
@@ -561,7 +565,7 @@ impl RsCtx<MetalBackend> {
             return Ok(());
         };
         let pool = backend.pool();
-        complete_deferred_experts_into(deferred, bufs, pool, hidden_out)
+        complete_deferred_experts_into(backend.metal(), deferred, bufs, pool, hidden_out)
     }
 
     /// Wait for the deferred GPU dispatch (so the persistent
