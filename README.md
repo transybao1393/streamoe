@@ -12,7 +12,7 @@ Guarded · In-memory · Streaming; see [Architecture](#architecture--aegis).
 Today that means a 35-billion-parameter vision-language model —
 Qwen3.6-35B-A3B, 19 GiB at 4-bit — answering questions about images
 in **4 GiB of RAM** on a shared laptop, at 6–9 tokens per second
-([Speed](#speed)), making the same greedy choices as the MLX reference.
+([Speed](#speed-at-a-glance)), making the same greedy choices as the MLX reference.
 
 <p align="center">
   <img src="docs/media/chat-image.gif" width="800"
@@ -74,7 +74,7 @@ in the design follows from that inversion.
   blind.
 
 Where it goes next: per-expert precision chosen at run time (4-bit,
-2-bit or skip, by a router policy outside the engine), a faster GPU
+packed 3-bit or skip, by a router policy outside the engine), a faster GPU
 side of decode, and more model families — see
 [Roadmap](#roadmap).
 
@@ -113,7 +113,7 @@ At open, streamoe sizes every account for the context you asked for —
 expert hot tier takes exactly what is left. Expert reads use
 `F_NOCACHE`, so the engine never grows the page cache and nothing else
 on the machine loses its file cache. The plan `tools/chat` prints at
-open for the [standard setup](#test-setup) with 4-bit experts and a
+open for the [standard setup](docs/benchmarks.md#test-setup) with 4-bit experts and a
 4 GiB cap:
 
 ```mermaid
@@ -131,7 +131,7 @@ pie showData
 ```
 
 With packed 3-bit experts the prefill staging shrinks to 0.33 GiB and
-the hot tier grows to 1.14 GiB. In the [speed runs](#speed) the peak
+the hot tier grows to 1.14 GiB. In the [speed runs](docs/benchmarks.md#speed) the peak
 stayed 0.26–0.31 GiB under every cap (2.7 / 3.7 / 4.7 / 5.7 GiB at
 3 / 4 / 5 / 6 GiB). One known exception: very long runs can outgrow the
 0.5 GiB runtime allowance — open in
@@ -164,7 +164,7 @@ stateDiagram-v2
     class D decode
 ```
 
-In the [standard setup](#test-setup) (4-bit experts, 4 GiB cap) this
+In the [standard setup](docs/benchmarks.md#test-setup) (4-bit experts, 4 GiB cap) this
 lifts hot-tier hits from 51 / 22 / 42% to 59 / 34 / 54% on the three
 test prompts and decode from 6.9 to 7.4 tok/s (+7%).
 `STREAMMOE_HOT_LEND=0` turns it off.
@@ -193,8 +193,8 @@ flowchart LR
 ```
 
 Against 4-bit: KL 0.048, the same top token 93% of the time, all 10
-scored tasks right (`tools/chat` `quality` bin). 2-bit broke tool calls, maths, JSON and code, so it
-is not offered.
+scored tasks right (`tools/chat` `quality` bin). 2-bit broke tool
+calls, maths, JSON and code, so it is not offered.
 
 ### A + S · One layer of decode
 
@@ -234,44 +234,20 @@ On Qwen3.6-35B-A3B (40 layers, 256 experts, 8 picked per token) the
 cross-layer guess with 6 experts prefetched uses 78–121 prefetched
 experts per token instead of 13–35 with the previous-token guess, and
 decodes 14% faster (6.5 → 7.4 tok/s, 4-bit, 4 GiB) — with identical
-output; see [Prefetch and reuse](#prefetch-and-reuse). Guesses only decide *what to
+output; see [Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse). Guesses only decide *what to
 read early*; routing always uses the model's own logits.
 
-Where one decode token's time goes — *Setup: standard, 4-bit experts,
-4 GiB cap, mean over the three test prompts (138 ms), GPU timestamps
-(`STREAMMOE_GPU_TIMING`) and I/O counters:*
-
-```mermaid
-pie showData
-    title One a3b decode token · 4-bit · 4 GiB cap (ms)
-    "GPU: attention + shared expert" : 35
-    "GPU: routed experts" : 20
-    "GPU: LM head" : 6
-    "Waiting on SSD reads" : 50
-    "CPU routing, encoding, GPU wake-up gaps" : 27
-```
-
-The CPU uses ~0.7 of 11 cores while decoding, so the levers are fewer
-bytes from disk and fewer, longer GPU bursts — not more threads. The
-GPU kernels run 3–4× slower than the same kernels in isolation:
-decode's short bursts leave the GPU in a slow state.
+A decode token at a 4 GiB cap (4-bit experts, 138 ms) spends ~44% of
+its time in GPU kernels, ~36% waiting on the SSD and ~20% on CPU work
+and GPU wake-up gaps; the CPU uses ~0.7 of 11 cores. So the levers are
+fewer bytes from disk and fewer, longer GPU bursts — not more threads
+([breakdown](docs/benchmarks.md#where-a-decode-token-goes)).
 
 ### S · Streaming: measured, not assumed
 
 `STREAMMOE_IO_TRACE=<file>` records every expert read and the phase of
 each layer; `tools/io_trace_report.py` turns it into disk busy / idle
-time. Standard setup, packed 3-bit at a 4 GiB cap, the photosynthesis
-prompt (tracing adds ~15%, so read it for proportions, not speed):
-
-```text
-prefill, 40 layer stages: 1474 ms, staging 971 ms, GPU between stages 503 ms; 72.7 experts/layer, 4.1 GB/s while staging
-decode, 120 tokens: 113.3 ms/token, disk busy 51.8 ms, idle 61.6 ms; 137 reads, 180 MiB per token
-  phase       wall ms  busy ms  idle ms
-  attention      80.5     29.4     51.1
-  misses         24.3     22.4      2.0
-  dispatch        8.5      0.0      8.5
-```
-
+time ([sample report](docs/benchmarks.md#disk-timeline)).
 Prefill staging runs at the SSD's limit (~4.1–4.6 GB/s here), and the
 disk's idle time in decode comes in ~1 ms pieces too short to fill with
 more prefetch — the tries are in
@@ -417,18 +393,18 @@ variables are spelled `streammoe` / `STREAMMOE_*`.
 | OLMoE-1B-7B variant (small test model: converter, NumPy reference, model tests under a cap) | Implemented — the model-level test bed on hosts without a3b weights |
 | Expert streaming: mmap mode, pread + speculative prefetch, slot ring | Exists |
 | Differential oracles (CPU vs Metal, batched vs per-token, MLX) | Exists |
-| `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; tested on OLMoE-1B-7B and on a3b under 3–7 GiB caps |
-| `F_NOCACHE` reads, fixed hot tier, routing profiles, expert-IO counters | Implemented — Phase 2; tested on OLMoE-1B-7B and on a3b under 3–7 GiB caps |
-| Layer-range execution (`layer_range`, `eval_stage`, f32 hidden in/out, per-range snapshots) | Implemented — Phase 3; unit tests pass, the a3b tests in `tests/layer_range.rs` need ≥ 8 GiB free and have not run |
-| Per-request state (`max_requests` pool, `admit_request` / `drop_request` / `eval_request`) | Implemented — Phase 4; exercised on a3b under a cap by `batch_bench` (4 requests, outputs identical) |
+| `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; tested on a3b by the model suites ([Tests](#tests)): open fails before any I/O when the plan doesn't fit, checkpoints planned inside a 4 GiB cap |
+| `F_NOCACHE` reads, fixed hot tier, routing profiles, expert-IO counters | Implemented — Phase 2; tested on a3b by the model suites ([Tests](#tests)): hot-tier sizes and profile seeding give bit-identical logits |
+| Layer-range execution (`layer_range`, `eval_stage`, f32 hidden in/out, per-range snapshots) | Implemented — Phase 3; tested on a3b by the model suites ([Tests](#tests)): whole-model `eval_stage` bit-identical to `eval_prompt`, 40 layers vs 20 + 10 + 10 within tolerance, per-range snapshots round-trip |
+| Per-request state (`max_requests` pool, `admit_request` / `drop_request` / `eval_request`) | Implemented — Phase 4; tested on a3b by the model suites ([Tests](#tests)): interleaved requests bit-identical to sequential runs |
 | `streammoe-net`: frames, `streammoe-node`, `streammoe-coord`, planner (TCP loopback) | Prototype — Phase 5; mode B continues in a separate repository |
-| Streaming improvements: telemetry (`ExpertIoStats`, CSV), bounded I/O (`io_queue_depth`, `io_bytes_per_sec`), in-place coalesced prefill reads, cross-layer guesses, lookahead prefetch, `fast_experts_dir` disk tier, `prefetch_experts` (prefetch width) | Implemented — Phase 6; library defaults: previous-token guess, `prefetch_experts` = 4 under a cap; `tools/chat` uses the cross-layer guess with 6, faster on a3b ([Prefetch and reuse](#prefetch-and-reuse)) |
+| Streaming improvements: telemetry (`ExpertIoStats`, CSV), bounded I/O (`io_queue_depth`, `io_bytes_per_sec`), in-place coalesced prefill reads, cross-layer guesses, lookahead prefetch, `fast_experts_dir` disk tier, `prefetch_experts` (prefetch width) | Implemented — Phase 6; tested on a3b by the model suites ([Tests](#tests)): bounded I/O, prefill reads, cross-layer guess, lookahead and the fast-dir tier all give identical output. Library defaults: previous-token guess, `prefetch_experts` = 4 under a cap; `tools/chat` uses the cross-layer guess with 6, faster on a3b ([Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse)) |
 | KV cache formats (`kv_format`: F32, F16, TurboQuant 4/3-bit; snapshot v4) | Implemented — F32 default; on OLMoE-1B-7B at a 3 GiB cap and n_ctx 4096, F16 / Turbo4 shrink KV 1.00 → 0.56 / 0.19 GiB (incl. prefill scratch) and decode +29% / +44% faster (the freed memory goes to the hot tier); answers correct in every format. MLA (Cogito) stays F32 |
 | Decode attention threads (`attn_threads`, default 4) | Implemented — bit-identical output; on OLMoE at 2.7k context decode +55–58% tok/s (F32 and Turbo4) |
 | Vision for Qwen3.5 / 3.6 (`riir::vision` CPU encoder, `eval_stage_mrope`, `tools/export_vision.py`) | Implemented — encoder matches transformers exactly and mlx_vlm to 0.997; whole pipeline checked layer by layer against MLX on a3b under a 4 GiB cap (encoder 137 MiB, ~1–3 s per image). Small printed text reads poorly, as it does in MLX |
-| Decode I/O: per-slot prefetch waits, prefill staging lent to the hot tier (`STREAMMOE_HOT_LEND`), single-token `qmv` matvec kernel (`STREAMMOE_MATVEC_QMV`), hot experts dispatched before disk reads (`STREAMMOE_EARLY_EXPERTS`) | Implemented — output unchanged; effect of each in [Prefetch and reuse](#prefetch-and-reuse) |
-| Packed 3-bit experts (`tools/requant_experts.py` → `tools/pack_experts.py`, `root-3bit/`; layout detected from the files), quality harness (`tools/chat` `quality` bin: KL, top-1, perplexity, scored tasks), `--precision 4\|3` in the chat page | Implemented — 1.31 MiB per expert vs 1.69 (−22%); vs 4-bit: KL 0.048, top-1 agreement 93%, 10/10 tasks; 9–15% more tok/s at every cap from 3 to 6 GiB ([Speed](#speed)). 2-bit fails 4 of 10 tasks |
-| Several tokens per pass: `eval_tokens` + `rewind_tokens` (one sequence, speculative checks), `eval_requests` (one token from each of up to 4 requests), `OpenConfig::max_decode_tokens` (buffers in the plan) | Implemented — logits bit-identical to one token per pass; parallel decoding 1.3× total throughput, speculative decoding not yet a win ([Several tokens per pass](#several-tokens-per-pass)) |
+| Decode I/O: per-slot prefetch waits, prefill staging lent to the hot tier (`STREAMMOE_HOT_LEND`), single-token `qmv` matvec kernel (`STREAMMOE_MATVEC_QMV`), hot experts dispatched before disk reads (`STREAMMOE_EARLY_EXPERTS`) | Implemented — output unchanged; effect of each in [Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse) |
+| Packed 3-bit experts (`tools/requant_experts.py` → `tools/pack_experts.py`, `root-3bit/`; layout detected from the files), quality harness (`tools/chat` `quality` bin: KL, top-1, perplexity, scored tasks), `--precision 4\|3` in the chat page | Implemented — 1.31 MiB per expert vs 1.69 (−22%); vs 4-bit: KL 0.048, top-1 agreement 93%, 10/10 tasks; 9–15% more tok/s at every cap from 3 to 6 GiB ([Speed](#speed-at-a-glance)). 2-bit fails 4 of 10 tasks |
+| Several tokens per pass: `eval_tokens` + `rewind_tokens` (one sequence, speculative checks), `eval_requests` (one token from each of up to 4 requests), `OpenConfig::max_decode_tokens` (buffers in the plan) | Implemented — logits bit-identical to one token per pass; parallel decoding 1.3× total throughput, speculative decoding not yet a win ([Several tokens per pass](docs/benchmarks.md#several-tokens-per-pass)) |
 | Router policy, per-expert precision | Planned — Phases 7–8 |
 
 Build with exactly one model feature (`model-qwen3-6-35b-a3b`,
@@ -456,9 +432,34 @@ let mut ctx = Ctx::open_with(&weights, &manifest, &vocab, &experts_root, false, 
 
 `open_with` fails with `Error::OverBudget` if the plan does not fit the cap.
 
-Tests: run `scripts/check_test_host.sh` first; it says which tier
-(unit/kernel or model) this host can run. Fixed bugs, open issues and
-traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
+### Tests
+
+Run `scripts/check_test_host.sh` first; it says which tier (unit /
+kernel, or model) this host can run. The model suites need the a3b
+files (`STREAMMOE_SMOKE_ARTIFACTS`, `STREAMMOE_SMOKE_ROOT`; see
+[Setup](#setup)). Suites that open the model uncapped take
+`STREAMMOE_TEST_CAP_GIB=4` to run under a cap on a small host:
+
+```bash
+STREAMMOE_TEST_CAP_GIB=4 cargo test --release --features model-qwen3-6-35b-a3b \
+    -- --include-ignored --test-threads=1 --skip resuming_prefill_after_seq_rm_matches_full_prefill
+```
+
+Last full run (2026-10-26, M3 Pro with 7 GiB free, release build):
+
+| Suite | a3b result |
+| --- | --- |
+| `mlx_regression` (argmax and top-20 vs the MLX golden), `smoke` | pass |
+| `checkpoint_restore` (23), `consecutive_eval_prompt` (3), `mrope` (3) | pass |
+| `layer_range` (4), `requests` (1), `streaming` (7), `expert_source_equivalence` (2), `budget_cap` (1) | pass |
+| `graph_diff_oracle` (22, CPU vs Metal), `batched_diff_oracle` (33, batched vs per-token kernels) | pass |
+| The default tier (169 unit and kernel tests, no model files) | pass |
+| `diff_oracle` (opens two contexts at once), the two 10 GiB-cap tests, `mmap_matches_pread` and `engine_op_diff` (need mmap mode), `vision` (needs reference embeddings) | not run — need ≥ 8 GiB free or extra data |
+| `resuming_prefill_after_seq_rm_matches_full_prefill` | known failure, skipped ([known issues](docs/known-issues.md)) |
+| a17b and Cogito model tests | not run — no weights on this host |
+
+Fixed bugs, open issues and traps are listed in
+[`docs/known-issues.md`](docs/known-issues.md).
 
 ## Roadmap
 
@@ -471,7 +472,7 @@ traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
   expert at a time instead of quantizing the whole model.
 - **Fewer, longer GPU bursts.** ~87 ms of every token is GPU and CPU
   work that does not shrink with the cap (constant from 3 to 6 GiB,
-  [Speed](#speed)). GPU timestamps (`STREAMMOE_GPU_TIMING`) show decode
+  [Speed](docs/benchmarks.md#speed)). GPU timestamps (`STREAMMOE_GPU_TIMING`) show decode
   kernels running 3–4× slower than in isolation: the CPU must see each
   layer's routing before it can fetch that layer's experts, and the
   resulting short bursts leave the GPU in a slow state. Dispatching hot
@@ -480,29 +481,15 @@ traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
 - **More model families.** Qwen3-30B-A3B (`qwen3_moe`) as a new
   variant, then runtime variant dispatch instead of one compile-time
   feature per model.
-- **Verification at full size.** The uncapped a3b oracle suites and
-  a17b model runs need a host with ≥ 8 GiB to spare.
+- **Verification at full size.** `diff_oracle`, the mmap-mode tests
+  and the a17b and Cogito model runs need a host with ≥ 8 GiB to spare
+  (or the weights).
 
 ## Running Qwen3.6-35B-A3B on a small Mac
 
 The model is 19 GiB at 4-bit. Under a cap streamoe keeps only the
 hottest experts in RAM and streams the rest from the SSD, so it runs in
 3–6 GiB.
-
-### Test setup
-
-Every number in this README comes from this setup unless its *Setup*
-line says otherwise.
-
-| | Standard setup |
-| --- | --- |
-| Host | MacBook Pro, M3 Pro (11-core CPU), 18 GB RAM, internal SSD; shared with other services, 7–8 GiB reclaimable during the runs |
-| Model | Qwen3.6-35B-A3B from `mlx-community/Qwen3.6-35B-A3B-4bit`, converted as in [Setup](#setup); experts 4-bit (`root/`) or packed 3-bit (`root-3bit/`) |
-| Engine | `tools/chat` release build, 2026-10-26; a fresh server per run, the KV cache reset between prompts |
-| Settings | n_ctx 4096, F32 KV, cross-layer guess with 6 experts prefetched, `attn_threads` 4, vision on (its 0.13 GiB is in the plan), thinking off, greedy (temperature 0) |
-| Prompts | *Photosynthesis* — "Explain photosynthesis to a ten-year-old in one paragraph." (120 tokens decoded) · *JavaScript* — "Write a JavaScript function that checks whether a string is a palindrome." (74) · *Hiking* — "Give me a short packing list for a weekend hiking trip." (120) |
-| Reported | tok/s = decoded tokens ÷ decode time (the chat page's figure); hot-tier hits and disk MiB per decode token; first word = request to first streamed token; peak = process footprint. Each value is the mean of 2 runs (the runs agree within ±6%) |
-| Units | GiB / MiB for memory and disk (1 GiB = 2³⁰ bytes); GB/s only for SSD bandwidth; the Mac's RAM as sold (18 GB) |
 
 ### What it costs
 
@@ -512,7 +499,7 @@ line says otherwise.
 | RAM | Whatever you cap it at: peaks of 2.7 / 3.7 / 4.7 / 5.7 GiB at 3 / 4 / 5 / 6 GiB caps. Below ~3 GiB the fixed parts don't fit and `open_with` fails with `OverBudget` |
 | Page cache | None from expert reads: under a cap they use `F_NOCACHE`, so the file cache other processes rely on is not evicted |
 | CPU | ~0.7 cores while decoding: 4 threads for decode attention (`attn_threads`) plus the I/O threads; the GPU does the rest |
-| SSD | 87–477 MiB read per token, depending on cap, expert format and prompt (table below) |
+| SSD | 87–477 MiB read per token, depending on cap, expert format and prompt ([per prompt](docs/benchmarks.md#speed)) |
 
 Fixed parts of the plan (n_ctx 4096): weights 1.29 GiB, runtime
 overhead 0.50, prefill staging 0.42 (0.33 packed 3-bit), prefill scratch
@@ -520,103 +507,33 @@ overhead 0.50, prefill staging 0.42 (0.33 packed 3-bit), prefill scratch
 state 0.12, expert slots 0.09 — 2.95 GiB with 4-bit experts. The hot
 tier gets the rest of the cap.
 
-### Speed
+### Speed at a glance
 
-*Setup: standard; caps 3–6 GiB.* tok/s per prompt (Photosynthesis /
-JavaScript / Hiking) and over all three:
+*[Standard setup](docs/benchmarks.md#test-setup): M3 Pro (18 GB RAM,
+shared with other services), n_ctx 4096, F32 KV, cross-layer guess with
+6 experts prefetched, greedy, three chat prompts, mean of 2 runs.*
+Decode tok/s over all three prompts:
 
-| Cap | Experts | Hot tier | tok/s per prompt | tok/s, all | Hot-tier hits | Disk MiB / token | First word | Peak |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 3 GiB | 4-bit | 0.05 GiB | 6.9 / 5.8 / 6.5 | **6.5** | 38 / 22 / 35% | 372 / 477 / 392 | 1.6–1.8 s | 2.73 GiB |
-| 3 GiB | packed 3-bit | 0.14 GiB | 7.7 / 6.9 / 7.6 | **7.5** | 42 / 23 / 35% | 278 / 368 / 310 | 1.3–1.5 s | 2.69 GiB |
-| 4 GiB | 4-bit | 1.05 GiB | 8.0 / 6.4 / 7.6 | **7.4** | 59 / 34 / 54% | 258 / 413 / 289 | 1.6–1.8 s | 3.74 GiB |
-| 4 GiB | packed 3-bit | 1.14 GiB | 8.8 / 7.2 / 8.2 | **8.1** | 64 / 38 / 54% | 180 / 305 / 225 | 1.3–1.5 s | 3.73 GiB |
-| 5 GiB | 4-bit | 2.05 GiB | 8.7 / 6.9 / 8.0 | **7.9** | 70 / 45 / 64% | 190 / 350 / 230 | 1.4–2.0 s | 4.74 GiB |
-| 5 GiB | packed 3-bit | 2.14 GiB | 9.2 / 7.7 / 8.7 | **8.6** | 76 / 51 / 66% | 124 / 248 / 174 | 1.2–1.7 s | 4.73 GiB |
-| 6 GiB | 4-bit | 3.05 GiB | 9.0 / 7.0 / 8.6 | **8.3** | 78 / 54 / 72% | 141 / 296 / 187 | 1.3–2.5 s | 5.74 GiB |
-| 6 GiB | packed 3-bit | 3.14 GiB | 9.9 / 8.3 / 9.1 | **9.2** | 84 / 62 / 74% | 87 / 198 / 135 | 1.1–1.6 s | 5.72 GiB |
-
-How to read it:
-
-- **Packed 3-bit is 9–15% faster at every cap**, and packed 3-bit at
-  4 GiB is about as fast as 4-bit at 5 GiB. Quality against 4-bit: KL
-  0.048, the same top token 93% of the time, perplexity 1.15 → 1.21,
-  all 10 scored tasks right (JSON, tool calls, arithmetic, code).
-- **Each extra GiB adds 5–14%**, most going from 3 to 4 GiB with 4-bit
-  experts. The JavaScript prompt spreads over
-  the most experts, so it reads the most from disk at every cap.
-- **The hot tier at 3 GiB is nearly empty**, yet hits are 22–42%: the
-  256 prefill-staging slots lent to the hot tier during decode carry it.
-- **The part of a token that is not disk wait is ~87 ms at every cap**
-  (forward time minus disk wait: 84–92 ms in every cell of the table). That is the
-  ceiling: with every expert in RAM — a ~16 GiB cap for packed 3-bit
-  (13.1 GiB of experts), ~20 GiB for 4-bit — decode would reach about
-  **11.5 tok/s** (*estimated, not measured*: this 18 GB host can't spare
-  that much). A cap above what other programs leave free makes the
-  machine swap and is slower than a small cap.
-- First word is time to the first streamed token for a ~25-token
-  prompt; the chat template plus a short question prefills at 14–22
-  tok/s because each token picks new experts. Long prompts prefill far
-  faster (135+ tok/s for a 3.3k-token prompt, measured on an earlier
-  build).
-- **Answers match MLX.** Output is identical across caps; with 4-bit
-  experts, argmax equals the MLX reference and the top-20 overlap is
-  20/20 with F32 KV and 19/20 with Turbo4 (the gate in
-  `mlx_regression.rs` is 19). On a3b the KV cache is small (10
-  full-attention layers, 2 KV heads), so F32 KV costs little and Turbo4
-  gains nothing measurable.
-
-### Prefetch and reuse
-
-*Setup: standard, 4-bit experts, 4 GiB cap; one setting changed per
-row.*
-
-| Setting | tok/s per prompt | tok/s, all | Hot-tier hits | Disk wait, ms / token | Prefetched experts used / token |
-| --- | --- | --- | --- | --- | --- |
-| **standard** (cross-layer guess, 6 prefetched) | 8.0 / 6.4 / 7.6 | **7.4** | 59 / 34 / 54% | 39 / 67 / 45 | 78 / 121 / 86 |
-| previous-token guess, 4 prefetched (library default) | 6.9 / 5.7 / 6.7 | 6.5 | 59 / 34 / 54% | 63 / 85 / 68 | 13 / 35 / 20 |
-| cross-layer guess, 4 prefetched | 7.7 / 5.8 / 7.2 | 7.0 | 59 / 34 / 54% | 43 / 83 / 49 | 54 / 81 / 57 |
-| cross-layer guess, 8 prefetched | 7.5 / 5.9 / 7.4 | 7.0 | 59 / 34 / 54% | 46 / 78 / 46 | 98 / 151 / 108 |
-| no lending (`STREAMMOE_HOT_LEND=0`) | 7.4 / 6.0 / 7.1 | 6.9 | 51 / 22 / 42% | 48 / 74 / 54 | 95 / 150 / 113 |
-| no early hot experts (`STREAMMOE_EARLY_EXPERTS=0`) | 7.9 / 6.2 / 7.6 | 7.3 | 59 / 34 / 54% | 37 / 67 / 42 | 78 / 121 / 85 |
-
-The standard row is the 2-run mean from [Speed](#speed); the others
-are single runs. The cross-layer guess — the next layer's experts
-guessed from the current hidden state, so their reads start while the
-GPU is still busy — is 14% faster than the library default
-(`PrefetchGuess::PrevToken`, 4 experts), and 6 is the best width: 4
-leaves reads for later, 8 reads more than it saves. Lending the prefill
-staging to the hot tier is worth 7%; dispatching hot experts before the
-disk reads land is worth 1–2%, within run-to-run noise here. Output is
-identical in every row. More CPU threads did not help on an earlier build: `io_threads` 16
-and `attn_threads` 8 match the defaults. On OLMoE-1B-7B the cross-layer
-guess did not help.
-
-### Several tokens per pass
-
-`Ctx::eval_tokens` decodes up to 4 tokens of one sequence in one pass,
-and `Ctx::eval_requests` decodes one token from each of up to 4
-requests. Logits are bit-identical to one token per pass, and the extra
-buffers are in the plan (`OpenConfig::max_decode_tokens`). A pass of 4
-tokens costs ~3× one token here: disk reads are the union of the
-tokens' experts, and every kernel still runs once per token.
-
-*Setup: `batch_bench` — packed 3-bit experts, 6 GiB cap, n_ctx 2048,
-otherwise standard settings; 4 requests from 4 short prompts (25–30
-tokens), 64 tokens each; 3 runs.*
-
-| Mode | Total tok/s | Per stream | vs one request at a time |
+| Cap | 4-bit experts | Packed 3-bit experts | Peak footprint |
 | --- | --- | --- | --- |
-| one request at a time | 8.9 | 8.9 | 1.00× |
-| batch 2 | 10.4–11.0 | 5.2–5.5 | 1.16–1.23× |
-| batch 3 | 11.4–11.5 | 3.8–3.9 | 1.28–1.29× |
-| batch 4 | **11.6–11.9** | 2.9–3.0 | **1.30–1.33×** |
+| 3 GiB | 6.5 | 7.5 | 2.7 GiB |
+| 4 GiB | 7.4 | 8.1 | 3.7 GiB |
+| 5 GiB | 7.9 | 8.6 | 4.7 GiB |
+| 6 GiB | 8.3 | 9.2 | 5.7 GiB |
 
-Parallel decoding pays when several requests are waiting; each one gets
-its tokens more slowly. Speculative decoding with prompt-lookup drafts
-(`spec_bench`, packed 3-bit, 4 GiB cap) is not a win yet: 0.79–1.02× of
-plain decode, outputs identical. Details in
-[`docs/known-issues.md`](docs/known-issues.md).
+- Packed 3-bit is 9–15% faster at every cap. Against 4-bit: KL 0.048,
+  the same top token 93% of the time, all 10 scored tasks right.
+- Output is identical across caps; with 4-bit experts it matches the
+  MLX reference (argmax equal, top-20 overlap 20/20).
+- ~87 ms of each token is GPU and CPU work that a bigger cap does not
+  remove, so with every expert in RAM decode would reach about
+  11.5 tok/s (*estimated*; this host can't spare 16–20 GiB).
+- Several requests at once (`eval_requests`, batch 4) give 1.30–1.33×
+  the total throughput; speculative decoding is not a win yet.
+
+Per-prompt numbers, hot-tier hits, disk reads, prefetch and reuse
+comparisons, multi-token passes, the per-token breakdown and vision
+timings are in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ### Setup
 
@@ -676,14 +593,14 @@ prefill speed, hot-tier hits and disk MiB per token. Thinking can be
 toggled. An **Experts** selector in the header switches between
 4-bit and packed 3-bit experts (the server restarts itself in ~2 s
 and frees the old model first, so memory stays under the cap). Its
-defaults are the [standard setup](#test-setup) with 4-bit experts:
+defaults are the [standard setup](docs/benchmarks.md#test-setup) with 4-bit experts:
 7.4 tok/s over the three test prompts at a 4 GiB cap. Stop the server
 (Ctrl-C) to give the memory back.
 
 #### What it looks like
 
 *Setup: standard, 4-bit experts, 4 GiB cap; recorded with headless
-Chrome on 2026-10-26, a few engine changes before the [Speed](#speed)
+Chrome on 2026-10-26, a few engine changes before the [Speed](docs/benchmarks.md#speed)
 runs, with other prompts.* Real time — the GIFs are not sped up.
 
 **Text** — 6.7 tok/s, 3.66 GiB of the 4 GiB cap:
@@ -723,13 +640,10 @@ sides are multiples of 32 and the area is at most `--vision-max-pixels`
 positions (`Ctx::eval_stage_mrope`). The encoder streams its 0.85 GiB
 of BF16 weights from disk for each image and keeps 137 MiB of buffers,
 counted in the cap (`OpenConfig::host_buffers`). `--no-vision` turns it
-off. *Setup: standard, 4-bit experts, 4 GiB cap, one image per turn:*
-
-| Image | Image tokens | Encode | Prefill (whole turn) | Process memory | CPU (peak, whole run) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 448 × 320 | 140 | 1.1 s | 5.3 s | 3.69 GiB | ≤ 2.1 cores |
-| 512 × 512 | 256 | 1.9 s | 5.7 s | 3.69 GiB | ≤ 2.1 cores |
-| 640 × 640 (cap) | 400 | 3.2 s | 5.3 s | 3.71 GiB | ≤ 2.1 cores |
+off.
+Encoding a 640 × 640 image (400 tokens) takes ~3 s and the process
+stays at ~3.7 GiB under a 4 GiB cap
+([timings](docs/benchmarks.md#vision)).
 
 Decode after an image runs at the usual speed. Scenes, colors, layout
 and counting work (a 2 × 2 color grid, five dots, shapes and their
@@ -741,15 +655,10 @@ and not at 512 × 256.
 
 ### Qwen3-30B-A3B
 
-Qwen3-30B-A3B (the `qwen3_moe` architecture: 48 full-attention layers,
-128 experts, top-8, no linear attention) is **not supported yet**: it
-needs its own variant, likely closer to the OLMoE path than to the
-Qwen3.6 one. Estimated from its shape, not measured: ~15 GiB of 4-bit
-experts at ~2.5 MiB each, ~0.95 GiB read per token with a cold hot tier —
-about twice Qwen3.6-35B-A3B — and 192 KiB of F32 KV per token
-(0.75 GiB at n_ctx 4096, ~0.1 GiB with Turbo4), so it would decode
-slower than Qwen3.6-35B-A3B at the same cap and gain more from a
-quantized `kv_format`.
+Qwen3-30B-A3B (`qwen3_moe`: 48 full-attention layers, 128 experts,
+top-8, no linear attention) is **not supported yet**; it needs its own
+variant. A size estimate is in
+[`docs/benchmarks.md`](docs/benchmarks.md#estimates).
 
 ## Provenance
 
