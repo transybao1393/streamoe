@@ -322,6 +322,7 @@ pub(crate) fn gpu_batched_experts_begin_mmap(
     layer_idx: i32,
     expert_bindings: &[(&metal::Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
+    done: &[bool],
 ) -> Result<(), DeferredError> {
     if ring.is_full() {
         return Err(DeferredError::RingFull);
@@ -338,6 +339,7 @@ pub(crate) fn gpu_batched_experts_begin_mmap(
         shared_gate_score,
         expert_bindings,
         chain,
+        done,
     )?;
     cmd_buffer.commit();
     ring.push(DeferredState {

@@ -870,6 +870,7 @@ pub(crate) fn gpu_batched_experts_encode(
         &bindings,
         None,
         buffer_pool.handle(bufs.combine_params_id()),
+        &[],
     );
     Ok(cmdbuf.to_owned())
 }
@@ -890,6 +891,7 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
     shared_gate_score: f32,
     expert_bindings: &[(&Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
+    done: &[bool],
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
     let cmdbuf = metal.queue().new_command_buffer().to_owned();
     let params = buffer_pool.handle(bufs.combine_params_id()).clone();
@@ -907,6 +909,7 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
         shared_gate_score,
         expert_bindings,
         chain,
+        done,
     )?;
     Ok(cmdbuf)
 }
@@ -917,7 +920,9 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
 /// several tokens' dispatches share one command buffer, each with its
 /// own params buffer (decode with T tokens); the K-expert scratch in
 /// `bufs` is reused in order, since encoders in one command buffer
-/// run one after another.
+/// run one after another. Slots marked in `done` had their FFN
+/// encoded earlier ([`encode_experts_early`]); only the combine reads
+/// them here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_experts_mmap_into(
     cmdbuf: &CommandBufferRef,
@@ -933,6 +938,7 @@ pub(crate) fn encode_experts_mmap_into(
     shared_gate_score: f32,
     expert_bindings: &[(&Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
+    done: &[bool],
 ) -> Result<(), ExpertForwardError> {
     let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
@@ -974,6 +980,7 @@ pub(crate) fn encode_experts_mmap_into(
         expert_bindings,
         chain,
         combine_params,
+        done,
     );
     Ok(())
 }
@@ -1008,6 +1015,146 @@ fn validate_inputs(
     Ok(())
 }
 
+/// Runs `[start, end)` of consecutive slots in `0..k` where `keep`.
+fn slot_runs(k: usize, keep: impl Fn(usize) -> bool) -> Vec<(u32, u32)> {
+    let mut runs = Vec::new();
+    let mut slot = 0;
+    while slot < k {
+        if !keep(slot) {
+            slot += 1;
+            continue;
+        }
+        let start = slot;
+        while slot < k && keep(slot) {
+            slot += 1;
+        }
+        runs.push((start as u32, slot as u32));
+    }
+    runs
+}
+
+/// The expert FFN (gate + up, SwiGLU, down) of slots `start..end` into
+/// their regions of the flat scratch. Every (slot, row) is computed the
+/// same whichever runs the slots are split into, so the combine sees
+/// identical inputs.
+#[allow(clippy::too_many_arguments)]
+fn encode_expert_ffn(
+    cmdbuf: &CommandBufferRef,
+    v3e: &ComputePipelineState,
+    swiglu: &ComputePipelineState,
+    bufs: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
+    input: &BufferRef,
+    v: Variant,
+    expert_bindings: &[(&Buffer, u64)],
+    start: u32,
+    end: u32,
+) {
+    let lay = bufs.layout();
+    let gate_flat = buffer_pool.handle(bufs.gate_flat_id());
+    let up_flat = buffer_pool.handle(bufs.up_flat_id());
+    let act_flat = buffer_pool.handle(bufs.act_flat_id());
+    let out_flat = buffer_pool.handle(bufs.out_flat_id());
+    let group_size = GROUP_SIZE as u32;
+    let inter = v.moe_intermediate as u32;
+
+    // Encoder 1: gate + up (shared input, two dispatches)
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        for (out, w, s, b) in [
+            (gate_flat, lay.gate_w_off(), lay.gate_s_off(), lay.gate_b_off()),
+            (up_flat, lay.up_w_off(), lay.up_s_off(), lay.up_b_off()),
+        ] {
+            encode_matvec_experts(
+                enc,
+                v3e,
+                expert_bindings,
+                input,
+                out,
+                inter,
+                v.hidden_dim as u32,
+                group_size,
+                w as u32,
+                s as u32,
+                b as u32,
+                start,
+                end,
+                0,
+            );
+        }
+        enc.end_encoding();
+    }
+
+    // Encoder 2: SwiGLU over the run's slots
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        let off = (start * inter) as NSUInteger * 4;
+        enc.set_compute_pipeline_state(swiglu);
+        enc.set_buffer(0, Some(gate_flat), off);
+        enc.set_buffer(1, Some(up_flat), off);
+        enc.set_buffer(2, Some(act_flat), off);
+        let dim = (end - start) * inter;
+        enc.set_bytes(3, 4, (&dim as *const u32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize::new(dim.div_ceil(256) as NSUInteger, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+
+    // Encoder 3: down
+    {
+        let enc = cmdbuf.new_compute_command_encoder();
+        encode_matvec_experts(
+            enc,
+            v3e,
+            expert_bindings,
+            act_flat,
+            out_flat,
+            v.hidden_dim as u32,
+            inter,
+            group_size,
+            lay.down_w_off() as u32,
+            lay.down_s_off() as u32,
+            lay.down_b_off() as u32,
+            start,
+            end,
+            inter,
+        );
+        enc.end_encoding();
+    }
+}
+
+/// Early part of a K-expert dispatch: the FFN of the slots marked
+/// `ready` (RAM-resident experts), encoded into a new command buffer
+/// the caller commits at once, so the GPU works through the disk reads
+/// of the other slots instead of idling. The main dispatch then gets
+/// the same mask as `done` and encodes the rest plus the combine.
+/// `None` when the variant takes the per-expert fallback.
+pub(crate) fn encode_experts_early(
+    metal: &mut MetalContext,
+    bufs: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
+    input: &BufferRef,
+    expert_bindings: &[(&Buffer, u64)],
+    ready: &[bool],
+) -> Result<Option<metal::CommandBuffer>, ExpertForwardError> {
+    let v = VARIANT;
+    let k = ready.len();
+    let Some(v3e) = metal.pipeline(experts_kernel_name(bufs.layout())).ok().cloned() else {
+        return Ok(None);
+    };
+    if v.hidden_dim > 4096 || k > MAX_K {
+        return Ok(None);
+    }
+    let swiglu = metal.pipeline("swiglu_fused")?.clone();
+    let cmdbuf = metal.queue().new_command_buffer().to_owned();
+    for (start, end) in slot_runs(k, |slot| ready[slot]) {
+        encode_expert_ffn(&cmdbuf, &v3e, &swiglu, bufs, buffer_pool, input, v, expert_bindings, start, end);
+    }
+    Ok(Some(cmdbuf))
+}
+
 /// Inner encoder helper — emits the K-expert FFN dispatches and
 /// combine into `cmdbuf`. Expert weights come from mmap'd Metal
 /// buffers via `expert_bindings` (buffer + byte offset per expert).
@@ -1028,6 +1175,7 @@ fn emit_batched_experts(
     expert_bindings: &[(&Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
     combine_params_buf: &Buffer,
+    done: &[bool],
 ) {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1056,82 +1204,10 @@ fn emit_batched_experts(
 
     if use_batched {
         let v3e = v3_experts.unwrap();
-        let gate_flat = buffer_pool.handle(bufs.gate_flat_id());
-        let up_flat = buffer_pool.handle(bufs.up_flat_id());
-        let act_flat = buffer_pool.handle(bufs.act_flat_id());
-        let out_flat = buffer_pool.handle(bufs.out_flat_id());
-        let group_size = GROUP_SIZE as u32;
-        let k_u32 = k as u32;
-
-        // Encoder 1: gate + up (shared input, two dispatches)
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            encode_matvec_experts(
-                enc,
-                v3e,
-                expert_bindings,
-                input,
-                gate_flat,
-                v.moe_intermediate as u32,
-                v.hidden_dim as u32,
-                group_size,
-                lay.gate_w_off() as u32,
-                lay.gate_s_off() as u32,
-                lay.gate_b_off() as u32,
-                k_u32,
-                0,
-            );
-            encode_matvec_experts(
-                enc,
-                v3e,
-                expert_bindings,
-                input,
-                up_flat,
-                v.moe_intermediate as u32,
-                v.hidden_dim as u32,
-                group_size,
-                lay.up_w_off() as u32,
-                lay.up_s_off() as u32,
-                lay.up_b_off() as u32,
-                k_u32,
-                0,
-            );
-            enc.end_encoding();
-        }
-
-        // Encoder 2: SwiGLU over all K experts
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            encode_swiglu_into_buf(
-                enc,
-                swiglu,
-                gate_flat,
-                up_flat,
-                act_flat,
-                k_u32 * v.moe_intermediate as u32,
-            );
-            enc.end_encoding();
-        }
-
-        // Encoder 3: down
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            encode_matvec_experts(
-                enc,
-                v3e,
-                expert_bindings,
-                act_flat,
-                out_flat,
-                v.hidden_dim as u32,
-                v.moe_intermediate as u32,
-                group_size,
-                lay.down_w_off() as u32,
-                lay.down_s_off() as u32,
-                lay.down_b_off() as u32,
-                k_u32,
-                v.moe_intermediate as u32,
-            );
-            enc.end_encoding();
+        // Slots not dispatched early ([`encode_experts_early`]), in
+        // runs of consecutive slots.
+        for (start, end) in slot_runs(k, |slot| !done.get(slot).copied().unwrap_or(false)) {
+            encode_expert_ffn(cmdbuf, v3e, swiglu, bufs, buffer_pool, input, v, expert_bindings, start, end);
         }
     } else {
         // Fallback: per-expert loop (hidden_dim > 4096 — i.e. Cogito-V2,
@@ -1139,6 +1215,7 @@ fn emit_batched_experts(
         // k > MAX_K). The batched matvec now chunks experts in groups of
         // 8, so a17b's k=10 takes the batched path above, not this one.
         assert_eq!(lay, ExpertLayout::Q4, "[moe] per-expert fallback has 4-bit kernels only");
+        assert!(!done.contains(&true), "[moe] per-expert fallback has no early dispatch");
         for slot in 0..k {
             let (wb, base_off) = expert_bindings[slot];
             let gate_buf = buffer_pool.handle(bufs.gate_id(slot));
@@ -1356,6 +1433,7 @@ fn encode_matvec_experts(
     w_byte_off: u32,
     s_byte_off: u32,
     b_byte_off: u32,
+    start: u32,
     k: u32,
     input_stride: u32,
 ) {
@@ -1379,8 +1457,9 @@ fn encode_matvec_experts(
     // (its global offset) and `k_active` = the chunk's expert count.
     // Chunks write disjoint `out[(base+e)*out_dim..]` regions, so they
     // are hazard-free within this one encoder.
+    // Slots `start..k` only: the chunks keep global slot indices.
     const CHUNK: u32 = 8;
-    let mut base = 0u32;
+    let mut base = start;
     while base < k {
         let chunk_k = (k - base).min(CHUNK);
         for i in 0..CHUNK as usize {

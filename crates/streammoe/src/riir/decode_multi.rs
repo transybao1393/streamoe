@@ -629,6 +629,7 @@ fn moe_dispatch_multi(
             it.shared_gate_score,
             &bindings,
             chain,
+            &[],
         )
         .map_err(|_| RsError::EvalFailed)?;
         if last_layer {

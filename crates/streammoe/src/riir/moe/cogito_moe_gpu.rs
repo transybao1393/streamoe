@@ -367,6 +367,7 @@ fn cogito_moe_layer_forward_gpu_inner(
         /* shared_gate_score = */ 0.0,
         &bindings,
         /* chain = */ None,
+        /* done = */ &[],
     )?;
     cmdbuf.commit();
     cmdbuf.wait_until_completed();

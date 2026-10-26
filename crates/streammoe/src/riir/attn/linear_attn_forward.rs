@@ -2051,6 +2051,14 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
 /// `complete_deferred_experts_into`, or `RsCtx::layer_forward_dump`'s
 /// post-dispatch drain).
 #[allow(clippy::too_many_arguments)]
+/// Whether [`moe_dispatch_per_token`] dispatches resident experts
+/// before the disk reads of the others (`STREAMMOE_EARLY_EXPERTS=0`
+/// turns it off).
+fn early_experts_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STREAMMOE_EARLY_EXPERTS").map_or(true, |v| v != "0"))
+}
+
 pub(in crate::riir) fn moe_dispatch_per_token(
     metal: &mut MetalContext,
     wf_buf: &MtlWeightBuf,
@@ -2113,6 +2121,9 @@ pub(in crate::riir) fn moe_dispatch_per_token(
         //   here). See `expert_io_mode::select` for the gate, and
         //   `prefetch.rs` for the state machine.
         let bindings_synced; // backing storage for the pread arm
+        // Slots whose FFN went out early (resident experts); the main
+        // dispatch skips them.
+        let mut early_done: Vec<bool> = Vec::new();
         let bindings: Vec<(&metal::Buffer, u64)> = if prefetch.mode().is_mmap() {
             indices
                 .iter()
@@ -2133,6 +2144,29 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             if let Some(hot) = expert_files.hot_tier() {
                 for slot in 0..k {
                     hot_bind[slot] = hot.lookup(layer_idx, indices[slot] as usize);
+                }
+            }
+
+            // 0b. If some experts must still come from disk, start the
+            //     resident ones' FFN now: the GPU works through the
+            //     reads below instead of idling (and slowing down).
+            let hot_n = hot_bind[..k].iter().filter(|b| b.is_some()).count();
+            if early_experts_enabled() && hot_n > 0 && hot_n < k {
+                let first = hot_bind[..k].iter().flatten().next().copied().expect("hot_n > 0");
+                let early_bind: Vec<(&metal::Buffer, u64)> =
+                    hot_bind[..k].iter().map(|b| b.unwrap_or(first)).collect();
+                let ready: Vec<bool> = hot_bind[..k].iter().map(Option::is_some).collect();
+                let early = crate::riir::moe::expert_forward::encode_experts_early(
+                    metal,
+                    moe,
+                    buffer_pool,
+                    buffer_pool.handle(buffers.normed),
+                    &early_bind,
+                    &ready,
+                )?;
+                if let Some(cmdbuf) = early {
+                    cmdbuf.commit();
+                    early_done = ready;
                 }
             }
 
@@ -2301,6 +2335,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             layer_idx as i32,
             &bindings,
             chain,
+            &early_done,
         )?;
     } else {
         let expert_size = expert_files.expert_size();

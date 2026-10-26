@@ -32,6 +32,11 @@
   `eval_tokens` / `eval_requests` pass. Its buffers are planned under
   a cap (`multi_decode` account, 0.22 GiB at 4 on a3b, exact — a pool
   test keeps the formula in step); a longer pass is refused.
+- Early expert dispatch: when some of a layer's experts must come from
+  disk, the RAM-resident ones' FFN goes to the GPU before the reads,
+  and the main dispatch adds the rest and the unchanged combine.
+  Bit-identical; ~5% faster warm decode on a3b at a 4 GiB cap.
+  `STREAMMOE_EARLY_EXPERTS=0` turns it off.
 - `Ctx::eval_tokens`: decode with T ≤ 4 tokens in one forward pass —
   decode's kernels and expert streaming, each layer's attention for all
   T tokens in one command buffer, the experts of all T read once —

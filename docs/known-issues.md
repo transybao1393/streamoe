@@ -223,12 +223,19 @@ Older engine history (graph mode, prefill, kernels) is in
   `batch_bench` (4 requests × 64 tokens, packed 3-bit): batches of
   2 / 3 / 4 give 1.18 / 1.12 / 1.25× total tok/s at a 5 GiB cap and
   1.22 / 1.47 / 1.35× at 7 GiB (one run each), 1.16–1.23 / 1.28–1.29 /
-  1.30–1.33× at 6 GiB (three runs), every output identical
+  1.30–1.33× at 6 GiB (three runs, early experts on), every output identical
   to one-at-a-time decode; each request then gets 3–5.7 tok/s instead
   of ~9. A bigger cap helps batches more than plain decode, since the
   pass's distinct experts hit RAM more. What a 4-token pass adds over
   one token (`verify_bench --profile`): disk wait 20 → 81 ms, expert
   GPU 31 → 94, attention GPU 33 → 96, LM head 6 → 21.
+- **Early expert dispatch** (resident experts' FFN sent before the
+  disk reads of the rest; `STREAMMOE_EARLY_EXPERTS`): alternating
+  `verify_bench` runs, packed 3-bit, 4 GiB cap — warm decode 107.1 /
+  107.2 ms/tok off vs 100.8 / 102.8 on (~5%), cold first decode ~1.5%;
+  quality harness bit-identical. The GPU only gets the resident
+  experts' share of a layer (~0.5 ms) to fill the disk wait, so it
+  does not end the slow state.
 - Per-turn decode I/O in the chat log: `io` in each `[chat]` line gives
   forward ms per token, the I/O wait inside it, and demand / prefetch
   reads per token.
