@@ -636,6 +636,12 @@ also [`CONTRIBUTORS.md`](CONTRIBUTORS.md).
   up, and publishing everything openly. moeflux started as flash-moe
   and git history reflects that.
 - **@mdegans** — for moeflux, the Rust rewrite streamoe builds on.
+- **[transybao1393/moeflux](https://github.com/transybao1393/moeflux)**
+  — the author's moeflux fork, where the revamp began: the memory cap,
+  `F_NOCACHE` streaming and hot tier, the layer-range pipeline, KV
+  formats, decode attention threads and the chat page were built and
+  published there under MIT (up to commit `7d73350`) before development
+  moved to streamoe.
 - **Claude Opus 4.6** — for the Metal streaming-experts kernels and
   the architecture that made all of this run.
 - **Anthropic** — for making Claude available to do work like this in
