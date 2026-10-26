@@ -474,13 +474,16 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
     let queue = metal.queue();
     let cmdbuf = queue.new_command_buffer();
 
-    // Single-row reference: inline-encode the v3_4bit pipeline.
-    // (encode_matvec wants an MtlWeightBuf which needs a WeightFile
-    // we don't want to load for a synthetic test.)
+    // Single-row reference: inline-encode the pipeline encode_matvec
+    // picks for this shape — qmv (aligned, in_dim % 32 == 0) unless
+    // STREAMMOE_MATVEC_QMV=0, else v3_4bit. (encode_matvec wants an
+    // MtlWeightBuf which needs a WeightFile we don't want to load for
+    // a synthetic test.)
     use metal::{MTLSize, NSUInteger};
+    let qmv = std::env::var("STREAMMOE_MATVEC_QMV").map_or(true, |v| v != "0");
     {
         let enc = cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipes.v3_4bit);
+        enc.set_compute_pipeline_state(if qmv { &pipes.qmv_4bit } else { &pipes.v3_4bit });
         enc.set_buffer(0, Some(&w_buf), w_off as NSUInteger);
         enc.set_buffer(1, Some(&w_buf), s_off as NSUInteger);
         enc.set_buffer(2, Some(&w_buf), b_off as NSUInteger);
@@ -492,7 +495,7 @@ fn dequant_matvec_4bit_n_tokens_v3_n1_matches_single() {
         let num_tgs = (out_dim + 7) / 8;
         enc.dispatch_thread_groups(
             MTLSize::new(num_tgs as NSUInteger, 1, 1),
-            MTLSize::new(256, 1, 1),
+            MTLSize::new(if qmv { 64 } else { 256 }, 1, 1),
         );
         enc.end_encoding();
     }

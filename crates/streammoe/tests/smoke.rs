@@ -9,6 +9,9 @@ use std::path::PathBuf;
 
 use streammoe::{Ctx, Error};
 
+mod common;
+use common::diff_helpers::open_model;
+
 fn model_root() -> PathBuf {
     // Default to the layout produced by the session's prep pipeline;
     // override with STREAMMOE_SMOKE_ROOT to point elsewhere.
@@ -34,7 +37,7 @@ fn rust_smoke_35b_a3b() {
     let art = artifacts();
     let root = model_root();
 
-    let mut ctx = Ctx::open(
+    let mut ctx = open_model(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),

@@ -20,6 +20,9 @@ use std::path::PathBuf;
 
 use streammoe::{CheckpointError, Ctx, DEFAULT_MAX_CHECKPOINTS};
 
+mod common;
+use common::diff_helpers::open_model;
+
 fn model_root() -> PathBuf {
     let default = "/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root";
     PathBuf::from(std::env::var("STREAMMOE_SMOKE_ROOT").unwrap_or(default.into()))
@@ -33,7 +36,7 @@ fn artifacts() -> PathBuf {
 fn open_ctx() -> Ctx {
     let art = artifacts();
     let root = model_root();
-    Ctx::open(
+    open_model(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),

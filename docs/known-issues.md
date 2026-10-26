@@ -13,7 +13,7 @@ history of `.claude/memory/`, which is no longer tracked.
 | A 128-token decode after a ~130-token prompt goes over a 4 or 5 GiB cap (`OverBudget` in `eval_token`, footprint = cap). | The plan gives the hot tier everything left under the cap. On longer runs the unplanned footprint grows past the 512 MiB `runtime_overhead`. 8 tokens peak at 3.89 GiB; 48 tokens after a 25-token prompt fit. The multi-token buffers are now planned (`max_decode_tokens`, `multi_decode` account). | Find what grows (pool is flat at 0.83 GiB; likely driver / file-backed pages). Until then `runtime_overhead` 768 MiB fits (`spec_bench` default). |
 | Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) is slower than plain decode: 0.79× / 0.92× on rewrite / code prompts, 1.02× on free text (packed 3-bit, 4 GiB cap, `spec_bench`). Output is token-identical. | A verify pass of ~4 tokens costs ~425 ms in real use (310 ms in `verify_bench`, where every draft is right) and yields 2.4–2.9 tokens; break-even is ~310–370 ms. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; draft only on long matches. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
-| The uncapped a3b oracle suites and all a17b model tests have not run (this host has 5–7 GiB reclaimable; they need ≥ 8 GiB). | a3b runs under a 3–5 GiB cap: answers correct, argmax matches the MLX golden, top-20 overlap 20/20 (F32 KV) / 19/20 (Turbo4), peak within the cap (README, *Running Qwen3.6-35B-A3B on a small Mac*). Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are otherwise verified on OLMoE-1B-7B, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
+| `diff_oracle`, the mmap-mode tests (`mmap_matches_pread`, `engine_op_diff`), the 10 GiB-cap tests and all a17b / Cogito model tests have not run (this host has ~7 GiB reclaimable; `diff_oracle` opens two contexts at once). | The other a3b model suites pass (2026-10-26): `mlx_regression`, `smoke`, `checkpoint_restore`, `consecutive_eval_prompt`, `mrope`, `layer_range`, `requests`, `streaming`, `expert_source_equivalence`, `budget_cap`, plus `graph_diff_oracle` and `batched_diff_oracle`. Suites that open uncapped ran under `STREAMMOE_TEST_CAP_GIB=4` (pread + hot tier instead of the uncapped path). | Run the rest on a host with ≥ 8 GiB free and the a17b / Cogito weights. |
 | Vision reads small or short printed text unreliably ("STOP" → "SOM" / "Form", "HELLO 2026" → "HILLCO" at 128–160 image tokens); scenes, colors, layout and counting are right. | Not an engine bug: on the same image embeddings, MLX (mlx_vlm, 4-bit) has the same top tokens ("F", "S", "T" for "STOP"); the engine follows MLX layer by layer (cosine ≥ 0.99 at layer 32, 0.96 on the last token at layer 40, bf16 vs f32); positions equal mlx_vlm's `get_rope_index`; the encoder matches transformers exactly and mlx_vlm to 0.997; all 92 160 packed expert tensors are byte-identical to the safetensors. | Use larger images. Re-check against a bf16 / 8-bit checkpoint if text reading matters. |
 | Decode kernels run 3–4× slower than in isolation (a3b, 4 GiB cap: GPU busy ~87 of ~143 ms/token; LM head 9–11 ms vs 2.8 ms). | Reproduced without the model (`tests/matvec_decode_bench.rs`, `matvec_decode_load_pattern`): ~1 ms GPU bursts separated by ~1 ms CPU gaps leave the GPU in a slow state. A spin kernel on a second queue during the gaps restores speed when the GPU is slow but costs 8–15 ms/token when it is not. | Fewer, longer GPU bursts per token; non-blocking keep-alive in the engine; wire `dequant_matvec_4bit_qmv` (+37–55% bandwidth in isolation) into `encode_matvec`. |
 
@@ -246,6 +246,17 @@ history of `.claude/memory/`, which is no longer tracked.
   `model-qwen3-6-35b-a3b`; the graph-diff kernel tests need no model
   files, so run them under a3b even on a host without a3b weights.
 - `checkpoint_restore.rs` fails under a17b — expected.
+- `dequant_matvec_4bit_n_tokens_v3_n1_matches_single`
+  (`batched_diff_oracle.rs`) failed since the qmv kernel landed: one-token
+  `encode_matvec_n_tokens` takes qmv, but the test's reference was still
+  the v3 kernel, which sums in another order. The reference now follows
+  `STREAMMOE_MATVEC_QMV` like the engine; the test passes either way.
+- Model suites that open uncapped (`smoke`, `mlx_regression`,
+  `consecutive_eval_prompt`, `checkpoint_restore`, `diff_oracle`) take
+  `STREAMMOE_TEST_CAP_GIB=<n>` to open under a cap; 4 is the smallest
+  that holds the default checkpoints. `diff_oracle` opens two contexts
+  at once, so it still needs ~8 GiB. Run model tests under a memory
+  guard, one binary at a time.
 - `cargo fmt` is not a gate (the crate is ~600 hunks off rustfmt); match
   the surrounding style, don't bulk-reformat.
 - zsh does not word-split variables (`$G commit` fails): export

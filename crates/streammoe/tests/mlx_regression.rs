@@ -38,7 +38,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use streammoe::Ctx;
+mod common;
+use common::diff_helpers::open_model;
 
 /// "The quick brown fox" per the Qwen3 tokenizer. Shared across all
 /// qwen3_5_moe variants (same vocab).
@@ -114,7 +115,7 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn run_streammoe(art: &Path, root: &Path) -> Vec<f32> {
-    let mut ctx = Ctx::open(
+    let mut ctx = open_model(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),

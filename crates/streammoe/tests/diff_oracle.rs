@@ -48,7 +48,7 @@ use std::path::Path;
 use std::time::Instant;
 
 mod common;
-use common::diff_helpers::{argmax, artifacts_dir, cosine_sim, default_a3b_paths};
+use common::diff_helpers::{argmax, artifacts_dir, cosine_sim, default_a3b_paths, open_model};
 use streammoe::riir::RsCtx;
 
 // ---------------------------------------------------------------------------
@@ -290,7 +290,7 @@ impl DiffBackend for RsBackend {
         use_2bit: bool,
     ) -> Self {
         Self(
-            RsCtx::open(weights, manifest, vocab, experts_dir, use_2bit)
+            open_model(weights, manifest, vocab, experts_dir, use_2bit)
                 .expect("RsBackend RsCtx::open"),
         )
     }

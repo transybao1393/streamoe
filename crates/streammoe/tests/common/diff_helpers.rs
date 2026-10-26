@@ -15,7 +15,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Comparison helpers
@@ -130,6 +130,37 @@ pub fn assert_logits_close(label: &str, c: &[f32], rs: &[f32]) {
         cos >= COSINE_SIM_MIN,
         "[diff:{label}] cosine sim {cos:.5} below {COSINE_SIM_MIN}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Opening the model
+// ---------------------------------------------------------------------------
+
+/// Opens a context the way `Ctx::open` does — uncapped — unless
+/// `STREAMMOE_TEST_CAP_GIB=<n>` is set: then under an n-GiB `mem_cap`
+/// at n_ctx 4096, so the model suites run on hosts without room for
+/// the uncapped engine. Output is the same at every cap; the capped
+/// path streams experts through the hot tier instead. 4 GiB is the
+/// smallest cap that holds the default checkpoints.
+pub fn open_model(
+    weights: &Path,
+    manifest: &Path,
+    vocab: &Path,
+    root: &Path,
+    use_2bit: bool,
+) -> Result<streammoe::Ctx, streammoe::Error> {
+    match std::env::var("STREAMMOE_TEST_CAP_GIB") {
+        Ok(gib) => {
+            let gib: f64 = gib.parse().expect("STREAMMOE_TEST_CAP_GIB: a number of GiB");
+            let cfg = streammoe::OpenConfig {
+                n_ctx: 4096,
+                mem_cap: Some((gib * (1u64 << 30) as f64) as u64),
+                ..streammoe::OpenConfig::default()
+            };
+            streammoe::Ctx::open_with(weights, manifest, vocab, root, use_2bit, &cfg)
+        }
+        Err(_) => streammoe::Ctx::open(weights, manifest, vocab, root, use_2bit),
+    }
 }
 
 // ---------------------------------------------------------------------------
