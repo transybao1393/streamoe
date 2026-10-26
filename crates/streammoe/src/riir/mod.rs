@@ -1887,6 +1887,28 @@ impl RsCtx<MetalBackend> {
         Ok(())
     }
 
+    /// Decode doesn't use the prefill staging buffer (one block per
+    /// expert, [`budget::Account::PrefillStaging`]), so lend it to the
+    /// hot tier as extra slots until the next batched prefill reclaims
+    /// it. Already counted in the budget and already resident, so the
+    /// tier grows (637 → 893 slots on a3b at a 4 GiB cap) without new
+    /// memory. No-op when already lent, without a hot tier or staging
+    /// buffer, or with `STREAMMOE_HOT_LEND=0`.
+    fn lend_staging_to_hot_tier(&self) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("STREAMMOE_HOT_LEND").map_or(true, |v| v != "0")) {
+            return;
+        }
+        let (Some(hot), Some(mgs), Some(backend)) =
+            (self.experts.hot_tier(), self.moe_graph_scratch.as_ref(), self.backend.as_ref())
+        else {
+            return;
+        };
+        if let Some(id) = mgs.expert_base {
+            hot.lend(backend.pool().handle(id), VARIANT.num_experts);
+        }
+    }
+
     fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
         self.ensure_backend()?;
         // Wrap each mmap'd layer file as a Metal-shared buffer via
@@ -2293,6 +2315,12 @@ impl RsCtx<MetalBackend> {
                 self.step_internal_per_token_oracle(input.rows(i..i + 1), pos, row_out)?;
             }
             return Ok(());
+        }
+
+        // The prefill staging buffer was lent to the hot tier for
+        // decode: take it back before staging writes it.
+        if let Some(hot) = self.experts.hot_tier() {
+            hot.reclaim();
         }
 
         // Chunked iteration over the batched-GQA path, `prefill_chunk`
@@ -3163,6 +3191,7 @@ impl RsCtx<MetalBackend> {
         }
 
         self.ensure_linear_resources()?;
+        self.lend_staging_to_hot_tier();
         let k_active = self.k_active;
         let expert_io_mode = self.expert_io_mode;
         let range = self.layer_range.clone();

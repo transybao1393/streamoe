@@ -20,12 +20,19 @@
 //!   GPU work of earlier tokens has completed by then (each token ends
 //!   by reading back logits on the same queue).
 //!
+//! - **Lent slots.** Memory another phase owns while it is idle can be
+//!   lent to the tier as extra slots ([`HotTier::lend`]): the prefill
+//!   staging buffer (one block per expert, 0.42 GiB on a3b) is unused
+//!   during decode, already counted in the budget and already resident.
+//!   [`HotTier::reclaim`] empties the lent slots and stops using them
+//!   before the owner writes the buffer again.
+//!
 //! Counters can be saved as a routing profile and used to seed the
 //! tier at open ([`HotTier::seed_from_counts`]), so a fresh process
 //! doesn't start cold.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 
@@ -91,6 +98,8 @@ struct Inner {
     /// xorshift state for victim sampling.
     rng: u64,
     stats: HotTierStats,
+    /// Lent slots (after the tier's own `capacity`) currently usable.
+    lent_active: bool,
 }
 
 /// See the module docs.
@@ -98,6 +107,9 @@ pub struct HotTier {
     chunks: Vec<Buffer>,
     slots_per_chunk: usize,
     capacity: usize,
+    /// Buffer lent by another phase and its slot count, slots
+    /// `capacity..capacity + n` ([`Self::lend`]). Set once.
+    lent: OnceLock<(Buffer, usize)>,
     expert_size: usize,
     num_layers: usize,
     num_experts: usize,
@@ -167,6 +179,7 @@ impl HotTier {
             chunks,
             slots_per_chunk,
             capacity,
+            lent: OnceLock::new(),
             expert_size,
             num_layers,
             num_experts,
@@ -182,17 +195,76 @@ impl HotTier {
                     capacity,
                     ..HotTierStats::default()
                 },
+                lent_active: false,
             }),
         })
     }
 
-    /// Slots in the tier.
+    /// Slots in the tier, lent slots included while they are lent.
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.active_capacity(&self.inner.lock().unwrap())
+    }
+
+    fn lent_slots(&self) -> usize {
+        self.lent.get().map_or(0, |&(_, n)| n)
+    }
+
+    fn active_capacity(&self, g: &Inner) -> usize {
+        self.capacity + if g.lent_active { self.lent_slots() } else { 0 }
+    }
+
+    /// Lend `buffer` (at least `slots * expert_size` bytes) to the tier
+    /// as `slots` extra slots, or re-lend it after [`Self::reclaim`].
+    /// The first call fixes the buffer; later calls must pass the same
+    /// one (others are ignored). The owner must not touch the buffer
+    /// until it calls [`Self::reclaim`], and no GPU work of the owner
+    /// may still read it.
+    pub fn lend(&self, buffer: &Buffer, slots: usize) {
+        if slots == 0 || (buffer.length() as usize) < slots * self.expert_size {
+            return;
+        }
+        let (lent, n) = self.lent.get_or_init(|| (buffer.clone(), slots));
+        if lent.contents() != buffer.contents() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.lent_active {
+            return;
+        }
+        let total = self.capacity + n;
+        g.owner.resize(total, None);
+        g.last_bound.resize(total, 0);
+        g.lent_active = true;
+        g.stats.capacity = total;
+    }
+
+    /// Empty the lent slots and stop using them, so the owner can write
+    /// the buffer. No GPU work may still read the experts in them (the
+    /// caller is between tokens). Returns how many were resident.
+    pub fn reclaim(&self) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        if !g.lent_active {
+            return 0;
+        }
+        let mut evicted = 0;
+        for s in self.capacity..self.capacity + self.lent_slots() {
+            if let Some(k) = g.owner[s].take() {
+                g.map.remove(&k);
+                evicted += 1;
+            }
+        }
+        g.lent_active = false;
+        g.stats.capacity = self.capacity;
+        g.stats.resident = g.map.len();
+        evicted
     }
 
     fn slot_location(&self, slot: u32) -> (&Buffer, usize) {
         let slot = slot as usize;
+        if slot >= self.capacity {
+            let (buf, _) = self.lent.get().expect("lent slot without a lent buffer");
+            return (buf, (slot - self.capacity) * self.expert_size);
+        }
         (
             &self.chunks[slot / self.slots_per_chunk],
             (slot % self.slots_per_chunk) * self.expert_size,
@@ -301,17 +373,18 @@ impl HotTier {
         let Some(k) = self.key(layer, expert) else {
             return false;
         };
-        if src.len() != self.expert_size || self.capacity == 0 {
+        if src.len() != self.expert_size {
             return false;
         }
         let mut g = self.inner.lock().unwrap();
-        if g.map.contains_key(&k) {
+        let capacity = self.active_capacity(&g);
+        if capacity == 0 || g.map.contains_key(&k) {
             return false;
         }
         let cand = g.counts[layer * self.num_experts + expert];
-        let slot = if g.map.len() < self.capacity {
+        let slot = if g.map.len() < capacity {
             // First free slot. Linear scan only while filling.
-            g.owner.iter().position(Option::is_none).map(|s| s as u32)
+            g.owner[..capacity].iter().position(Option::is_none).map(|s| s as u32)
         } else {
             let epoch = g.epoch;
             let mut best: Option<(u32, u32)> = None; // (slot, count)
@@ -319,7 +392,7 @@ impl HotTier {
                 g.rng ^= g.rng << 13;
                 g.rng ^= g.rng >> 7;
                 g.rng ^= g.rng << 17;
-                let s = (g.rng % self.capacity as u64) as u32;
+                let s = (g.rng % capacity as u64) as u32;
                 if g.last_bound[s as usize] == epoch {
                     continue;
                 }
@@ -365,7 +438,7 @@ impl HotTier {
     pub fn reset_stats(&self) {
         let mut g = self.inner.lock().unwrap();
         g.stats = HotTierStats {
-            capacity: self.capacity,
+            capacity: self.active_capacity(&g),
             ..HotTierStats::default()
         };
     }
@@ -376,15 +449,21 @@ impl HotTier {
     }
 
     /// The `capacity` most popular `(layer, expert)` pairs in `counts`
-    /// (non-zero only), most popular first. Also installs `counts` as
-    /// the tier's starting popularity. Caller reads each pair and
+    /// (non-zero only), most popular first. Caller reads each pair and
     /// passes the bytes to [`Self::offer`].
+    ///
+    /// The profile picks what to load, not how long it stays: the
+    /// tier's popularity counters are left at zero. A seeded expert the
+    /// workload picks earns counts and stays; one it never picks is
+    /// replaced at the first miss, as in an empty tier. Installing the
+    /// profile's counts instead froze the tier on the profile's topics
+    /// for hundreds of tokens (a3b chat, 4 GiB cap: first-answer hits
+    /// 51% cold vs 28% seeded that way).
     pub fn seed_from_counts(&self, counts: &[u32]) -> Vec<(usize, usize)> {
         let n = self.num_layers * self.num_experts;
         if counts.len() != n {
             return Vec::new();
         }
-        self.inner.lock().unwrap().counts.copy_from_slice(counts);
         let mut order: Vec<usize> = (0..n).filter(|&i| counts[i] > 0).collect();
         order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
         order.truncate(self.capacity);
@@ -537,6 +616,61 @@ mod tests {
         assert_eq!(load_profile(&p, 4, 8).unwrap(), counts);
         assert!(matches!(load_profile(&p, 4, 9), Err(HotTierError::ProfileShape { .. })));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn seeded_experts_yield_to_the_workload() {
+        let t = tier(2);
+        let mut counts = vec![0u32; 32];
+        counts[0] = 500;
+        counts[1] = 400;
+        for (l, e) in t.seed_from_counts(&counts) {
+            assert!(t.offer(l, e, &blob(1)));
+        }
+        // The workload picks (0, 1) and a new expert (2, 2) once each;
+        // the new one replaces the seeded (0, 0) nobody picked.
+        t.record_pick(0, 1);
+        t.record_pick(2, 2);
+        t.begin_epoch();
+        assert!(t.offer(2, 2, &blob(2)));
+        assert!(t.contains(0, 1));
+        assert!(!t.contains(0, 0));
+    }
+
+    #[test]
+    fn lent_slots_hold_experts_until_reclaimed() {
+        let t = tier(2);
+        let dev = Device::system_default().unwrap();
+        let staging = dev.new_buffer((3 * ES) as NSUInteger, MTLResourceOptions::StorageModeShared);
+        t.lend(&staging, 3);
+        assert_eq!(t.capacity(), 5);
+        for e in 0..5 {
+            assert!(t.offer(0, e, &blob(e as u8 + 1)));
+        }
+        // Experts 2..5 live in the lent buffer and round-trip from it.
+        let mut dst = vec![0u8; ES];
+        assert!(t.copy_out(0, 4, &mut dst));
+        assert!(dst.iter().all(|&b| b == 5));
+        let (buf, off) = t.lookup(0, 3).unwrap();
+        assert_eq!((buf.contents(), off), (staging.contents(), ES as u64));
+        // Reclaim drops exactly the lent residents and shrinks the tier.
+        assert_eq!(t.reclaim(), 3);
+        assert_eq!((t.capacity(), t.stats().resident), (2, 2));
+        assert!(t.contains(0, 1) && !t.contains(0, 2));
+        // Full again at 2: a new expert can't land in a reclaimed slot.
+        t.record_picks(1, 0, 9);
+        t.begin_epoch();
+        assert!(t.offer(1, 0, &blob(9)));
+        assert_eq!(t.stats().resident, 2);
+        // Re-lend: empty lent slots fill first.
+        t.lend(&staging, 3);
+        assert!(t.offer(2, 0, &blob(7)));
+        assert_eq!((t.capacity(), t.stats().resident), (5, 3));
+        // Another buffer is ignored once one is fixed.
+        let other = dev.new_buffer((8 * ES) as NSUInteger, MTLResourceOptions::StorageModeShared);
+        t.reclaim();
+        t.lend(&other, 8);
+        assert_eq!(t.capacity(), 2);
     }
 
     #[test]
