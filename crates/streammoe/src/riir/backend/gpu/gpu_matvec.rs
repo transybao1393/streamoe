@@ -21,8 +21,17 @@
 //! - `dequant_matvec_4bit_fast` otherwise. Threadgroup shape: 64
 //!   threads, `out_dim` threadgroups (1 row per group).
 //!
-//! Per the Phase 3 finding, both kernels are bit-exact per-PSO on
-//! the same device.
+//! - `dequant_matvec_4bit_qmv` replaces both for single-token 4-bit
+//!   matvecs when the shape allows it ([`qmv_fits`]): 64 threads,
+//!   `(out_dim + 7) / 8` threadgroups. 1.3–1.5× v3's bandwidth on a3b
+//!   decode shapes (`tests/matvec_decode_bench.rs`); it sums in a
+//!   different order, so it matches v3 to rounding, not bit for bit.
+//!   `STREAMMOE_MATVEC_QMV=0` restores v3 / fast.
+//!
+//! Per the Phase 3 finding, v3 and fast are bit-exact per-PSO on the
+//! same device.
+
+use std::sync::OnceLock;
 
 use metal::{Buffer, CommandBufferRef, MTLSize, NSUInteger};
 use streammoe_metal::{Kernels, QmmCall, QuantWeights};
@@ -74,7 +83,29 @@ pipeline_bundle! {
         v3_4bit_n => "dequant_matvec_4bit_v3_n_tokens",
         fast_4bit_n => "dequant_matvec_4bit_fast_n_tokens",
         v3_8bit_n => "dequant_matvec_8bit_v3_n_tokens",
+        qmv_4bit => "dequant_matvec_4bit_qmv",
     }
+}
+
+/// Whether a single-token 4-bit matvec can take the qmv kernel. qmv
+/// reads 32 weights (one `uint4`) and 32 inputs (eight `float4`s) per
+/// lane step, so rows and the input must be 16-byte aligned and a
+/// 32-weight chunk must not straddle a quantization group.
+fn qmv_fits(in_dim: u32, w_off: u64, input_off: u64) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("STREAMMOE_MATVEC_QMV").map_or(true, |v| v != "0"))
+        && in_dim % 32 == 0
+        && GROUP_SIZE % 32 == 0
+        && w_off % 16 == 0
+        && input_off % 16 == 0
+}
+
+/// Dispatch shape for qmv: 2 SIMD groups × 4 rows per threadgroup.
+fn dispatch_qmv(enc: &metal::ComputeCommandEncoderRef, out_dim: u32) {
+    enc.dispatch_thread_groups(
+        MTLSize::new(out_dim.div_ceil(8) as NSUInteger, 1, 1),
+        MTLSize::new(64, 1, 1),
+    );
 }
 
 /// Encode one matvec dispatch into `cmdbuf`. Reuses the
@@ -89,8 +120,11 @@ pub fn encode_matvec(
     spec: &MatvecSpec,
 ) {
     let group_size = GROUP_SIZE as u32;
+    let use_qmv = spec.bits == 4 && qmv_fits(spec.in_dim, spec.w_off, 0);
     let (pipeline, use_v3_layout) = if spec.bits == 8 {
         (&pipes.v3_8bit, true)
+    } else if use_qmv {
+        (&pipes.qmv_4bit, false)
     } else if spec.in_dim <= 4096 {
         (&pipes.v3_4bit, true)
     } else {
@@ -107,7 +141,9 @@ pub fn encode_matvec(
     enc.set_bytes(5, 4, (&spec.out_dim as *const u32).cast());
     enc.set_bytes(6, 4, (&spec.in_dim as *const u32).cast());
     enc.set_bytes(7, 4, (&group_size as *const u32).cast());
-    if use_v3_layout {
+    if use_qmv {
+        dispatch_qmv(&enc, spec.out_dim);
+    } else if use_v3_layout {
         let num_tgs = (spec.out_dim + 7) / 8;
         enc.dispatch_thread_groups(
             MTLSize::new(num_tgs as NSUInteger, 1, 1),
@@ -162,8 +198,11 @@ pub fn encode_matvec_n_tokens(
         return;
     }
     let group_size = GROUP_SIZE as u32;
+    let use_qmv = bits == 4 && n_tokens == 1 && qmv_fits(in_dim, w_off, input_off);
     let use_v3 = bits == 8 || in_dim <= 4096;
-    let pipeline = if bits == 8 {
+    let pipeline = if use_qmv {
+        &pipes.qmv_4bit
+    } else if bits == 8 {
         &pipes.v3_8bit_n
     } else if use_v3 {
         &pipes.v3_4bit_n
@@ -183,7 +222,9 @@ pub fn encode_matvec_n_tokens(
     enc.set_bytes(7, 4, (&group_size as *const u32).cast());
     enc.set_bytes(8, 4, (&n_tokens as *const u32).cast());
 
-    if use_v3 {
+    if use_qmv {
+        dispatch_qmv(&enc, out_dim);
+    } else if use_v3 {
         let num_row_tiles = (out_dim + 7) / 8;
         enc.set_bytes(9, 4, (&num_row_tiles as *const u32).cast());
         let total_tgs = (num_row_tiles as u64).saturating_mul(n_tokens as u64);

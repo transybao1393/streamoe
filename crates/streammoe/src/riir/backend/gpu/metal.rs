@@ -132,6 +132,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "dequant_matvec_4bit_batched",
     "dequant_matvec_4bit_fast",
     "dequant_matvec_4bit_v3",
+    "dequant_matvec_4bit_qmv",
     "dequant_matvec_4bit_v3_experts",
     "dequant_matvec_4bit_v4",
     "dequant_matvec_4bit_v5",

@@ -342,6 +342,88 @@ kernel void dequant_matvec_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1d-qmv: 4-bit dequant matvec for decode (one token), built for
+// memory bandwidth.
+// ============================================================================
+//
+// v3 (and the v4 / v5 experiments below, which keep its layout) gives
+// each SIMD group one row, loads 4 bytes per lane per step and
+// re-stages the whole input vector in threadgroup memory for every 8
+// rows — on the 248k-row LM head that staging moves as many bytes as
+// the weights. qmv follows MLX's qmv layout instead:
+//
+//   - each lane loads 16 bytes (32 weights) per step: one uint4,
+//   - each SIMD group computes QMV_ROWS rows, keeping its lane's 32
+//     inputs in registers across them (no threadgroup memory),
+//   - a 32-weight chunk never straddles a 64-weight group, so it has
+//     one scale s and one bias b, and contributes
+//       Σ (q·s + b)·x = s·Σ q·x + b·Σ x.
+//
+// Requires in_dim % 32 == 0, group_size % 32 == 0 and 16-byte-aligned
+// weight rows (the host checks and falls back to v3). Summation order
+// differs from v3, so results match to rounding, not bit for bit.
+
+#define QMV_ROWS 4
+#define QMV_SGS  2
+
+inline float qmv_dot8(uint w, thread const float* x) {
+    return float( w        & 0xF) * x[0] + float((w >>  4) & 0xF) * x[1]
+         + float((w >>  8) & 0xF) * x[2] + float((w >> 12) & 0xF) * x[3]
+         + float((w >> 16) & 0xF) * x[4] + float((w >> 20) & 0xF) * x[5]
+         + float((w >> 24) & 0xF) * x[6] + float((w >> 28)      ) * x[7];
+}
+
+kernel void dequant_matvec_4bit_qmv(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint row0 = (tgid * QMV_SGS + simd_group) * QMV_ROWS;
+    if (row0 >= out_dim) return;
+    const uint packed_cols = in_dim / 8;
+    const uint num_groups  = in_dim / group_size;
+
+    float acc[QMV_ROWS] = {0.0f};
+    for (uint c = simd_lane * 32; c < in_dim; c += 32 * 32) {
+        float xr[32];
+        float xsum = 0.0f;
+        device const float4* xv = (device const float4*)(x + c);
+        for (uint i = 0; i < 8; i++) {
+            float4 v = xv[i];
+            xr[4 * i + 0] = v.x; xr[4 * i + 1] = v.y;
+            xr[4 * i + 2] = v.z; xr[4 * i + 3] = v.w;
+            xsum += (v.x + v.y) + (v.z + v.w);
+        }
+        const uint g = c / group_size;
+        for (uint r = 0; r < QMV_ROWS; r++) {
+            const uint row = row0 + r;
+            if (row >= out_dim) break;
+            uint4 w = *(device const uint4*)(W_packed + row * packed_cols + c / 8);
+            float d = qmv_dot8(w.x, xr) + qmv_dot8(w.y, xr + 8)
+                    + qmv_dot8(w.z, xr + 16) + qmv_dot8(w.w, xr + 24);
+            float s = bf16_to_f32(scales[row * num_groups + g]);
+            float b = bf16_to_f32(biases[row * num_groups + g]);
+            acc[r] += fma(s, d, b * xsum);
+        }
+    }
+    for (uint r = 0; r < QMV_ROWS; r++) {
+        float sum = simd_sum(acc[r]);
+        if (simd_lane == 0 && row0 + r < out_dim) {
+            out[row0 + r] = sum;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 1d-v3-n: 4-bit dequant matvec, N tokens (in_dim ≤ 4096 path).
 // ============================================================================
 //
