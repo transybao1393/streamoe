@@ -44,6 +44,10 @@
   recurrence, logits identical to `eval_request` per request. On a3b,
   packed 3-bit, 4 requests × 64 tokens: 1.18–1.25× total tok/s at a
   5 GiB cap, 1.22–1.47× at 7 GiB.
+- `tools/chat` benches: `verify_bench` (cost of checking T tokens in
+  one pass, bit-identity of `eval_tokens`, `--profile`), `spec_bench`
+  (prompt-lookup speculative decoding vs plain decode, end to end) and
+  `batch_bench` (parallel decoding vs one request at a time).
 - `MetalContext::record_wait`; `Ctx::cmdbuf_stats` now includes the
   deferred expert dispatches and the LM head. An ignored expert-kernel
   GPU-time bench in `tests/packed_3bit.rs`.
