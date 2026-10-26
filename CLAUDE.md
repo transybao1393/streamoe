@@ -16,20 +16,15 @@ moeflux. The code still uses the `moeflux` names until the rename.
   were public on the old fork under MIT. The vision work (`b356c5d`
   onward) was never on the old fork.
 - **Open tasks, in order:**
-  1. **License.** *Drafted 2026-10-26 with PolyForm Noncommercial —
-     `LICENSE`, `LICENSE-MIT`, `NOTICE`, Cargo `license`, README;
-     awaiting the user's review.* The user wants personal / academic use free and
-     commercial use only by them. Pick with the user: PolyForm
-     Noncommercial 1.0.0 (recommended) or BSL 1.1 with a change date.
-     The new license covers only commits after `7d73350`; upstream code
-     and the already-public commits stay MIT. Add `LICENSE` (new),
-     `LICENSE-MIT` (current text, unchanged), a `NOTICE` saying what is
-     under which license and crediting flash-moe / moeflux /
-     Michael de Gans, and set `Cargo.toml` `license` to
-     `MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0` (or the BSL
-     equivalent). Mention a lawyer for commercial licensing and the
-     open question of copyright in AI-written code. Keep the repo
-     private until the user has reviewed the license files.
+  1. **License — done** (2026-10-26, `1ff495e`). PolyForm
+     Noncommercial 1.0.0 in `LICENSE.md` (official Markdown text, so
+     GitHub renders it) covers commits after `7d73350`; `LICENSE-MIT`
+     keeps upstream code and the already-public commits; `NOTICE` draws
+     the boundary; Cargo `license` is
+     `MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0`, except
+     `moeflux-metal` (vendored MLX / llama.cpp), which stays `MIT`.
+     Still open: a lawyer's check before selling commercial licenses
+     (copyright in AI-written code).
   2. **Rename the code** moeflux → streamoe: crates (`crates/moeflux*`),
      package names, binaries (`moeflux-node`, `moeflux-coord`), docs,
      `tools/chat` dependency, test env vars only if the user agrees.
