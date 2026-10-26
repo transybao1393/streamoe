@@ -191,6 +191,12 @@ Older engine history (graph mode, prefill, kernels) is in
   holds GPU time too (it was always 0 — metal-rs has no binding for
   `GPUStartTime` / `GPUEndTime`, so `gpu_timing.rs` calls them through
   `msg_send!`).
+- **Disk timeline**: set `STREAMMOE_IO_TRACE=<file>` to log every
+  expert read (start, end, kind, layer, bytes) and per-layer phase
+  markers, then `python3 tools/io_trace_report.py <file>` prints disk
+  busy / idle time per decode phase and prefill staging throughput.
+  It slows decode ~15% — use it to see where time goes, never to
+  measure speed.
 - The SSD tops out at ~6.7 GB/s once ≥ 4 reads are in flight in older
   measurements; at decode sizes on 2026-10-26 (`tests/ssd_read_bench.rs`,
   1.77 MB experts, `F_NOCACHE`) it gave 2.9 GB/s for one read, 4.0 for

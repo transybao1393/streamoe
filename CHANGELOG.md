@@ -28,6 +28,9 @@
   perplexity, scored tasks against a reference run).
 - `STREAMMOE_GPU_TIMING`: GPU timestamps per command buffer;
   `CmdbufStat::gpu_ns` is now real GPU time.
+- `STREAMMOE_IO_TRACE` + `tools/io_trace_report.py`: a timeline of
+  expert reads and forward-pass phases, summarized as disk busy / idle
+  time per phase (costs ~15% decode speed while on).
 - Ignored benches: `matvec_decode_bench` (decode matvec kernels) and
   `ssd_read_bench` (expert reads at decode sizes, sync vs async).
 
