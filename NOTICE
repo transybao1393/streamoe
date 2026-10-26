@@ -21,7 +21,6 @@ repository is licensed in two parts. Git history marks the boundary.
   b. crates/streammoe-metal/, including later changes to it. It vendors
      MLX and llama.cpp kernel source under their MIT licenses; see
      crates/streammoe-metal/NOTICE and crates/streammoe-metal/LICENSE.
-  c. paper/ — the flash-moe paper by Dan Woods.
 
   To get the MIT-only code, check out commit 7d73350.
 

@@ -14,7 +14,7 @@
 *.air
 *.metallib
 
-# Generated model files (recreate with scripts/ and repack_experts.py)
+# Generated model files (recreate with scripts/, e.g. scripts/repack_experts.py)
 model_weights.bin
 model_weights.json
 # Vision tower (tools/export_vision.py) and encoder reference data
@@ -52,11 +52,10 @@ frames/
 # macOS
 .DS_Store
 
-# Third-party reference documents (vendor manuals, others' papers) are
-# not ours to redistribute — link to them instead. paper/ is flash-moe's
-# own paper and stays tracked.
+# Third-party reference documents (vendor manuals, others' papers —
+# flash-moe's included) are not ours to redistribute — link to them
+# instead.
 *.pdf
-!paper/*.pdf
 
 # Local secrets and environment (tokens, signing or license keys)
 .env

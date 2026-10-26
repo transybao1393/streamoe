@@ -16,12 +16,12 @@ hardcoded, so the same script works across model variants — see
 `tools/gen_expert_index.py` for the index generator.
 
 Usage:
-    python repack_experts.py --index expert_index_<variant>.json
-    python repack_experts.py --index <path> --layers 0-4
-    python repack_experts.py --index <path> --layers 0,5,10
-    python repack_experts.py --index <path> --dry-run
-    python repack_experts.py --index <path> --verify-only 0
-    python repack_experts.py --index <path> --output-dir /path/to/output
+    python scripts/repack_experts.py --index expert_index_<variant>.json
+    python scripts/repack_experts.py --index <path> --layers 0-4
+    python scripts/repack_experts.py --index <path> --layers 0,5,10
+    python scripts/repack_experts.py --index <path> --dry-run
+    python scripts/repack_experts.py --index <path> --verify-only 0
+    python scripts/repack_experts.py --index <path> --output-dir /path/to/output
 """
 
 import argparse

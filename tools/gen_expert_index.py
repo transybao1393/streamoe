@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate expert_index.json for an MLX-quantized Qwen MoE model.
 
-This produces the input that `repack_experts.py` consumes: a JSON map
+This produces the input that `scripts/repack_experts.py` consumes: a JSON map
 from layer index to the absolute safetensors byte offsets of each
 expert component (gate/up/down × weight/scales/biases).
 
@@ -17,7 +17,7 @@ Usage:
     python gen_expert_index.py --mlx-path <dir> --out expert_index.json
 
 The output schema matches upstream's hand-written A17B index, so
-`repack_experts.py` consumes it unmodified:
+`scripts/repack_experts.py` consumes it unmodified:
 
     {
       "model_path": "<mlx dir>",
