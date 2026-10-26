@@ -42,6 +42,13 @@ node_modules/
 npm-debug.log*
 package-lock.json
 
+# Raw screen recordings and frame dumps (README demos are committed
+# only as encoded GIFs / PNG stills in docs/media/)
+*.mov
+*.mp4
+*.webm
+frames/
+
 # macOS
 .DS_Store
 
