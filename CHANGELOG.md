@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-beta.1 — 2026-10-27
+
+First beta. Highlights: vision input, packed 3-bit experts, several
+tokens per pass (parallel decoding), early expert dispatch, the a3b
+model suites run under a cap, and the moeflux → streammoe rename.
+Numbers below use the standard setup in `docs/benchmarks.md`.
 
 ### Added
 
@@ -8,7 +13,8 @@
   under a cap (`Account::Checkpoints`).
 - `tools/chat`: a local chat page for Qwen3.6-35B-A3B under a cap.
 - README guide for running Qwen3.6-35B-A3B on a small Mac, with measured
-  memory and speed (≈ 5 tok/s at a 4 GiB cap on an M3 Pro).
+  memory and speed (6.5–9.2 tok/s at 3–6 GiB caps on an M3 Pro), and
+  `docs/benchmarks.md` with the full tables and the test setup.
 - Multimodal RoPE for Qwen3.5 / 3.6 (`MROPE_SECTION`, interleaved
   `[11, 11, 10]`): `Ctx::eval_stage_mrope` takes per-token `[t, h, w]`
   positions; CPU `apply_mrope` and the Metal `rope_n_tokens_mrope`
@@ -65,6 +71,10 @@
   time per phase (costs ~15% decode speed while on).
 - Ignored benches: `matvec_decode_bench` (decode matvec kernels) and
   `ssd_read_bench` (expert reads at decode sizes, sync vs async).
+- `STREAMMOE_TEST_CAP_GIB=<n>`: the model suites that open uncapped
+  (`smoke`, `mlx_regression`, `consecutive_eval_prompt`,
+  `checkpoint_restore`, `diff_oracle`) open under an n-GiB cap instead,
+  so they run on a small host.
 
 ### Performance
 
@@ -73,13 +83,13 @@
   layout from the expert files (`variants::ExpertLayout`,
   `ExpertFiles::layout`) and runs 3-bit decode and prefill kernels with
   output bit-identical to the same codes in 4-bit nibbles. a3b at a
-  4 GiB cap: −20 to −25% per decode token, −29 to −34% time to first
-  word vs 4-bit. `tools/chat --precision 3` uses it.
+  4 GiB cap: 8.1 vs 7.4 tok/s (9–15% faster at every cap from 3 to
+  6 GiB). `tools/chat --precision 3` uses it.
 - Decode waits per prefetch slot instead of for the whole layer's
   prefetch (−1.5 to −5% per token on a3b at a 4 GiB cap).
 - The prefill staging buffer is lent to the hot tier during decode
-  (637 → 893 slots on a3b at 4 GiB, no new memory; −10 to −12% per
-  token on two of three prompts). `STREAMMOE_HOT_LEND=0` turns it off.
+  (256 more slots on a3b, no new memory; 6.9 → 7.4 tok/s at a 4 GiB
+  cap). `STREAMMOE_HOT_LEND=0` turns it off.
 - `qmv` kernel for single-token 4-bit matvecs (LM head 8.2 → 5.9 ms).
   `STREAMMOE_MATVEC_QMV=0` turns it off.
 
@@ -90,6 +100,9 @@
 - Whole-model weights counted at raw length instead of whole pages.
 - Parked request slots' host linear-attn state not touched at open.
 - Intermittent `footprint_is_readable_and_nonzero` failure.
+- `dequant_matvec_4bit_n_tokens_v3_n1_matches_single` compared the qmv
+  path against the v3 kernel; its reference now follows
+  `STREAMMOE_MATVEC_QMV` like the engine.
 
 ### Changed
 
@@ -108,6 +121,12 @@
   `max_checkpoints: 0` if unused); `set_max_checkpoints` cannot raise
   the count past the opened value; `checkpoint_pos` can return
   `StateSnapshotError::CheckpointsFull`. `moeflux-node` plans none.
+- License: work after commit `7d73350` is under PolyForm Noncommercial
+  1.0.0 (`LICENSE.md`); earlier code stays MIT (`LICENSE-MIT`); `NOTICE`
+  draws the boundary.
+- Removed flash-moe leftovers (C engine results, the paper, a
+  model-specific `expert_index.json`); `repack_experts.py` moved to
+  `scripts/`.
 
 ## 0.2.0-alpha.1 — 2026-10-26
 
