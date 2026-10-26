@@ -869,6 +869,7 @@ pub(crate) fn gpu_batched_experts_encode(
         v,
         &bindings,
         None,
+        buffer_pool.handle(bufs.combine_params_id()),
     );
     Ok(cmdbuf.to_owned())
 }
@@ -890,6 +891,49 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
     expert_bindings: &[(&Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
 ) -> Result<metal::CommandBuffer, ExpertForwardError> {
+    let cmdbuf = metal.queue().new_command_buffer().to_owned();
+    let params = buffer_pool.handle(bufs.combine_params_id()).clone();
+    encode_experts_mmap_into(
+        &cmdbuf,
+        metal,
+        bufs,
+        buffer_pool,
+        &params,
+        actual_k,
+        input,
+        h_mid,
+        shared_out,
+        expert_weights,
+        shared_gate_score,
+        expert_bindings,
+        chain,
+    )?;
+    Ok(cmdbuf)
+}
+
+/// [`gpu_batched_experts_encode_mmap`] into the caller's `cmdbuf`,
+/// with the combine weights written to `combine_params` (18 f32s:
+/// the K expert weights, then the shared-gate score at `[16]`). Lets
+/// several tokens' dispatches share one command buffer, each with its
+/// own params buffer (decode with T tokens); the K-expert scratch in
+/// `bufs` is reused in order, since encoders in one command buffer
+/// run one after another.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_experts_mmap_into(
+    cmdbuf: &CommandBufferRef,
+    metal: &mut MetalContext,
+    bufs: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
+    combine_params: &Buffer,
+    actual_k: i32,
+    input: &BufferRef,
+    h_mid: &BufferRef,
+    shared_out: &BufferRef,
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+    expert_bindings: &[(&Buffer, u64)],
+    chain: Option<ChainToNormed<'_>>,
+) -> Result<(), ExpertForwardError> {
     let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
         return Err(ExpertForwardError::BadK {
@@ -904,21 +948,16 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
             actual: expert_weights.len(),
         });
     }
-
     let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
     let v3_experts = metal.pipeline(experts_kernel_name(bufs.layout())).ok().cloned();
     let combine_flat = metal.pipeline(combine_flat_kernel_name())?.clone();
-
     {
-        let buf = buffer_pool.handle(bufs.combine_params_id());
-        let params: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(buf, 18) };
+        let params: &mut [f32] = unsafe { buffer_as_mut_slice::<f32>(combine_params, 18) };
         params.fill(0.0);
         params[..k].copy_from_slice(expert_weights);
         params[16] = shared_gate_score;
     }
-
-    let cmdbuf = metal.queue().new_command_buffer();
     emit_batched_experts(
         cmdbuf,
         &matvec,
@@ -934,8 +973,9 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
         v,
         expert_bindings,
         chain,
+        combine_params,
     );
-    Ok(cmdbuf.to_owned())
+    Ok(())
 }
 
 /// Shared input validation for both encode entry points.
@@ -987,6 +1027,7 @@ fn emit_batched_experts(
     v: Variant,
     expert_bindings: &[(&Buffer, u64)],
     chain: Option<ChainToNormed<'_>>,
+    combine_params_buf: &Buffer,
 ) {
     {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1170,7 +1211,6 @@ fn emit_batched_experts(
                 Some(c) => c.combine_out,
                 None => moe_hidden_buf,
             };
-            let combine_params_buf = buffer_pool.handle(bufs.combine_params_id());
             let enc = cmdbuf.new_compute_command_encoder();
             encode_combine_flat(
                 enc,

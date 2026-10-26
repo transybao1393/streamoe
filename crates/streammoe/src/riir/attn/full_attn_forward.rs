@@ -244,14 +244,49 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // waiting for it (lookahead prefetch of the next layer).
     before_wait: Option<&mut dyn FnMut()>,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    encode_full_attn_cmd1(metal, cmdbuf, gpu, layer_idx, prev_layer_chained)?;
+    metal.commit_and_wait_labeled_with(cmdbuf, "full_attn.cmd1", || {
+        if let Some(f) = before_wait {
+            f()
+        }
+    });
+    let (gpu_attn_args, o_proj) = full_attn_host_attention(gpu, layer_idx, pos, kv_state)?;
+    let cmdbuf = queue.new_command_buffer();
+    post_attention_pre_moe(metal, cmdbuf, gpu, layer_idx, k_active, o_proj, gpu_attn_args, None)
+}
+
+/// CMD1 of [`full_attn_pre_moe_layer_forward`] — input norm (unless
+/// the previous layer chained it) and the q / k / v projections —
+/// encoded into `cmdbuf` without committing.
+pub(in crate::riir) fn encode_full_attn_cmd1(
+    metal: &mut MetalContext,
+    cmdbuf: &metal::CommandBufferRef,
+    gpu: &GpuLayerCtx<'_>,
+    layer_idx: usize,
+    prev_layer_chained: bool,
+) -> Result<(), LayerForwardError> {
+    encode_full_attn_cmd1_steps(metal, cmdbuf, std::slice::from_ref(gpu), layer_idx, prev_layer_chained)
+}
+
+/// [`encode_full_attn_cmd1`] for several tokens, `gpus[t]` per token:
+/// the input norms, then each projection over every token.
+/// Bit-identical per token.
+pub(in crate::riir) fn encode_full_attn_cmd1_steps(
+    metal: &mut MetalContext,
+    cmdbuf: &metal::CommandBufferRef,
+    gpus: &[GpuLayerCtx<'_>],
+    layer_idx: usize,
+    prev_layer_chained: bool,
+) -> Result<(), LayerForwardError> {
     let GpuLayerCtx {
         wf,
         wf_buf,
         layer_cache,
-        buffers,
         buffer_pool,
         ..
-    } = *gpu;
+    } = gpus[0];
     let v = VARIANT;
 
     // Phase 0b (prefill arc): the KV cache is GPU-resident, registered
@@ -280,11 +315,6 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
         wf,
         &format!("model.layers.{layer_idx}.self_attn.v_proj.weight"),
     );
-    let o_bits = bits_of(
-        wf,
-        &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
-    );
-
     // Pull the full-attn-specific offsets out of the tagged-enum
     // cache. Every slot is required at `LayerWeightCache::build` time
     // for full-attn layers, so this is a single match instead of a
@@ -305,14 +335,10 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     let v_w = attn.v_proj_w;
     let v_s = attn.v_proj_s;
     let v_b = attn.v_proj_b;
-    let o_w = attn.o_proj_w;
-    let o_s = attn.o_proj_s;
-    let o_b = attn.o_proj_b;
     // q_norm / k_norm are loaded by name inside `rms_norm_per_head_cpu`;
     // they're guaranteed present here because `LayerWeightCache::build`
     // populated `attn.q_norm_w` / `attn.k_norm_w` as required slots.
 
-    let q_dim = v.num_attn_heads * v.head_dim; // total Q channels
     let q_proj_dim = v.q_proj_dim(); // q (+ per-head sigmoid gate)
     let kv_dim = v.num_kv_heads * v.head_dim;
 
@@ -329,66 +355,85 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // by `post_attention_tail`'s `encode_residual_add`; it's not
     // mutated within the layer's forward, so dual-use is safe.
     {
-        let cmdbuf = metal.queue().new_command_buffer();
 
         // Slice 5d-8: skip the input-norm prelude when the previous
         // layer chained — `buffers.normed` is already populated.
         if !prev_layer_chained {
-            encode_rms_norm_bf16_into(
-                cmdbuf,
-                &rms_pipes,
-                buffer_pool.handle(buffers.input),
-                wf_buf.buffer(),
-                layer_cache.input_layernorm_w,
-                buffer_pool.handle(buffers.sum_sq),
-                buffer_pool.handle(buffers.normed),
-                v.hidden_dim as u32,
-                crate::riir::variants::RMS_NORM_EPS,
-            );
-        }
-
-        let specs = [
-            MatvecSpec {
-                w_off: q_w,
-                s_off: q_s,
-                b_off: q_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.q_proj_out),
-                out_dim: q_proj_dim as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: q_bits,
-            },
-            MatvecSpec {
-                w_off: k_w,
-                s_off: k_s,
-                b_off: k_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.k_out),
-                out_dim: kv_dim as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: k_bits,
-            },
-            MatvecSpec {
-                w_off: v_w,
-                s_off: v_s,
-                b_off: v_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.v_out),
-                out_dim: kv_dim as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: v_bits,
-            },
-        ];
-        for s in &specs {
-            encode_matvec(cmdbuf, &mv, wf_buf, s);
-        }
-
-        metal.commit_and_wait_labeled_with(cmdbuf, "full_attn.cmd1", || {
-            if let Some(f) = before_wait {
-                f()
+            for g in gpus {
+                encode_rms_norm_bf16_into(
+                    cmdbuf,
+                    &rms_pipes,
+                    buffer_pool.handle(g.buffers.input),
+                    wf_buf.buffer(),
+                    layer_cache.input_layernorm_w,
+                    buffer_pool.handle(g.buffers.sum_sq),
+                    buffer_pool.handle(g.buffers.normed),
+                    v.hidden_dim as u32,
+                    crate::riir::variants::RMS_NORM_EPS,
+                );
             }
-        });
+        }
+
+        let proj = |w_off, s_off, b_off, out_dim: usize, bits, outs: Vec<&metal::Buffer>| {
+            let specs: Vec<MatvecSpec> = gpus
+                .iter()
+                .zip(outs)
+                .map(|(g, output)| MatvecSpec {
+                    w_off,
+                    s_off,
+                    b_off,
+                    input: buffer_pool.handle(g.buffers.normed),
+                    output,
+                    out_dim: out_dim as u32,
+                    in_dim: v.hidden_dim as u32,
+                    bits,
+                })
+                .collect();
+            for spec in &specs {
+                encode_matvec(cmdbuf, &mv, wf_buf, spec);
+            }
+        };
+        proj(q_w, q_s, q_b, q_proj_dim, q_bits, gpus.iter().map(|g| buffer_pool.handle(g.buffers.q_proj_out)).collect());
+        proj(k_w, k_s, k_b, kv_dim, k_bits, gpus.iter().map(|g| buffer_pool.handle(g.buffers.k_out)).collect());
+        proj(v_w, v_s, v_b, kv_dim, v_bits, gpus.iter().map(|g| buffer_pool.handle(g.buffers.v_out)).collect());
+
     }
+    Ok(())
+}
+
+/// The host half of a full-attention layer, after CMD1 completed: read
+/// back q / k / v, per-head norms, RoPE at `pos`, append the row to
+/// `kv_state`, then either stage q for the GPU SDPA fast path (returns
+/// its args) or run SDPA on the CPU into `o_proj_stack`. Several tokens
+/// in order append and attend causally: each sees the rows before it.
+pub(in crate::riir) fn full_attn_host_attention(
+    gpu: &GpuLayerCtx<'_>,
+    layer_idx: usize,
+    pos: [i32; 3],
+    kv_state: &mut KvCache,
+) -> Result<(Option<GpuAttnEncodeArgs>, OProj), LayerForwardError> {
+    let GpuLayerCtx {
+        wf,
+        layer_cache,
+        buffers,
+        buffer_pool,
+        ..
+    } = *gpu;
+    let v = VARIANT;
+    let attn = layer_cache
+        .attn
+        .full()
+        .ok_or(LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "full_attn weights (called on linear-attn layer)",
+        })?;
+    let o_bits = bits_of(
+        wf,
+        &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
+    );
+    let q_dim = v.num_attn_heads * v.head_dim;
+    let q_proj_dim = v.q_proj_dim();
+    let kv_dim = v.num_kv_heads * v.head_dim;
 
     // ── Read q_proj_out, k, v back to host ───────────────────────
     let q_proj_host = read_buffer_to_vec(buffer_pool.handle(buffers.q_proj_out), q_proj_dim);
@@ -588,25 +633,16 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     //
     // `queue_clone` (not `queue`) so the cmdbuf borrow doesn't pin
     // `*metal` and block the `&mut metal` arg below.
-    let queue = metal.queue_clone();
-    let cmdbuf = queue.new_command_buffer();
-    let intermediates = post_attention_pre_moe(
-        metal,
-        cmdbuf,
-        gpu,
-        layer_idx,
-        k_active,
+    Ok((
+        gpu_attn_args,
         OProj {
-            w_off: o_w,
-            s_off: o_s,
-            b_off: o_b,
+            w_off: attn.o_proj_w,
+            s_off: attn.o_proj_s,
+            b_off: attn.o_proj_b,
             bits: o_bits,
             in_dim: q_dim as u32,
         },
-        gpu_attn_args,
-        None,
-    )?;
-    Ok(intermediates)
+    ))
 }
 
 /// Run one full-attention layer's forward pass — per-token wrapper.

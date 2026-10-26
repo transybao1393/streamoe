@@ -658,6 +658,18 @@ impl LayerForwardBuffers {
         Self::new_for_range(pool, 0..VARIANT.num_layers)
     }
 
+    /// Per-step buffers for one more token of decode with T tokens: its
+    /// own input / normed / projection / router scratch, and `main`'s
+    /// recurrence state (the tokens of one pass advance the same state,
+    /// in order). Callers refresh `conv_state` / `delta_state` from the
+    /// live set before each pass — a request switch swaps them.
+    pub fn new_step_set(pool: &mut MetalBufferPool, main: &Self) -> Self {
+        let mut s = Self::new_for_range(pool, 0..0);
+        s.conv_state = main.conv_state.clone();
+        s.delta_state = main.delta_state.clone();
+        s
+    }
+
     /// [`Self::new`] allocating recurrence state only for the
     /// linear-attn layers in `range` (plan phase 3).
     pub fn new_for_range(pool: &mut MetalBufferPool, range: std::ops::Range<usize>) -> Self {
@@ -1008,14 +1020,73 @@ pub fn linear_attn_layer_forward(
     // disables the chain — used for the last layer and the dump hook.
     chain_next_norm_off: Option<u64>,
 ) -> Result<(), LayerForwardError> {
+    let queue = metal.queue_clone();
+    let cmdbuf = queue.new_command_buffer();
+    let o_proj = encode_linear_attn_cmd1(metal, cmdbuf, gpu, layer_idx, prev_layer_chained)?;
+
+    // ── Hand off to the shared post-attention tail ───────────────
+    // `batch_out[6]` already holds the `gated_rms_norm` output —
+    // exactly the o_proj input the tail consumes. The tail leaves an
+    // in-flight K-expert dispatch in `*deferred`. Linear-attn never
+    // takes the GPU SDPA fast path (it has no attention-kernel
+    // pipeline), so `gpu_attn_args = None`.
+    post_attention_tail(
+        metal,
+        cmdbuf,
+        gpu,
+        moe,
+        deferred,
+        layer_idx,
+        k_active,
+        expert_files,
+        pool,
+        prefetch,
+        prefetch_set,
+        o_proj,
+        gpu_combine,
+        /* gpu_attn_args = */ None,
+        chain_next_norm_off,
+    )
+}
+
+/// CMD1 of [`linear_attn_layer_forward`] — input norm (unless the
+/// previous layer chained it), projections, conv, gated delta-net step
+/// — encoded into `cmdbuf` without committing. The recurrence state
+/// is updated in place, so several tokens' CMD1s encoded in order into
+/// one command buffer advance it token by token (decode with T
+/// tokens). Returns the layer's o_proj for the post-attention tail.
+pub(in crate::riir) fn encode_linear_attn_cmd1(
+    metal: &mut MetalContext,
+    cmdbuf: &CommandBufferRef,
+    gpu: &GpuLayerCtx<'_>,
+    layer_idx: usize,
+    prev_layer_chained: bool,
+) -> Result<OProj, LayerForwardError> {
+    encode_linear_attn_cmd1_steps(metal, cmdbuf, std::slice::from_ref(gpu), layer_idx, prev_layer_chained, &[])
+}
+
+/// [`encode_linear_attn_cmd1`] for several consecutive tokens of decode
+/// with T tokens, `gpus[t]` holding token `t`'s step buffers. Encoded
+/// op by op across the tokens; the conv and delta-net steps run token
+/// by token, in order, on the recurrence their step sets share. `rollback[t]`, when given, receives this layer's conv /
+/// delta state after token `t`. Per token the kernels and their order
+/// are the single-token path's, so results are bit-identical.
+pub(in crate::riir) fn encode_linear_attn_cmd1_steps(
+    metal: &mut MetalContext,
+    cmdbuf: &CommandBufferRef,
+    gpus: &[GpuLayerCtx<'_>],
+    layer_idx: usize,
+    prev_layer_chained: bool,
+    rollback: &[(BufId<ConvStateBuf>, BufId<DeltaStateBuf>)],
+) -> Result<OProj, LayerForwardError> {
     let GpuLayerCtx {
         wf,
         wf_buf,
         layer_cache,
-        buffers,
         buffer_pool,
         ..
-    } = *gpu;
+    } = gpus[0];
+    let steps: Vec<&LayerForwardBuffers> = gpus.iter().map(|g| g.buffers).collect();
     let v = VARIANT;
     let linear_layer_idx =
         linear_layer_idx_for(layer_idx).ok_or(LayerForwardError::MissingTensor {
@@ -1112,171 +1183,148 @@ pub fn linear_attn_layer_forward(
     //
     // `queue_clone` (not `queue`) so the cmdbuf borrow doesn't pin
     // `*metal` and block the `&mut metal` arg to `post_attention_tail`.
-    let queue = metal.queue_clone();
-    let cmdbuf = queue.new_command_buffer();
     {
         // Slice 5d-8: skip the input-norm prelude when the previous
         // layer chained — `buffers.normed` is already populated by the
         // appended rms_norm at the tail of the previous K-expert cmdbuf
         // (drained at the top of `step_internal`'s layer iteration).
         if !prev_layer_chained {
-            encode_rms_norm_bf16_into(
+            for b in &steps {
+                encode_rms_norm_bf16_into(
+                    cmdbuf,
+                    &rms_pipes,
+                    buffer_pool.handle(b.input),
+                    wf_buf.buffer(),
+                    layer_cache.input_layernorm_w,
+                    buffer_pool.handle(b.sum_sq),
+                    buffer_pool.handle(b.normed),
+                    v.hidden_dim as u32,
+                    RMS_NORM_EPS,
+                );
+            }
+        }
+
+        // 4 projections from each token's normed input:
+        let proj = |w_off, s_off, b_off, out_dim: usize, bits, outs: Vec<&Buffer>| {
+            let specs: Vec<MatvecSpec> = steps
+                .iter()
+                .zip(outs)
+                .map(|(b, output)| MatvecSpec {
+                    w_off,
+                    s_off,
+                    b_off,
+                    input: buffer_pool.handle(b.normed),
+                    output,
+                    out_dim: out_dim as u32,
+                    in_dim: v.hidden_dim as u32,
+                    bits,
+                })
+                .collect();
+            for spec in &specs {
+                encode_matvec(cmdbuf, &mv, wf_buf, spec);
+            }
+        };
+        proj(qkv_w, qkv_s, qkv_b, v.linear_conv_dim(), qkv_bits, steps.iter().map(|b| buffer_pool.handle(b.q_stack)).collect());
+        proj(z_w, z_s, z_b, v.linear_total_value(), z_bits, steps.iter().map(|b| buffer_pool.handle(b.z_stack)).collect());
+        proj(beta_w, beta_s, beta_b, v.linear_num_v_heads, beta_bits, steps.iter().map(|b| buffer_pool.handle(b.beta_stack)).collect());
+        proj(alpha_w, alpha_s, alpha_b, v.linear_num_v_heads, alpha_bits, steps.iter().map(|b| buffer_pool.handle(b.alpha_stack)).collect());
+
+        // Copy this layer's state after token t into `rollback[t]`.
+        let keep = |src: &Buffer, dst: &Buffer| {
+            let blit = cmdbuf.new_blit_command_encoder();
+            blit.copy_from_buffer(src, 0, dst, 0, src.length());
+            blit.end_encoding();
+        };
+        for (t, b) in steps.iter().enumerate() {
+            encode_conv1d_step(
                 cmdbuf,
-                &rms_pipes,
-                buffer_pool.handle(buffers.input),
+                &lp.conv1d_step,
+                &lp.conv1d_state_update,
+                buffer_pool.handle(b.conv_state[linear_layer_idx]),
+                buffer_pool.handle(b.q_stack),
+                0,
                 wf_buf.buffer(),
-                layer_cache.input_layernorm_w,
-                buffer_pool.handle(buffers.sum_sq),
-                buffer_pool.handle(buffers.normed),
-                v.hidden_dim as u32,
-                RMS_NORM_EPS,
+                conv1d_w,
+                buffer_pool.handle(b.conv_output),
+                v.linear_conv_dim() as u32,
+            );
+            if let Some(&(conv, _)) = rollback.get(t) {
+                keep(buffer_pool.handle(b.conv_state[linear_layer_idx]), buffer_pool.handle(conv));
+            }
+        }
+
+        for b in &steps {
+            encode_rms_norm_qk(
+                cmdbuf,
+                &lp.rms_norm_qk,
+                buffer_pool.handle(b.conv_output),
+                v.linear_num_k_heads as u32,
+                Variant::LINEAR_KEY_DIM as u32,
             );
         }
 
-        // 4 batched projections from buffers.normed:
-        let specs = [
-            MatvecSpec {
-                w_off: qkv_w,
-                s_off: qkv_s,
-                b_off: qkv_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.q_stack),
-                out_dim: v.linear_conv_dim() as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: qkv_bits,
-            },
-            MatvecSpec {
-                w_off: z_w,
-                s_off: z_s,
-                b_off: z_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.z_stack),
-                out_dim: v.linear_total_value() as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: z_bits,
-            },
-            MatvecSpec {
-                w_off: beta_w,
-                s_off: beta_s,
-                b_off: beta_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.beta_stack),
-                out_dim: v.linear_num_v_heads as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: beta_bits,
-            },
-            MatvecSpec {
-                w_off: alpha_w,
-                s_off: alpha_s,
-                b_off: alpha_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.alpha_stack),
-                out_dim: v.linear_num_v_heads as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: alpha_bits,
-            },
-        ];
-        for s in &specs {
-            encode_matvec(cmdbuf, &mv, wf_buf, s);
+        for b in &steps {
+            encode_compute_decay_beta(
+                cmdbuf,
+                &lp.compute_decay_beta,
+                buffer_pool.handle(b.alpha_stack), // alpha
+                0,
+                buffer_pool.handle(b.beta_stack), // beta
+                0,
+                wf_buf.buffer(),
+                a_log,
+                dt_bias,
+                buffer_pool.handle(b.delta_g_decay),
+                buffer_pool.handle(b.delta_beta),
+                v.linear_num_v_heads as u32,
+            );
         }
 
-        encode_conv1d_step(
-            cmdbuf,
-            &lp.conv1d_step,
-            &lp.conv1d_state_update,
-            buffer_pool.handle(buffers.conv_state[linear_layer_idx]),
-            buffer_pool.handle(buffers.q_stack),
-            0,
-            wf_buf.buffer(),
-            conv1d_w,
-            buffer_pool.handle(buffers.conv_output),
-            v.linear_conv_dim() as u32,
-        );
-
-        encode_rms_norm_qk(
-            cmdbuf,
-            &lp.rms_norm_qk,
-            buffer_pool.handle(buffers.conv_output),
-            v.linear_num_k_heads as u32,
-            Variant::LINEAR_KEY_DIM as u32,
-        );
-
-        encode_compute_decay_beta(
-            cmdbuf,
-            &lp.compute_decay_beta,
-            buffer_pool.handle(buffers.alpha_stack), // alpha
-            0,
-            buffer_pool.handle(buffers.beta_stack), // beta
-            0,
-            wf_buf.buffer(),
-            a_log,
-            dt_bias,
-            buffer_pool.handle(buffers.delta_g_decay),
-            buffer_pool.handle(buffers.delta_beta),
-            v.linear_num_v_heads as u32,
-        );
-
         let k_heads_per_v = (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
-        encode_delta_net_step(
-            cmdbuf,
-            &lp.delta_net_step,
-            buffer_pool.handle(buffers.delta_state[linear_layer_idx]),
-            buffer_pool.handle(buffers.conv_output),
-            buffer_pool.handle(buffers.delta_g_decay),
-            buffer_pool.handle(buffers.delta_beta),
-            buffer_pool.handle(buffers.delta_output),
-            v.linear_num_v_heads as u32,
-            Variant::LINEAR_VALUE_DIM as u32,
-            k_heads_per_v,
-        );
+        for (t, b) in steps.iter().enumerate() {
+            encode_delta_net_step(
+                cmdbuf,
+                &lp.delta_net_step,
+                buffer_pool.handle(b.delta_state[linear_layer_idx]),
+                buffer_pool.handle(b.conv_output),
+                buffer_pool.handle(b.delta_g_decay),
+                buffer_pool.handle(b.delta_beta),
+                buffer_pool.handle(b.delta_output),
+                v.linear_num_v_heads as u32,
+                Variant::LINEAR_VALUE_DIM as u32,
+                k_heads_per_v,
+            );
+            if let Some(&(_, delta)) = rollback.get(t) {
+                keep(buffer_pool.handle(b.delta_state[linear_layer_idx]), buffer_pool.handle(delta));
+            }
+        }
 
-        encode_gated_rms_norm(
-            cmdbuf,
-            &lp.gated_rms_norm,
-            buffer_pool.handle(buffers.delta_output),
-            buffer_pool.handle(buffers.z_stack), // z
-            0,
-            wf_buf.buffer(),
-            gnorm_w,
-            buffer_pool.handle(buffers.o_proj_stack),
-            0,
-            v.linear_num_v_heads as u32,
-            Variant::LINEAR_VALUE_DIM as u32,
-        );
+        for b in &steps {
+            encode_gated_rms_norm(
+                cmdbuf,
+                &lp.gated_rms_norm,
+                buffer_pool.handle(b.delta_output),
+                buffer_pool.handle(b.z_stack), // z
+                0,
+                wf_buf.buffer(),
+                gnorm_w,
+                buffer_pool.handle(b.o_proj_stack),
+                0,
+                v.linear_num_v_heads as u32,
+                Variant::LINEAR_VALUE_DIM as u32,
+            );
+        }
 
         // Slice cmdbuf-fold-1: CMD1's commit+wait is gone — the tail
         // commits the same cmdbuf below after encoding CMD2+3.
     }
-
-    // ── Hand off to the shared post-attention tail ───────────────
-    // `batch_out[6]` already holds the `gated_rms_norm` output —
-    // exactly the o_proj input the tail consumes. The tail leaves an
-    // in-flight K-expert dispatch in `*deferred`. Linear-attn never
-    // takes the GPU SDPA fast path (it has no attention-kernel
-    // pipeline), so `gpu_attn_args = None`.
-    post_attention_tail(
-        metal,
-        cmdbuf,
-        gpu,
-        moe,
-        deferred,
-        layer_idx,
-        k_active,
-        expert_files,
-        pool,
-        prefetch,
-        prefetch_set,
-        OProj {
-            w_off: o_w,
-            s_off: o_s,
-            b_off: o_b,
-            bits: o_bits,
-            in_dim: v.linear_total_value() as u32,
-        },
-        gpu_combine,
-        /* gpu_attn_args = */ None,
-        chain_next_norm_off,
-    )
+    Ok(OProj {
+        w_off: o_w,
+        s_off: o_s,
+        b_off: o_b,
+        bits: o_bits,
+        in_dim: v.linear_total_value() as u32,
+    })
 }
 
 /// Host-side bookkeeping captured by [`post_attention_pre_moe`] and
@@ -1483,14 +1531,51 @@ pub(in crate::riir) fn post_attention_pre_moe(
     // waiting for it (lookahead prefetch of the next layer).
     before_wait: Option<&mut dyn FnMut()>,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
+    encode_post_attention(metal, cmdbuf, gpu, layer_idx, o_proj, gpu_attn_args)?;
+    metal.commit_and_wait_labeled_with(cmdbuf, "post_attn_tail.cmd2_3", || {
+        if let Some(f) = before_wait {
+            f()
+        }
+    });
+    finish_post_attention(gpu, k_active)
+}
+
+/// Encode CMD2+3 of [`post_attention_pre_moe`] — o_proj, residual,
+/// post-attention norm, router logits, shared expert — into `cmdbuf`
+/// without committing it. Decode with T tokens encodes every token's
+/// CMD2+3 into one command buffer, each with its own `gpu.buffers`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::riir) fn encode_post_attention(
+    metal: &mut MetalContext,
+    cmdbuf: &CommandBufferRef,
+    gpu: &GpuLayerCtx<'_>,
+    layer_idx: usize,
+    o_proj: OProj,
+    gpu_attn_args: Option<GpuAttnEncodeArgs>,
+) -> Result<(), LayerForwardError> {
+    encode_post_attention_steps(metal, cmdbuf, std::slice::from_ref(gpu), layer_idx, o_proj, &[gpu_attn_args])
+}
+
+/// [`encode_post_attention`] for several tokens of one layer,
+/// `gpus[t]` / `gpu_attn_args[t]` per token. Encoded op by op across
+/// the tokens; per token the kernels and their order are the
+/// single-token path's, so results are bit-identical.
+pub(in crate::riir) fn encode_post_attention_steps(
+    metal: &mut MetalContext,
+    cmdbuf: &CommandBufferRef,
+    gpus: &[GpuLayerCtx<'_>],
+    layer_idx: usize,
+    o_proj: OProj,
+    gpu_attn_args: &[Option<GpuAttnEncodeArgs>],
+) -> Result<(), LayerForwardError> {
     let GpuLayerCtx {
         wf,
         wf_buf,
         layer_cache,
-        buffers,
         buffer_pool,
         ..
-    } = *gpu;
+    } = gpus[0];
+    let steps: Vec<&LayerForwardBuffers> = gpus.iter().map(|g| g.buffers).collect();
     let v = VARIANT;
 
     // Per-tensor bit widths for the MoE-side matvecs.
@@ -1528,7 +1613,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
     // Slice 5d-7b: pre-fetch attn pipelines only when the GPU SDPA
     // fast path is active. Keeps the CPU-SDPA / linear-attn paths
     // free of unrelated pipeline lookups.
-    let attn_pipes = if gpu_attn_args.is_some() {
+    let attn_pipes = if gpu_attn_args.iter().any(Option::is_some) {
         Some(GpuAttnPipelines::fetch(metal)?)
     } else {
         None
@@ -1570,7 +1655,10 @@ pub(in crate::riir) fn post_attention_pre_moe(
         // are pre-staged into `buffers.gpu_attn_q` / `gpu_attn_gate` by
         // the caller; K/V are read directly from the canonical pool KV
         // (`args.k_cache` / `v_cache`).
-        if let (Some(args), Some(attn_pipes)) = (gpu_attn_args.as_ref(), attn_pipes.as_ref()) {
+        for (b, args) in steps.iter().zip(gpu_attn_args) {
+            let (Some(args), Some(attn_pipes)) = (args.as_ref(), attn_pipes.as_ref()) else {
+                continue;
+            };
             let head_dim = v.head_dim as u32;
             let kv_dim = (v.num_kv_heads * v.head_dim) as u32;
             let num_heads = v.num_attn_heads as u32;
@@ -1581,9 +1669,9 @@ pub(in crate::riir) fn post_attention_pre_moe(
             encode_attn_scores_batched_into(
                 cmdbuf,
                 &attn_pipes.scores,
-                buffer_pool.handle(buffers.gpu_attn_q),
+                buffer_pool.handle(b.gpu_attn_q),
                 buffer_pool.handle(args.k_cache),
-                buffer_pool.handle(buffers.gpu_attn_scores),
+                buffer_pool.handle(b.gpu_attn_scores),
                 num_heads,
                 head_dim,
                 kv_dim,
@@ -1595,7 +1683,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
             encode_attn_softmax_batched_into(
                 cmdbuf,
                 &attn_pipes.softmax,
-                buffer_pool.handle(buffers.gpu_attn_scores),
+                buffer_pool.handle(b.gpu_attn_scores),
                 num_heads,
                 args.kv_len,
                 seq_stride,
@@ -1603,9 +1691,9 @@ pub(in crate::riir) fn post_attention_pre_moe(
             encode_attn_values_batched_into(
                 cmdbuf,
                 &attn_pipes.values,
-                buffer_pool.handle(buffers.gpu_attn_scores),
+                buffer_pool.handle(b.gpu_attn_scores),
                 buffer_pool.handle(args.v_cache),
-                buffer_pool.handle(buffers.gpu_attn_out),
+                buffer_pool.handle(b.gpu_attn_out),
                 num_heads,
                 head_dim,
                 kv_dim,
@@ -1617,154 +1705,113 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 encode_sigmoid_gate_into(
                     cmdbuf,
                     &attn_pipes.gate,
-                    buffer_pool.handle(buffers.gpu_attn_out),
-                    buffer_pool.handle(buffers.gpu_attn_gate),
+                    buffer_pool.handle(b.gpu_attn_out),
+                    buffer_pool.handle(b.gpu_attn_gate),
                     num_heads * head_dim,
                 );
             }
         }
 
+        // One matvec over every token: `io` gives each token's input /
+        // output.
+        let matvec = |w_off, s_off, b_off, out_dim: u32, in_dim: u32, bits, io: Vec<(&Buffer, &Buffer)>| {
+            let specs: Vec<MatvecSpec> = io
+                .into_iter()
+                .map(|(input, output)| MatvecSpec { w_off, s_off, b_off, input, output, out_dim, in_dim, bits })
+                .collect();
+            for spec in &specs {
+                encode_matvec(cmdbuf, &mv, wf_buf, spec);
+            }
+        };
+
         // o_proj + residual_add + post-attn rms_norm (was CMD2).
         // GPU SDPA path: read from `gpu_attn_out` (zero-host-stage).
         // CPU SDPA / linear-attn paths: read from `batch_out[6]`.
-        let oproj_input = if gpu_attn_args.is_some() {
-            buffer_pool.handle(buffers.gpu_attn_out)
-        } else {
-            buffer_pool.handle(buffers.o_proj_stack)
-        };
-        encode_matvec(
-            cmdbuf,
-            &mv,
-            wf_buf,
-            &MatvecSpec {
-                w_off: o_proj.w_off,
-                s_off: o_proj.s_off,
-                b_off: o_proj.b_off,
-                input: oproj_input,
-                output: buffer_pool.handle(buffers.output),
-                out_dim: v.hidden_dim as u32,
-                in_dim: o_proj.in_dim,
-                bits: o_proj.bits,
-            },
-        );
-        encode_residual_add(
-            cmdbuf,
-            &resid_add,
-            buffer_pool.handle(buffers.output),
-            buffer_pool.handle(buffers.input), // residual source — see slice 5d-2 note
-            buffer_pool.handle(buffers.h_mid),
-            v.hidden_dim as u32,
-        );
-        encode_rms_norm_pair(
-            cmdbuf,
-            &sum_sq,
-            &apply,
-            buffer_pool.handle(buffers.h_mid),
-            wf_buf.buffer(),
-            post_attn_norm_w,
-            buffer_pool.handle(buffers.normed),
-            buffer_pool.handle(buffers.sum_sq),
-            v.hidden_dim as u32,
-        );
-
-        // gate logits + shared-expert gate scalar + shared FFN
-        // gate/up matvecs (was CMD3a).
-        encode_matvec(
-            cmdbuf,
-            &mv,
-            wf_buf,
-            &MatvecSpec {
-                w_off: gate_w,
-                s_off: gate_s,
-                b_off: gate_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.gate_logits),
-                out_dim: v.num_experts as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: gate_bits,
-            },
-        );
-        if let Some(sh) = shared {
-            encode_matvec(
+        let oproj_io = steps
+            .iter()
+            .zip(gpu_attn_args)
+            .map(|(b, args)| {
+                let input = if args.is_some() {
+                    buffer_pool.handle(b.gpu_attn_out)
+                } else {
+                    buffer_pool.handle(b.o_proj_stack)
+                };
+                (input, buffer_pool.handle(b.output))
+            })
+            .collect();
+        matvec(o_proj.w_off, o_proj.s_off, o_proj.b_off, v.hidden_dim as u32, o_proj.in_dim, o_proj.bits, oproj_io);
+        for b in &steps {
+            encode_residual_add(
                 cmdbuf,
-                &mv,
-                wf_buf,
-                &MatvecSpec {
-                    w_off: sh.seg_w,
-                    s_off: sh.seg_s,
-                    b_off: sh.seg_b,
-                    input: buffer_pool.handle(buffers.normed),
-                    output: buffer_pool.handle(buffers.shared_gate),
-                    out_dim: 1,
-                    in_dim: v.hidden_dim as u32,
-                    bits: seg_bits,
-                },
+                &resid_add,
+                buffer_pool.handle(b.output),
+                buffer_pool.handle(b.input), // residual source — see slice 5d-2 note
+                buffer_pool.handle(b.h_mid),
+                v.hidden_dim as u32,
             );
-            encode_matvec(
+            encode_rms_norm_pair(
                 cmdbuf,
-                &mv,
-                wf_buf,
-                &MatvecSpec {
-                    w_off: sh.gate_w,
-                    s_off: sh.gate_s,
-                    b_off: sh.gate_b,
-                    input: buffer_pool.handle(buffers.normed),
-                    output: buffer_pool.handle(buffers.shared_gate_out),
-                    out_dim: v.shared_intermediate as u32,
-                    in_dim: v.hidden_dim as u32,
-                    bits: s_gate_bits,
-                },
-            );
-            encode_matvec(
-                cmdbuf,
-                &mv,
-                wf_buf,
-                &MatvecSpec {
-                    w_off: sh.up_w,
-                    s_off: sh.up_s,
-                    b_off: sh.up_b,
-                    input: buffer_pool.handle(buffers.normed),
-                    output: buffer_pool.handle(buffers.shared_up_out),
-                    out_dim: v.shared_intermediate as u32,
-                    in_dim: v.hidden_dim as u32,
-                    bits: s_up_bits,
-                },
-            );
-
-            // GPU swiglu — was the CPU loop between CMD3a and CMD3a-b.
-            encode_swiglu_buf(
-                cmdbuf,
-                &swiglu,
-                buffer_pool.handle(buffers.shared_gate_out),
-                buffer_pool.handle(buffers.shared_up_out),
-                buffer_pool.handle(buffers.shared_act),
-                v.shared_intermediate as u32,
-            );
-
-            // shared_down matvec (was CMD3a-b).
-            encode_matvec(
-                cmdbuf,
-                &mv,
-                wf_buf,
-                &MatvecSpec {
-                    w_off: sh.down_w,
-                    s_off: sh.down_s,
-                    b_off: sh.down_b,
-                    input: buffer_pool.handle(buffers.shared_act),
-                    output: buffer_pool.handle(buffers.shared_out),
-                    out_dim: v.hidden_dim as u32,
-                    in_dim: v.shared_intermediate as u32,
-                    bits: s_down_bits,
-                },
+                &sum_sq,
+                &apply,
+                buffer_pool.handle(b.h_mid),
+                wf_buf.buffer(),
+                post_attn_norm_w,
+                buffer_pool.handle(b.normed),
+                buffer_pool.handle(b.sum_sq),
+                v.hidden_dim as u32,
             );
         }
 
-        metal.commit_and_wait_labeled_with(cmdbuf, "post_attn_tail.cmd2_3", || {
-            if let Some(f) = before_wait {
-                f()
+        // gate logits + shared-expert gate scalar + shared FFN
+        // gate/up matvecs (was CMD3a).
+        let hidden = v.hidden_dim as u32;
+        macro_rules! from_normed {
+            ($field:ident) => {
+                steps.iter().map(|b| (buffer_pool.handle(b.normed), buffer_pool.handle(b.$field))).collect()
+            };
+        }
+        matvec(gate_w, gate_s, gate_b, v.num_experts as u32, hidden, gate_bits, from_normed!(gate_logits));
+        if let Some(sh) = shared {
+            matvec(sh.seg_w, sh.seg_s, sh.seg_b, 1, hidden, seg_bits, from_normed!(shared_gate));
+            let inter = v.shared_intermediate as u32;
+            matvec(sh.gate_w, sh.gate_s, sh.gate_b, inter, hidden, s_gate_bits, from_normed!(shared_gate_out));
+            matvec(sh.up_w, sh.up_s, sh.up_b, inter, hidden, s_up_bits, from_normed!(shared_up_out));
+
+            // GPU swiglu — was the CPU loop between CMD3a and CMD3a-b.
+            for b in &steps {
+                encode_swiglu_buf(
+                    cmdbuf,
+                    &swiglu,
+                    buffer_pool.handle(b.shared_gate_out),
+                    buffer_pool.handle(b.shared_up_out),
+                    buffer_pool.handle(b.shared_act),
+                    inter,
+                );
             }
-        });
+
+            // shared_down matvec (was CMD3a-b).
+            let down_io = steps.iter().map(|b| (buffer_pool.handle(b.shared_act), buffer_pool.handle(b.shared_out))).collect();
+            matvec(sh.down_w, sh.down_s, sh.down_b, hidden, inter, s_down_bits, down_io);
+        }
+
     }
+    Ok(())
+}
+
+/// After [`encode_post_attention`]'s command buffer completed: the CPU
+/// MoE router on `gpu.buffers`' gate logits and the shared-gate scalar.
+pub(in crate::riir) fn finish_post_attention(
+    gpu: &GpuLayerCtx<'_>,
+    k_active: usize,
+) -> Result<PostAttnIntermediates, LayerForwardError> {
+    let GpuLayerCtx {
+        layer_cache,
+        buffers,
+        buffer_pool,
+        ..
+    } = *gpu;
+    let v = VARIANT;
+    let shared = layer_cache.shared.as_ref();
 
     // ── CPU: MoE router on the gate logits ───────────────────────
     let mut scores = read_buffer_to_vec(buffer_pool.handle(buffers.gate_logits), v.num_experts);

@@ -111,6 +111,23 @@ impl DeferredRing {
         Ok(())
     }
 
+    /// Push a committed GPU-combine dispatch encoded outside this
+    /// module (decode with T tokens: one command buffer holding every
+    /// token's K-expert dispatch for a layer).
+    pub(crate) fn push_gpu(
+        &mut self,
+        cmd_buffer: metal::CommandBuffer,
+        layer_idx: i32,
+        actual_k: usize,
+    ) -> Result<(), DeferredError> {
+        self.push(DeferredState {
+            cmd_buffer,
+            mode: DeferredMode::Gpu,
+            layer_idx,
+            actual_k,
+        })
+    }
+
     /// Wait for every in-flight dispatch to finish on the GPU without
     /// removing it (its completion/readback still happens through the
     /// normal drain). Lookahead prefetch (plan phase 6) uses this

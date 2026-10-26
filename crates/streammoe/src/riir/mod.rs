@@ -28,6 +28,7 @@ pub mod attn;
 pub mod backend;
 pub mod budget;
 pub mod config;
+mod decode_multi;
 pub mod gpu_capture;
 pub mod io;
 pub mod moe;
@@ -293,6 +294,8 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     layer_range: std::ops::Range<usize>,
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
+    /// Extra per-token buffers for [`Self::eval_tokens`], built on first use.
+    multi_decode: Option<decode_multi::MultiDecodeBuffers>,
     /// S10b-2: run-lifetime scratch BufIds for the batched linear-attn
     /// `graph1` (allocated once at max chunk width, reused every step /
     /// layer). Built by [`Self::ensure_linear_resources`].
@@ -745,6 +748,7 @@ impl RsCtx<MetalBackend> {
             layer_caches: None,
             layer_range,
             linear_buffers: None,
+            multi_decode: None,
             linear_attn_graph_scratch: None,
             full_attn_graph_scratch: None,
             moe_graph_scratch: None,

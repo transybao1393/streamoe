@@ -28,6 +28,22 @@
   perplexity, scored tasks against a reference run).
 - `STREAMMOE_GPU_TIMING`: GPU timestamps per command buffer;
   `CmdbufStat::gpu_ns` is now real GPU time.
+- `Ctx::eval_tokens`: decode with T ≤ 4 tokens in one forward pass —
+  decode's kernels and expert streaming, each layer's attention for all
+  T tokens in one command buffer, the experts of all T read once —
+  with logits at every position bit-identical to `eval_token`. The
+  verification half of speculative decoding. On a3b, packed 3-bit at a
+  4 GiB cap: 176 / 238 / 310 ms per pass for T = 2 / 3 / 4 vs 103–118
+  ms for one token.
+- `Ctx::rewind_tokens`: keep the first `keep` tokens of the last
+  `eval_tokens` pass (the KV drops the rest, the linear-attention
+  recurrence goes back to its copy after token `keep - 1`), so
+  rejected speculative drafts can be undone.
+- `Ctx::eval_requests`: parallel decoding — one token from each of up
+  to 4 admitted requests in one pass, each on its own KV and
+  recurrence, logits identical to `eval_request` per request. On a3b,
+  packed 3-bit, 4 requests × 64 tokens: 1.18–1.25× total tok/s at a
+  5 GiB cap, 1.22–1.47× at 7 GiB.
 - `MetalContext::record_wait`; `Ctx::cmdbuf_stats` now includes the
   deferred expert dispatches and the LM head. An ignored expert-kernel
   GPU-time bench in `tests/packed_3bit.rs`.
