@@ -21,6 +21,25 @@
   bf16). `tools/export_vision.py` writes `vision_weights.{bin,json}`.
 - `tools/chat`: images (upload or paste) and a live CPU / RAM bar
   (`/stats`, served while a turn runs).
+- `tools/chat`: `--precision 4|3` and an Experts selector in the header
+  (the server re-executes itself to switch); per-turn I/O and CPU stats.
+- `tools/requant_experts.py` (3-/2-bit rounding kept in the 4-bit
+  layout) and the chat crate's `quality` binary (KL, top-1 agreement,
+  perplexity, scored tasks against a reference run).
+- `STREAMMOE_GPU_TIMING`: GPU timestamps per command buffer;
+  `CmdbufStat::gpu_ns` is now real GPU time.
+- Ignored benches: `matvec_decode_bench` (decode matvec kernels) and
+  `ssd_read_bench` (expert reads at decode sizes, sync vs async).
+
+### Performance
+
+- Decode waits per prefetch slot instead of for the whole layer's
+  prefetch (−1.5 to −5% per token on a3b at a 4 GiB cap).
+- The prefill staging buffer is lent to the hot tier during decode
+  (637 → 893 slots on a3b at 4 GiB, no new memory; −10 to −12% per
+  token on two of three prompts). `STREAMMOE_HOT_LEND=0` turns it off.
+- `qmv` kernel for single-token 4-bit matvecs (LM head 8.2 → 5.9 ms).
+  `STREAMMOE_MATVEC_QMV=0` turns it off.
 
 ### Fixed
 

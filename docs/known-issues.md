@@ -13,7 +13,7 @@ Older engine history (graph mode, prefill, kernels) is in
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
 | The uncapped a3b oracle suites and all a17b model tests have not run (this host has 5–7 GiB reclaimable; they need ≥ 8 GiB). | a3b runs under a 3–5 GiB cap: answers correct, argmax matches the MLX golden, top-20 overlap 20/20 (F32 KV) / 19/20 (Turbo4), peak within the cap (README, *Running Qwen3.6-35B-A3B on a small Mac*). Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are otherwise verified on OLMoE-1B-7B, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
 | Vision reads small or short printed text unreliably ("STOP" → "SOM" / "Form", "HELLO 2026" → "HILLCO" at 128–160 image tokens); scenes, colors, layout and counting are right. | Not an engine bug: on the same image embeddings, MLX (mlx_vlm, 4-bit) has the same top tokens ("F", "S", "T" for "STOP"); the engine follows MLX layer by layer (cosine ≥ 0.99 at layer 32, 0.96 on the last token at layer 40, bf16 vs f32); positions equal mlx_vlm's `get_rope_index`; the encoder matches transformers exactly and mlx_vlm to 0.997; all 92 160 packed expert tensors are byte-identical to the safetensors. | Use larger images. Re-check against a bf16 / 8-bit checkpoint if text reading matters. |
-| GPU time is not measured directly. | metal-rs exposes no GPU timestamps (`CmdbufStat::gpu_ns` stays 0); only wall time and I/O wait. | — |
+| Decode kernels run 3–4× slower than in isolation (a3b, 4 GiB cap: GPU busy ~87 of ~143 ms/token; LM head 9–11 ms vs 2.8 ms). | Reproduced without the model (`tests/matvec_decode_bench.rs`, `matvec_decode_load_pattern`): ~1 ms GPU bursts separated by ~1 ms CPU gaps leave the GPU in a slow state. A spin kernel on a second queue during the gaps restores speed when the GPU is slow but costs 8–15 ms/token when it is not. | Fewer, longer GPU bursts per token; non-blocking keep-alive in the engine; wire `dequant_matvec_4bit_qmv` (+37–55% bandwidth in isolation) into `encode_matvec`. |
 
 ## Fixed
 
@@ -78,6 +78,34 @@ Older engine history (graph mode, prefill, kernels) is in
   was ~half of decode time. `OpenConfig::attn_threads` (default 4)
   splits heads across a pool, bit-identical: needle decode
   303.6 → 192.6 ms/tok (F32), 205.8 → 132.8 (Turbo4).
+- **A routing profile froze the hot tier on its own topics**:
+  `seed_from_counts` installed the profile's counts (hundreds) as the
+  tier's popularity, so a new conversation's experts (count 1–2) could
+  not displace unused seeded ones until decay, ~200 tokens later.
+  a3b chat at a 4 GiB cap: first-answer hot-tier hits 51% cold vs 28%
+  seeded. Seeding now loads the profile's experts with zero popularity;
+  seeded and cold runs match (51 / 22 / 42% on three prompts).
+- **Each layer waited for every prefetch read before reading its
+  misses**, wrong guesses included. `PrefetchState::begin_layer` /
+  `wait_slot` now start the misses right after routing and wait only
+  for the prefetch slots the layer binds. a3b, 4 GiB cap, greedy
+  output identical: forward 124.0 → 122.2, 157.1 → 149.2 and
+  135.6 → 132.6 ms/token on three prompts (most where misses are many).
+- **The prefill staging buffer sat idle during decode** (0.42 GiB on
+  a3b, one block per expert, already in the budget). It is now lent to
+  the hot tier as extra slots for decode (`HotTier::lend`, 637 → 893
+  slots at a 4 GiB cap) and reclaimed at the start of every batched
+  prefill (`HotTier::reclaim`); `STREAMMOE_HOT_LEND=0` turns it off.
+  a3b chat at a 4 GiB cap, greedy output identical, peak unchanged
+  (3.67–3.72 GiB): hot-tier hits 51 / 22 / 42% → 58 / 34 / 54%,
+  forward 124.3 → 111.8, 150.2 → 149.5, 135.2 → 119.1 ms/token.
+- **Single-token 4-bit matvecs use `dequant_matvec_4bit_qmv`**
+  (1.3–1.5× v3's bandwidth in isolation; `STREAMMOE_MATVEC_QMV=0`
+  restores v3). LM head 8.2 → 5.9 ms, full-attention projections
+  3.2 → 2.8 ms per token; greedy output identical. tok/s is unchanged
+  within noise because decode waits on disk reads, and `cmd2_3`
+  (~15 small dependent dispatches per layer) is bound by dispatch
+  latency, not bandwidth.
 
 ## Precautions
 
@@ -138,8 +166,21 @@ Older engine history (graph mode, prefill, kernels) is in
 - **Files read recently are still in the page cache**: a "disk"
   benchmark on them measures RAM. Use a fresh cold copy, check
   residency, delete it afterwards.
-- The SSD tops out at ~6.7 GB/s once ≥ 4 reads are in flight; decode is
-  bandwidth-bound, so fewer bytes per token is what speeds it up.
+- **GPU time per command buffer**: set `STREAMMOE_GPU_TIMING=<file>`
+  to log `<label> <gpu_start> <gpu_end> <cpu_resumed>` (seconds, host
+  clock) for every waited command buffer; `CmdbufStat::gpu_ns` now
+  holds GPU time too (it was always 0 — metal-rs has no binding for
+  `GPUStartTime` / `GPUEndTime`, so `gpu_timing.rs` calls them through
+  `msg_send!`).
+- The SSD tops out at ~6.7 GB/s once ≥ 4 reads are in flight in older
+  measurements; at decode sizes on 2026-10-26 (`tests/ssd_read_bench.rs`,
+  1.77 MB experts, `F_NOCACHE`) it gave 2.9 GB/s for one read, 4.0 for
+  four and 4.4 at most. Decode is bandwidth-bound — a3b at a 4 GiB cap
+  reads ~330 MiB per token, ~75 ms of disk at 4.4 GB/s — so fewer bytes
+  per token is what speeds it up.
+- Per-turn decode I/O in the chat log: `io` in each `[chat]` line gives
+  forward ms per token, the I/O wait inside it, and demand / prefetch
+  reads per token.
 
 ### Tests and tooling
 
@@ -165,3 +206,27 @@ Older engine history (graph mode, prefill, kernels) is in
 - More from §8 of the plan: soft page-cache allowance, growing the hot
   tier when idle, lazily committed KV, LZ4 / LZFSE compression,
   per-expert files, all-2-bit experts.
+- Warm-starting the chat from a routing profile at small caps: at
+  4 GiB the tier holds 637 experts and each token routes 320, so the
+  tier turns over within the first tokens of any prompt and seeded and
+  cold launches measure the same. May help at caps where the tier holds
+  a large share of the model — unmeasured.
+- Skipping low-weight experts to save reads: a3b's gate weights are
+  flat — the top 6 of 8 carry 84% of the weight and only 1.4% of picks
+  are under 5% — so dropping picks costs real quality.
+- Splitting each expert read into 2–8 pieces for more reads in flight:
+  slower (4 experts: 1.76 ms whole, 1.92 ms in 4 pieces).
+- Larger or sequential reads: one `pread` of n adjacent experts is only
+  5–8% faster than n random ones (8 experts: 3.14 vs 3.39 ms) — a
+  1.77 MB expert is already a large block. Worth it only bundled with
+  a co-activation file layout, and decode reads ~1.5 misses per layer.
+- All-2-bit experts, re-measured on a3b (2026-10-26): experts rounded
+  to 4 levels (`tools/requant_experts.py`, kept in the 4-bit layout) vs
+  the 4-bit model on 314 teacher-forced tokens and 10 scored tasks
+  (`tools/chat/src/bin/quality.rs`): KL 0.29, top-1 agreement 82%,
+  perplexity 1.15 → 1.64; broke a tool call (no opening `<tool_call>`),
+  17 × 23 = 39, a JSON array of objects came back as flat strings, and
+  `is_prime` returned True for every n ≤ 7. 3-bit (8 levels) held up:
+  KL 0.048, top-1 93%, perplexity 1.21, all 10 tasks right — the
+  candidate for a packed 3-bit expert format (−22% bytes per expert).
+
