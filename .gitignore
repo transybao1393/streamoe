@@ -37,6 +37,11 @@ __pycache__/
 *.so
 .python-version
 
+# Node (Mermaid tooling for the README diagrams: parser, mermaid-cli)
+node_modules/
+npm-debug.log*
+package-lock.json
+
 # macOS
 .DS_Store
 
