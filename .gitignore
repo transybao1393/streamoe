@@ -85,6 +85,10 @@ profiles/
 traces/
 traces_*/
 routing_trace*.txt
+# Disk timelines (STREAMMOE_IO_TRACE) and GPU timings (STREAMMOE_GPU_TIMING)
+io_trace*.txt
+iotrace*.txt
+gpu_timing*.txt
 ref_*.json
 results/
 # KV-format measurement runs (harness outputs, generated needle prompt)
