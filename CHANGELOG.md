@@ -32,6 +32,13 @@
 
 ### Changed
 
+- **Renamed moeflux → streammoe.** Crates `streammoe`, `streammoe-metal`,
+  `streammoe-net` (directories `crates/streammoe*`), binaries
+  `streammoe-node`, `streammoe-coord`, `streammoe-chat`, and env vars
+  `MOEFLUX_*` → `STREAMMOE_*`. Downstream code changes
+  `use moeflux::…` to `use streammoe::…`. Snapshot, routing-profile and
+  network-frame formats are unchanged (same magics), so existing files
+  still load.
 - Under a cap, checkpoint buffers take cap memory at open (set
   `max_checkpoints: 0` if unused); `set_max_checkpoints` cannot raise
   the count past the opened value; `checkpoint_pos` can return

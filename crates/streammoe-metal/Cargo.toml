@@ -1,0 +1,13 @@
+[package]
+name          = "streammoe-metal"
+description   = "MLX-derived Metal compute kernels for the streammoe inference stack — vendors Apple's MLX quantized-GEMM kernels (MIT) behind a thin Rust dispatch wrapper."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = "MIT"  # whole crate stays MIT; see NOTICE
+repository    = { workspace = true }
+authors       = { workspace = true }
+
+[dependencies]
+metal       = { workspace = true }
+thiserror   = { workspace = true }

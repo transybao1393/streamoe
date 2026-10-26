@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build a moeflux test binary with the flags samply needs on macOS,
+# Build a streammoe test binary with the flags samply needs on macOS,
 # capture a CPU profile via samply (with presymbolicate sidecar so
 # we don't depend on the binary still being on disk later), and
 # aggregate the top hot symbols.
@@ -13,8 +13,8 @@
 #                                                 #   (default: --save-only)
 #
 # Outputs:
-#   /tmp/moeflux_profile.json
-#   /tmp/moeflux_profile.syms.json
+#   /tmp/streammoe_profile.json
+#   /tmp/streammoe_profile.syms.json
 #   prints aggregated top self/inclusive on stdout
 #
 # Why these flags:
@@ -40,13 +40,13 @@ if [[ "${1:-}" == "--open" ]]; then OPEN="yes"; TEST="${2:-cogito_v2_smoke}"; TE
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-OUT_JSON=/tmp/moeflux_profile.json
-OUT_SYMS=/tmp/moeflux_profile.syms.json
+OUT_JSON=/tmp/streammoe_profile.json
+OUT_SYMS=/tmp/streammoe_profile.syms.json
 
 echo "[profile] building $TEST with debuginfo + frame pointers..." >&2
 RUSTFLAGS="-C force-frame-pointers=yes" \
   CARGO_PROFILE_RELEASE_DEBUG=true \
-  cargo build -p moeflux \
+  cargo build -p streammoe \
     --no-default-features \
     --features model-cogito-v2-671b \
     --release \

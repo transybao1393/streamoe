@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Export a decoder-side vocab.bin from a HuggingFace tokenizer.json.
 
-This is the format moeflux's vocab loader reads (used only for
+This is the format streammoe's vocab loader reads (used only for
 token-id → string decoding in log output; does not carry merges).
 The companion `export_tokenizer.py` script produces the BPET format
-moeflux uses for *encoding* text → tokens. moeflux needs both files:
+streammoe uses for *encoding* text → tokens. streammoe needs both files:
 tokenizer.bin (BPET) and vocab.bin (this).
 
 Binary format (little-endian):

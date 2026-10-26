@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/moeflux",
-    "crates/moeflux-metal",
-    "crates/moeflux-net",
+    "crates/streammoe",
+    "crates/streammoe-metal",
+    "crates/streammoe-net",
 ]
 
 [workspace.package]

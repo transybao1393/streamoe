@@ -1,0 +1,34 @@
+[package]
+name          = "streammoe-net"
+description   = "Pipeline-parallel streammoe over TCP: frames, a stage node, a coordinator and a layer-range planner."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+authors       = { workspace = true }
+publish       = false
+
+[features]
+default = []
+
+# Model variant, forwarded to `streammoe`. Select exactly one (the node
+# runs a streammoe context; frames and the planner are variant-free).
+model-qwen3-5-a17b      = ["streammoe/model-qwen3-5-a17b"]
+model-qwen3-6-35b-a3b   = ["streammoe/model-qwen3-6-35b-a3b"]
+model-cogito-v2-671b    = ["streammoe/model-cogito-v2-671b"]
+model-olmoe-1b-7b       = ["streammoe/model-olmoe-1b-7b"]
+
+[dependencies]
+streammoe     = { path = "../streammoe" }
+thiserror   = { workspace = true }
+bytemuck    = { workspace = true }
+serde_json  = { workspace = true }
+
+[[bin]]
+name = "streammoe-node"
+path = "src/bin/streammoe-node.rs"
+
+[[bin]]
+name = "streammoe-coord"
+path = "src/bin/streammoe-coord.rs"

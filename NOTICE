@@ -1,9 +1,9 @@
-streamoe — NOTICE
-=================
+streammoe — NOTICE
+==================
 
 Required Notice: Copyright 2026 transybao1393 (https://github.com/transybao1393)
 
-streamoe grew out of moeflux, which grew out of flash-moe. The
+streammoe grew out of moeflux, which grew out of flash-moe. The
 repository is licensed in two parts. Git history marks the boundary.
 
 1. MIT License — see LICENSE-MIT
@@ -18,9 +18,9 @@ repository is licensed in two parts. Git history marks the boundary.
          kernels authored by Claude Opus 4.6 / 4.7 (Anthropic);
        - transybao1393's commits a36ae3b..7d73350, which were published
          under the MIT License and remain under it.
-  b. crates/moeflux-metal/, including later changes to it. It vendors
+  b. crates/streammoe-metal/, including later changes to it. It vendors
      MLX and llama.cpp kernel source under their MIT licenses; see
-     crates/moeflux-metal/NOTICE and crates/moeflux-metal/LICENSE.
+     crates/streammoe-metal/NOTICE and crates/streammoe-metal/LICENSE.
   c. paper/ — the flash-moe paper by Dan Woods.
 
   To get the MIT-only code, check out commit 7d73350.

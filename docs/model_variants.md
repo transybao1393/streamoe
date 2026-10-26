@@ -1,6 +1,6 @@
 # Model variants
 
-moeflux compiles for one model shape at a time. Model shape is
+streammoe compiles for one model shape at a time. Model shape is
 *compile-time*, not runtime: the per-variant constants are folded into
 the binary, and Metal shader dispatch dims are simpler to reason about
 that way. Runtime model parameterization is future work — for now,
@@ -98,7 +98,7 @@ the batched flash SDPA kernel (unfolded only; heads_per_kv is 1).
 2. Confirm the architecture. The `qwen3_5_moe` family drops in by
    constants alone; a different architecture (e.g. plain `qwen3_moe`
    without SSM, or a new MLA model) needs kernel work.
-3. Add a `model-your-name` feature in `crates/moeflux/Cargo.toml` and
+3. Add a `model-your-name` feature in `crates/streammoe/Cargo.toml` and
    a matching shape block in `src/riir/variants.rs`.
 4. Run the model-prep pipeline in `scripts/` against your
    MLX-converted weights.

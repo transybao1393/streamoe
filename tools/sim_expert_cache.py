@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Replay moeflux routing traces against expert predictors and caches.
+"""Replay streammoe routing traces against expert predictors and caches.
 
-Trace lines (MOEFLUX_ROUTING_TRACE):
+Trace lines (STREAMMOE_ROUTING_TRACE):
     <phase> <token> <layer> e0 … e{k-1} [: p0 … p{E-1}]
 phase `p` (prefill: picks only, warms history) or `d` (decode: picks
 plus the router's full softmax). Every metric is scored on decode.
 
-Each decode (token, layer) is modelled the way moeflux serves it:
+Each decode (token, layer) is modelled the way streammoe serves it:
     H = hot tier (resident, fixed capacity)
     P = predicted set, prefetched where not in H
     reads = |P \\ H| (prefetch) + |A \\ (H ∪ P)| (demand misses)
 with A the experts the router actually picks.
 
 Predictors:
-    prev            previous token's picks (moeflux's PrevToken guess)
+    prev            previous token's picks (streammoe's PrevToken guess)
     mrs-λ/M         moving router score: S ← λ·S + p(token); predict the
                     top-M of S. Short retention: λ ≤ 0.7 forgets in a few
                     tokens. Uses all E probabilities, so near-misses
                     (ranked just below the top-k) are predicted too.
 Hot tiers (capacity C experts across all layers):
-    none, lfu (moeflux's frequency tier), lru (bounded page cache), mrs-λ (keep the top-C experts
+    none, lfu (streammoe's frequency tier), lru (bounded page cache), mrs-λ (keep the top-C experts
     by moving router score — refilled every token, refills are reads)
 Reference: page cache = unbounded LRU (what an uncapped mmap run gets).
 
@@ -49,7 +49,7 @@ def load(path, n_exp):
 
 
 class LFUTier:
-    """Frequency-admitted tier, as moeflux's hot tier: admit a missed
+    """Frequency-admitted tier, as streammoe's hot tier: admit a missed
     expert only if it has been picked more often than the coldest."""
 
     def __init__(self, cap):

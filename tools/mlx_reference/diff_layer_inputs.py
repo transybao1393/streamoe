@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diff per-layer INPUT hidden states (moeflux vs MLX).
+"""Diff per-layer INPUT hidden states (streammoe vs MLX).
 
 layer N input = layer N-1 output (or embedding for N=0).
 """
@@ -21,7 +21,7 @@ def main():
     print("-" * 70)
 
     for L in range(NLAYERS):
-        mf, _, _ = load(f"/tmp/moeflux_dump_l{L}_in.bin")
+        mf, _, _ = load(f"/tmp/streammoe_dump_l{L}_in.bin")
         mx, _, _ = load(f"/tmp/mlx_dump_l{L}_in.bin")
 
         mf_rms = np.sqrt((mf ** 2).mean())

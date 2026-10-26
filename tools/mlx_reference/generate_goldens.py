@@ -17,7 +17,7 @@ Usage:
     uv run --with mlx --with mlx-lm python3 generate_goldens.py \\
         --model /path/to/mlx-model \\
         --variant qwen3-6-35b-a3b \\
-        --out   /path/to/moeflux/crates/moeflux/tests/fixtures/mlx_golden_<variant>.txt \\
+        --out   /path/to/streammoe/crates/streammoe/tests/fixtures/mlx_golden_<variant>.txt \\
         [--top 200] [--prompt "The quick brown fox"]
 """
 import argparse

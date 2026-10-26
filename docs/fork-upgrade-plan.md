@@ -1,5 +1,8 @@
 # moeflux fork: upgrade plan
 
+> Written before the rename: `moeflux` names, crate paths and
+> `MOEFLUX_*` env vars here are now `streammoe` / `STREAMMOE_*`.
+
 Oct 25, 2026 · companion to `moeflux fork proposed changes.md`
 
 This plan turns the proposal into an ordered set of changes, corrected

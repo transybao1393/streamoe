@@ -1,7 +1,7 @@
-// moeflux — C smoke test
+// streammoe — C smoke test
 //
 // Exercises the full mf_* C API end-to-end. Intended as:
-//   (1) a basic link check — proves libmoeflux.a has all the symbols
+//   (1) a basic link check — proves libstreammoe.a has all the symbols
 //       drama_llama's FFI will call.
 //   (2) a pipe-is-alive check — loads a model, runs a 4-token prefill,
 //       runs three more single-token decodes, verifies logits are not
@@ -12,12 +12,12 @@
 // This is NOT a correctness test. Token IDs are fabricated; the
 // outputs are not compared against a reference. Content quality of
 // the generated logits is irrelevant — the test only asserts that
-// the moeflux pipeline runs without crashing and produces non-
+// the streammoe pipeline runs without crashing and produces non-
 // pathological output shapes.
 //
 // Build: from metal_infer/ directory:
 //   cc -O2 -Wall -I../metal_infer ../tests/smoke.c \
-//      ../metal_infer/libmoeflux.a \
+//      ../metal_infer/libstreammoe.a \
 //      -framework Metal -framework Foundation -framework Accelerate \
 //      -lpthread -lcompression \
 //      -o ../tests/smoke
@@ -27,7 +27,7 @@
 // Run:
 //   ./smoke <weights_path> <manifest_path> <vocab_path> <experts_dir>
 
-#include "../metal_infer/moeflux.h"
+#include "../metal_infer/streammoe.h"
 
 #include <math.h>
 #include <stdio.h>

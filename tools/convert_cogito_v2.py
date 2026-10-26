@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end conversion: MLX 4-bit DeepSeek-V3 / Cogito-V2 → moeflux on-disk format.
+"""End-to-end conversion: MLX 4-bit DeepSeek-V3 / Cogito-V2 → streammoe on-disk format.
 
 Reads an `mlx_lm convert`-produced DeepSeek-V3 architecture model
 (currently `mlx-community/cogito-v2-preview-deepseek-671B-MoE-4bit`)
-and emits the canonical moeflux parent-directory layout:
+and emits the canonical streammoe parent-directory layout:
 
     parent/
     ├── mlx/
@@ -45,7 +45,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-# Canonical packing order — moeflux's expert layout assumes exactly
+# Canonical packing order — streammoe's expert layout assumes exactly
 # this sequence. Mirrors `model_variant.h`'s {GATE,UP,DOWN}_{W,S,B}_OFF.
 COMPONENT_ORDER = (
     "gate_proj.weight", "gate_proj.scales", "gate_proj.biases",

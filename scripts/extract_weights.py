@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 extract_weights.py — Extract all non-expert weights from Qwen3.5-397B-A17B-4bit
-into a single binary file that moeflux can mmap.
+into a single binary file that streammoe can mmap.
 
 Outputs:
   - model_weights.bin: binary blob containing all non-expert weight tensors
@@ -142,7 +142,7 @@ def main():
         filepath = model_path / filename
         header_cache[filename] = parse_safetensors_header(str(filepath))
 
-    # Sanitize tensor names: remove "language_model." prefix for moeflux
+    # Sanitize tensor names: remove "language_model." prefix for streammoe
     def sanitize_name(name):
         if name.startswith("language_model."):
             return name[len("language_model."):]
@@ -158,7 +158,7 @@ def main():
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
     # Pull config from the model's HuggingFace config.json; each key
-    # maps 1:1 to a field moeflux expects.
+    # maps 1:1 to a field streammoe expects.
     rope_params = text_config.get('rope_parameters') or {}
     cfg_out = {
         "hidden_size":                     text_config['hidden_size'],
@@ -241,7 +241,7 @@ def main():
                 data = sf.read(byte_len)
 
             # A17B stores `linear_attn.A_log` as F32; A3B stores it as BF16.
-            # moeflux's C engine reads it as `float *A_log` unconditionally,
+            # streammoe's C engine reads it as `float *A_log` unconditionally,
             # so A3B gets garbage without a conversion. Promote BF16 → F32
             # here so the binary file always carries F32 for A_log and the
             # C code needs no per-variant branching.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Check that this machine can run the moeflux test tiers before
+# Check that this machine can run the streammoe test tiers before
 # starting a test phase: CPU, RAM, current memory headroom, load,
 # disk, and whether the model files the oracle suites load exist.
 #
@@ -8,8 +8,8 @@
 #   scripts/check_test_host.sh            # report + verdict per tier
 #
 # Env overrides (same as the test suites):
-#   MOEFLUX_SMOKE_ARTIFACTS   dir with model_weights.bin / .json, vocab.bin
-#   MOEFLUX_SMOKE_ROOT        model root dir holding packed_experts/
+#   STREAMMOE_SMOKE_ARTIFACTS   dir with model_weights.bin / .json, vocab.bin
+#   STREAMMOE_SMOKE_ROOT        model root dir holding packed_experts/
 #   MIN_FREE_GIB              headroom required for model tiers (default 8)
 #
 # Exit status:
@@ -19,8 +19,8 @@
 
 set -u
 
-ARTIFACTS="${MOEFLUX_SMOKE_ARTIFACTS:-/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts}"
-ROOT="${MOEFLUX_SMOKE_ROOT:-/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root}"
+ARTIFACTS="${STREAMMOE_SMOKE_ARTIFACTS:-/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-artifacts}"
+ROOT="${STREAMMOE_SMOKE_ROOT:-/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-root}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-8}"
 
 gib() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
@@ -32,7 +32,7 @@ warn() { echo "  warn  $*"; }
 
 echo "== Host"
 if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
-    echo "  moeflux needs macOS on Apple Silicon (got $(uname -s) $(uname -m))"
+    echo "  streammoe needs macOS on Apple Silicon (got $(uname -s) $(uname -m))"
     exit 1
 fi
 cpu="$(sysctl -n machdep.cpu.brand_string)"
@@ -83,10 +83,10 @@ ok=1
 weights="$ARTIFACTS/model_weights.bin"
 experts="$ROOT/packed_experts"
 if [ ! -f "$weights" ]; then
-    fail "no $weights (set MOEFLUX_SMOKE_ARTIFACTS)"
+    fail "no $weights (set STREAMMOE_SMOKE_ARTIFACTS)"
 fi
 if [ ! -d "$experts" ]; then
-    fail "no $experts (set MOEFLUX_SMOKE_ROOT)"
+    fail "no $experts (set STREAMMOE_SMOKE_ROOT)"
 fi
 if [ $ok -eq 1 ]; then
     wbytes="$(stat -f %z "$weights")"

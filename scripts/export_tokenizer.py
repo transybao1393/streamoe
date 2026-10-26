@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export HuggingFace tokenizer.json to a compact binary format for moeflux.
+"""Export HuggingFace tokenizer.json to a compact binary format for streammoe.
 
 Usage: python export_tokenizer.py [tokenizer.json] [output.bin]
 

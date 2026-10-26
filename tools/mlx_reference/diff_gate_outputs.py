@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diff moeflux vs MLX dumps across all 40 layers.
+"""Diff streammoe vs MLX dumps across all 40 layers.
 
 Summarizes the per-layer divergence: h_post RMS diff, gate_logits diff,
 gate_probs diff, top-K set overlap, weight diff.
@@ -29,7 +29,7 @@ def load(path):
 
 def main():
     NLAYERS = 40
-    mf_prefix = "/tmp/moeflux_dump"
+    mf_prefix = "/tmp/streammoe_dump"
     mx_prefix = "/tmp/mlx_dump"
 
     print(f"{'L':>3} {'h_post max':>10} {'h_post rel':>10} "

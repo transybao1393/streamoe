@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# watch_run.sh — sample a moeflux process and the host once a second
+# watch_run.sh — sample a streammoe process and the host once a second
 # while it runs, so a capped run can be checked against the cap and
 # against what it does to the rest of the machine.
 #

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Convert an MLX 4-bit OLMoE checkpoint into moeflux artifacts.
+"""Convert an MLX 4-bit OLMoE checkpoint into streammoe artifacts.
 
 OLMoE differs from the Qwen MLX checkpoints the other scripts expect:
 experts are stored one tensor per expert (`mlp.experts.{E}.*`), not
 stacked under `switch_mlp`, and scales / biases / norm weights are F16
-where moeflux's kernels read BF16. This script handles both in one
+where streammoe's kernels read BF16. This script handles both in one
 pass, reading the safetensors through a memory map (≈ no RAM):
 
     <out>/artifacts/model_weights.bin   non-expert tensors, 64 B aligned

@@ -1,4 +1,4 @@
-//! moeflux-chat — a local chat page for Qwen3.6-35B-A3B under a hard
+//! streammoe-chat — a local chat page for Qwen3.6-35B-A3B under a hard
 //! memory cap.
 //!
 //!   cargo run --release -- --model ~/models/qwen3-6-35b-a3b --cap-gib 5.5
@@ -20,9 +20,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use moeflux::riir::budget;
-use moeflux::riir::vision::{VisionEncoder, image_rope_positions};
-use moeflux::{Ctx, KvFormat, OpenConfig, PrefetchGuess, StageInput, StageOutput};
+use streammoe::riir::budget;
+use streammoe::riir::vision::{VisionEncoder, image_rope_positions};
+use streammoe::{Ctx, KvFormat, OpenConfig, PrefetchGuess, StageInput, StageOutput};
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
@@ -205,7 +205,7 @@ impl Chat {
     /// Evaluate `toks` at the next slots. Plain RoPE while no image is
     /// in the context (bit-identical to M-RoPE with equal axes, and the
     /// usual fast paths); M-RoPE text rows `[p, p, p]` after one.
-    fn eval(&mut self, toks: &[i32], out: StageOutput<'_>) -> Result<(), moeflux::Error> {
+    fn eval(&mut self, toks: &[i32], out: StageOutput<'_>) -> Result<(), streammoe::Error> {
         let start = self.history.len();
         if self.rope_delta == 0 {
             match out {
@@ -223,7 +223,7 @@ impl Chat {
     }
 
     /// Feed an encoded image at the next slots.
-    fn eval_image(&mut self, embeds: &[f32], grid_h: usize, grid_w: usize) -> Result<(), moeflux::Error> {
+    fn eval_image(&mut self, embeds: &[f32], grid_h: usize, grid_w: usize) -> Result<(), streammoe::Error> {
         let start = self.history.len();
         let p = start as i32 + self.rope_delta;
         let (rows, next) = image_rope_positions(p, grid_h, grid_w);

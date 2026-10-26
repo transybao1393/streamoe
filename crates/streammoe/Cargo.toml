@@ -1,0 +1,41 @@
+[package]
+name          = "streammoe"
+description   = "Pure-Rust streaming-experts MoE inference on Metal. Forked from flash-moe; only the Metal kernels remain from upstream."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+repository    = { workspace = true }
+authors       = { workspace = true }
+readme        = "../../README.md"
+
+[features]
+default = []
+
+# Model variant features. Select exactly one. These gate the
+# per-variant shape constants in `riir/variants.rs` and the
+# integration test binaries.
+model-qwen3-5-a17b      = []
+model-qwen3-6-35b-a3b   = []
+# Cogito-V2-Preview-671B (DeepSeek-V3 architecture).
+model-cogito-v2-671b    = []
+# OLMoE-1B-7B-0125-Instruct (olmoe architecture).
+model-olmoe-1b-7b       = []
+
+[dependencies]
+thiserror   = { workspace = true }
+memmap2     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+metal       = { workspace = true }
+rayon       = { workspace = true }
+libc        = { workspace = true }
+bytemuck    = { workspace = true }
+objc        = { workspace = true }
+static_assertions = { workspace = true }
+sysinfo     = { workspace = true }
+# Vendored, MLX-derived Metal kernels — the tiled quantized GEMM that
+# replaces the memory-bound 4-bit dequant matvec.
+streammoe-metal = { version = "=0.2.0-alpha.1", path = "../streammoe-metal" }
+
+[dev-dependencies]

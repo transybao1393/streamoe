@@ -1,13 +1,13 @@
 [package]
-name = "moeflux-chat"
+name = "streammoe-chat"
 version = "0.0.0"
 edition = "2021"
 publish = false
 license = "MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0"
-description = "Local chat page for trying a moeflux model under a memory cap"
+description = "Local chat page for trying a streammoe model under a memory cap"
 
 [dependencies]
-moeflux = { path = "../../crates/moeflux", features = ["model-qwen3-6-35b-a3b"] }
+streammoe = { path = "../../crates/streammoe", features = ["model-qwen3-6-35b-a3b"] }
 serde_json = "1"
 libc = "0.2"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

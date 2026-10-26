@@ -79,7 +79,7 @@ profiles/
 *.csv
 # Routing profiles for hot-tier seeding (RsCtx::save_routing_profile)
 *.prof
-# Routing traces (MOEFLUX_ROUTING_TRACE) and their replays
+# Routing traces (STREAMMOE_ROUTING_TRACE) and their replays
 # (tools/sim_expert_cache.py), NumPy reference outputs
 # (tools/olmoe_ref.py), harness results
 traces/

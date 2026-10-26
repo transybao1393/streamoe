@@ -103,7 +103,7 @@ Older engine history (graph mode, prefill, kernels) is in
   `max_checkpoints` (default 4) full-context snapshots are planned
   whether or not they are used: on OLMoE at n_ctx 2048 F32 that is
   4 × 0.5 GiB, enough to fail a 3 GiB cap. Set `max_checkpoints: 0`
-  when nothing calls `checkpoint_pos` (pipeline stages: `moeflux-node`
+  when nothing calls `checkpoint_pos` (pipeline stages: `streammoe-node`
   does), lower it, or use a quantized `kv_format` (Turbo4 snapshots are
   ~5× smaller). Under a cap `set_max_checkpoints` cannot raise it past
   the opened value, and `checkpoint_pos` returns

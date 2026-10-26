@@ -3,7 +3,7 @@
 
 For every decoder layer, captures the MoE block's intermediate tensors at
 position 0 of a 4-token prompt ("The quick brown fox") and writes one
-binary file per layer in the same format as moeflux's MOEFLUX_DUMP_L0.
+binary file per layer in the same format as streammoe's STREAMMOE_DUMP_L0.
 
 Usage:
   uv run --with mlx --with mlx-lm python3 mlx_l0_dump.py <out_prefix>
@@ -137,7 +137,7 @@ def main():
             # shared_raw (pos=0)
             f.write(l0_components['shared_raw'][0, 0].astype(np.float32).tobytes())
             # per-expert outputs — MLX order is determined by inds; reorder to match
-            # moeflux's expert_indices order. We'll write raw MLX order here and
+            # streammoe's expert_indices order. We'll write raw MLX order here and
             # the diff script will align by index.
             y_pe = l0_components['y_per_expert'][0, 0]  # (K, HIDDEN)
             for k in range(K):

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Independent NumPy reference forward for OLMoE, reading the same
-converted artifacts moeflux loads (model_weights.{bin,json} +
-packed_experts/), so a moeflux run can be checked against it exactly.
+converted artifacts streammoe loads (model_weights.{bin,json} +
+packed_experts/), so a streammoe run can be checked against it exactly.
 
-Shares no code with moeflux. Follows mlx-lm's olmoe.py:
+Shares no code with streammoe. Follows mlx-lm's olmoe.py:
   - q_norm / k_norm are RMSNorm over the whole projection, before the
     split into heads;
   - RoPE is rotate-half over the full head dim;
