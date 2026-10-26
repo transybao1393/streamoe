@@ -608,11 +608,13 @@ impl ExpertFiles {
         };
         let off = (expert_idx as u64) * (self.expert_size as u64);
         let permit = self.limits.admit(self.expert_size as u64);
+        let tr0 = super::io_trace::now();
         let n = file.read_at(out, off).map_err(|e| ExpertIoError::Io {
             layer: layer_idx,
             source: e,
         })?;
         drop(permit);
+        super::io_trace::read(tr0, kind, layer_idx, 1, n);
         if n != self.expert_size {
             return Err(ExpertIoError::ShortRead {
                 layer: layer_idx,
@@ -654,6 +656,7 @@ impl ExpertFiles {
         };
         let off = (first as u64) * (es as u64);
         let permit = self.limits.admit(out.len() as u64);
+        let tr0 = super::io_trace::now();
         let mut done = 0usize;
         while done < out.len() {
             let got = file
@@ -673,6 +676,7 @@ impl ExpertFiles {
             done += got;
         }
         drop(permit);
+        super::io_trace::read(tr0, kind, layer_idx, n, out.len());
         self.counters
             .record_read(kind, layer_idx, n as u64, out.len() as u64, self.fast[layer_idx]);
         if let Some(hot) = &self.hot {

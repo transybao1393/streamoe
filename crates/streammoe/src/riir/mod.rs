@@ -3162,7 +3162,9 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(), RsError> {
         // Telemetry: wall time per decode token (plan phase 6).
         let t0 = std::time::Instant::now();
+        io::io_trace::mark('T', 0);
         let r = self.step_internal_per_token_inner(input, pos, output);
+        io::io_trace::mark('E', 0);
         if r.is_ok() {
             self.experts.counters().record_decode(t0.elapsed().as_nanos() as u64);
         }
@@ -3289,6 +3291,7 @@ impl RsCtx<MetalBackend> {
                 moe::deferred::complete_deferred_experts_chained(deferred)
                     .map_err(|_| RsError::EvalFailed)?;
             }
+            io::io_trace::mark('L', layer_idx);
 
             // Slice 5d-6b: kick off async prefetch for THIS layer
             // using its prediction (= last token's same-layer

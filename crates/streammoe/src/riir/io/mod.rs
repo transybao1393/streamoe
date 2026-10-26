@@ -6,6 +6,7 @@ pub mod guess;
 pub mod hot_tier;
 pub mod io_limit;
 pub mod io_stats;
+pub mod io_trace;
 pub mod layer_weight_cache;
 pub mod lm_head;
 pub mod mtl_weight_buf;

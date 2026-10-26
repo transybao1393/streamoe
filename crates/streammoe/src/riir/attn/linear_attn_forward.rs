@@ -2094,6 +2094,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             //    and run alongside it. Everything from here to the last
             //    bound slot landing is I/O wait on the critical path.
             let io_t0 = std::time::Instant::now();
+            crate::riir::io::io_trace::mark('R', layer_idx);
             let prefetch_status = prefetch.begin_layer(layer_idx);
 
             // 2. Per-slot hit/miss decision. Set-based, not
@@ -2155,6 +2156,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             prefetch.record_outcome(hit_count, k as u64 - hit_count - hot_count);
             expert_files.counters().record_decode_layer(layer_idx, hot_count, hit_count);
             expert_files.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
+            crate::riir::io::io_trace::mark('W', layer_idx);
 
             // 3b. Cross-layer guesses (plan phase 6): keep this layer's
             //     post-attention residual for the next layer's guess.
@@ -3035,9 +3037,11 @@ where
             // host bounce buffer; each expert is read at most once per
             // layer chunk.
             let t0 = std::time::Instant::now();
+            crate::riir::io::io_trace::mark('S', layer_idx);
             backend.pool_mut().with_bytes_mut(base_id, |staging| {
                 expert_files.stage_layer(io_pool, layer_idx, &buckets.expert_ids, staging)
             })??;
+            crate::riir::io::io_trace::mark('s', layer_idx);
             expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
             base_id
         }
