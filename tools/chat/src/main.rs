@@ -14,10 +14,12 @@
 //! (`host_buffers`). `/stats` (CPU and memory, sampled every second) is
 //! answered even while a turn runs.
 //!
-//! `--precision 3` reads experts from `root-3bit/` instead of `root/`
-//! (`tools/requant_experts.py`: 3-bit rounding kept in the 4-bit
-//! layout — same size and speed, slightly lower quality, until a packed
-//! 3-bit format exists). The page can switch: `POST /precision`
+//! `--precision 3` reads experts from `root-3bit/` instead of `root/`:
+//! 3-bit experts (`tools/requant_experts.py`, then
+//! `tools/pack_experts.py`), slightly lower quality and a quarter fewer
+//! weight bytes to read per expert. The engine detects the layout from
+//! the files, so an unpacked 3-bit copy also works, at 4-bit speed.
+//! The page can switch: `POST /precision`
 //! re-executes this process with the other value, so the old model's
 //! memory is released before the new one opens and the cap holds.
 
