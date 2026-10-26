@@ -10,6 +10,8 @@ Older engine history (graph mode, prefill, kernels) is in
 
 | Issue | Impact | Plan |
 | --- | --- | --- |
+| A 128-token decode after a ~130-token prompt goes over a 4 or 5 GiB cap (`OverBudget` in `eval_token`, footprint = cap). | The plan gives the hot tier everything left under the cap. On longer runs the unplanned footprint grows past the 512 MiB `runtime_overhead`. 8 tokens peak at 3.89 GiB; 48 tokens after a 25-token prompt fit. `eval_tokens` adds ~0.21 GiB of unplanned buffers (step sets, extra synced slots, rollback recurrence copies). | Find what grows (pool is flat at 0.83 GiB; likely driver / file-backed pages). Until then `runtime_overhead` 768 MiB fits (`spec_bench` default). Put the `eval_tokens` buffers in the plan. |
+| Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) is slower than plain decode: 0.79× / 0.92× on rewrite / code prompts, 1.02× on free text (packed 3-bit, 4 GiB cap, `spec_bench`). Output is token-identical. | A verify pass of ~4 tokens costs ~425 ms in real use (310 ms in `verify_bench`, where every draft is right) and yields 2.4–2.9 tokens; break-even is ~310–370 ms. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; draft only on long matches. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
 | The uncapped a3b oracle suites and all a17b model tests have not run (this host has 5–7 GiB reclaimable; they need ≥ 8 GiB). | a3b runs under a 3–5 GiB cap: answers correct, argmax matches the MLX golden, top-20 overlap 20/20 (F32 KV) / 19/20 (Turbo4), peak within the cap (README, *Running Qwen3.6-35B-A3B on a small Mac*). Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are otherwise verified on OLMoE-1B-7B, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
 | Vision reads small or short printed text unreliably ("STOP" → "SOM" / "Form", "HELLO 2026" → "HILLCO" at 128–160 image tokens); scenes, colors, layout and counting are right. | Not an engine bug: on the same image embeddings, MLX (mlx_vlm, 4-bit) has the same top tokens ("F", "S", "T" for "STOP"); the engine follows MLX layer by layer (cosine ≥ 0.99 at layer 32, 0.96 on the last token at layer 40, bf16 vs f32); positions equal mlx_vlm's `get_rope_index`; the encoder matches transformers exactly and mlx_vlm to 0.997; all 92 160 packed expert tensors are byte-identical to the safetensors. | Use larger images. Re-check against a bf16 / 8-bit checkpoint if text reading matters. |
@@ -217,6 +219,15 @@ Older engine history (graph mode, prefill, kernels) is in
   Inside decode the same dispatch takes ~0.75 ms: the GPU's slow
   state between short bursts, not the kernel. The first, cold runs
   in the bench take 0.56–0.62 ms.
+- **Parallel decoding pays; speculative decoding does not yet.**
+  `batch_bench` (4 requests × 64 tokens, packed 3-bit): batches of
+  2 / 3 / 4 give 1.18 / 1.12 / 1.25× total tok/s at a 5 GiB cap and
+  1.22 / 1.47 / 1.35× at 7 GiB (one run each), every output identical
+  to one-at-a-time decode; each request then gets 3–5.7 tok/s instead
+  of ~9. A bigger cap helps batches more than plain decode, since the
+  pass's distinct experts hit RAM more. What a 4-token pass adds over
+  one token (`verify_bench --profile`): disk wait 20 → 81 ms, expert
+  GPU 31 → 94, attention GPU 33 → 96, LM head 6 → 21.
 - Per-turn decode I/O in the chat log: `io` in each `[chat]` line gives
   forward ms per token, the I/O wait inside it, and demand / prefetch
   reads per token.
@@ -242,6 +253,14 @@ Older engine history (graph mode, prefill, kernels) is in
   per token).
 - Re-laying-out experts on disk for coalesced reads: no gain (the SSD
   is flat once ≥ 4 reads are in flight).
+- A multi-column qmv for decode with T tokens (one weight read for
+  T ≤ 4 inputs, bit-exact to qmv with `clang fp reassociate(off)` on
+  both): 1.15–1.9× at T=4 in a warm microbench, no gain inside
+  `eval_tokens` / `eval_requests` (attention GPU 63 / 100 / 96 ms at
+  T=2/3/4 vs 52 / 71 / 95 per-token; parallel decoding 1.18–1.25× either
+  way). In decode's slow GPU state the per-token arithmetic, not the
+  weight reads, sets the cost. `fp contract(off)` on top made T=2/3
+  3× slower.
 - More from §8 of the plan: soft page-cache allowance, growing the hot
   tier when idle, lazily committed KV, LZ4 / LZFSE compression,
   per-expert files, all-2-bit experts.
