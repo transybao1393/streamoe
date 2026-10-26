@@ -35,6 +35,7 @@ pub mod range;
 pub mod requests;
 pub mod snapshot;
 pub mod variants;
+pub mod vision;
 pub use attn::gpu_attn::{
     GpuAttnError, gpu_attn_scores_batched, gpu_attn_softmax_batched, gpu_attn_values_batched,
     gpu_sigmoid_gate,
