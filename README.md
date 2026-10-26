@@ -7,7 +7,8 @@ Silicon, built on one conviction: *the size of a model should not
 decide which machine can run it — your memory budget should.* You set a
 cap; streamoe plans every byte at open, streams experts from SSD
 through a hot tier it manages itself, and never takes memory it did
-not plan for.
+not plan for. The design is called **AEGIS** — Adaptive · Expert ·
+Guarded · In-memory · Streaming; see [Architecture](#architecture--aegis).
 
 Today that means a 35-billion-parameter vision-language model —
 Qwen3.6-35B-A3B, 19.4 GB at 4-bit — answering questions about images
@@ -78,56 +79,97 @@ Where it goes next: per-expert precision chosen at run time (4-bit,
 side of decode, and more model families — see
 [Roadmap](#roadmap).
 
-## Architecture
+## Architecture — AEGIS
 
-### The whole system
+The engine's design is called **AEGIS**: **A**daptive · **E**xpert ·
+**G**uarded · **I**n-memory · **S**treaming. An aegis is a shield. The
+memory cap is its rim: nothing inside crosses it, nothing outside it is
+disturbed, and everything inside works to run a model several times
+larger than the shield — fast.
+
+| | Principle | What does it |
+| --- | --- | --- |
+| **A** · Adaptive | Fit the work to the cap and to what the model is doing right now | cross-layer expert guesses, per-slot prefetch waits, LFU hot-tier admission, lending idle buffers, 4-bit or packed 3-bit experts |
+| **E** · Expert | Make every routed expert cheap to read and to run | packed 3-bit layout (−22% bytes, detected at open), fused gather kernels (`gather_mm_id`), `qmv` for single-token matvecs |
+| **G** · Guarded | Memory is a contract, not an estimate | the budget plan at open (`OverBudget` before anything is touched), `F_NOCACHE` so neighbours keep their page cache, vision and KV inside the plan |
+| **I** · In-memory | Bytes already in RAM do as much work as they can | the hot tier (zero-copy bind), the slot ring, compact KV (F16, Turbo4/3), prefill staging lent to decode |
+| **S** · Streaming | Disk is a tier, and its time is measured | parallel `F_NOCACHE` pread overlapped with GPU work, `STREAMMOE_IO_TRACE` and `STREAMMOE_GPU_TIMING` timelines |
+
+### The shield
 
 ```mermaid
 flowchart TB
     classDef app fill:#4f46e5,stroke:#312e81,color:#ffffff
-    classDef engine fill:#0f766e,stroke:#134e4a,color:#ffffff
-    classDef mem fill:#b45309,stroke:#78350f,color:#ffffff
-    classDef disk fill:#475569,stroke:#1e293b,color:#ffffff
+    classDef a fill:#7c3aed,stroke:#4c1d95,color:#ffffff
+    classDef e fill:#0f766e,stroke:#134e4a,color:#ffffff
+    classDef g fill:#b91c1c,stroke:#7f1d1d,color:#ffffff
+    classDef i fill:#b45309,stroke:#78350f,color:#ffffff
+    classDef s fill:#475569,stroke:#1e293b,color:#ffffff
 
     APP["<b>Application</b><br/>drama_llama · tools/chat"]:::app
-    API["<b>Ctx</b><br/>open_with · eval_prompt · eval_token<br/>eval_stage · eval_stage_mrope · requests · snapshots"]:::engine
-    PLAN["<b>Budget plan</b><br/>every account sized at open<br/>fails with OverBudget if it can't fit"]:::engine
-    VIS["<b>Vision encoder</b><br/>CPU · Accelerate GEMMs<br/>streams 0.85 GiB BF16 weights"]:::engine
 
-    subgraph LOOP["Forward pass · per layer"]
-        direction LR
-        ATT["<b>Attention</b><br/>GatedDeltaNet linear layers<br/>full-attention layers · MLA"]:::engine
-        RT["<b>Router</b><br/>top-k on the<br/>model's own logits"]:::engine
-        MOE["<b>K-expert matvec</b><br/>Metal · 4-bit"]:::engine
-        ATT --> RT --> MOE
+    subgraph G["G · Guarded"]
+        direction TB
+        GATE["<b>Ctx — the only way in</b><br/>open_with · eval_prompt<br/>eval_token · eval_stage<br/>eval_stage_mrope · snapshots"]:::g
+        PLAN["<b>Budget plan</b><br/>every account sized at open<br/>OverBudget before anything is touched"]:::g
+        subgraph E["E · Expert: each layer"]
+            direction LR
+            VIS["<b>Vision encoder</b><br/>CPU · image → tokens"]:::e
+            ATT["<b>Attention</b><br/>linear · full · MLA"]:::e
+            RT["<b>Router</b><br/>top-k on the<br/>model's own logits"]:::e
+            MOE["<b>Expert kernels</b><br/>4-bit · packed 3-bit<br/>gather_mm_id · qmv"]:::e
+            VIS -.-> ATT --> RT --> MOE
+        end
+        subgraph A["A · Adaptive"]
+            direction LR
+            GUESS["<b>Cross-layer guess</b><br/>next layer's experts"]:::a
+            WAIT["<b>Per-slot wait</b><br/>bind each read as it lands"]:::a
+            ADMIT["<b>LFU admission</b><br/>keep the most-picked"]:::a
+            LEND["<b>Lend / reclaim</b><br/>idle prefill staging"]:::a
+        end
+        subgraph I["I · In-memory"]
+            direction LR
+            W["Non-expert<br/>weights"]:::i
+            KV["KV cache<br/>F32 · F16 · Turbo4/3"]:::i
+            HOT["<b>Hot tier</b><br/>zero-copy bind"]:::i
+            SLOTS["<b>Slot ring</b><br/>synced + 2 prefetch sets"]:::i
+        end
     end
 
-    subgraph MEM["RAM · inside the cap"]
+    subgraph S["S · Streaming"]
         direction LR
-        W["Non-expert<br/>weights"]:::mem
-        KV["KV cache<br/>F32 · F16 · Turbo4/3"]:::mem
-        HOT["<b>Hot tier</b><br/>LFU · profile-seeded<br/>+ lent prefill staging"]:::mem
-        SLOTS["Slot ring<br/>synced + 2 prefetch sets"]:::mem
+        SSD[("<b>SSD</b><br/>root/ 4-bit · root-3bit/ packed<br/>F_NOCACHE pread")]:::s
+        TRACE["<b>Timelines</b><br/>STREAMMOE_IO_TRACE<br/>STREAMMOE_GPU_TIMING"]:::s
     end
 
-    SSD[("<b>SSD</b><br/>packed experts<br/>root/ (4-bit) · root-3bit/<br/>F_NOCACHE pread")]:::disk
-    FAST[("<b>Fast disk tier</b><br/>optional copy of hot layers")]:::disk
-
-    APP --> API
-    APP -- "image" --> VIS -- "embeddings at M-RoPE positions" --> API
-    API --> PLAN --> MEM
-    API --> LOOP
-    LOOP <--> W & KV
+    APP -- "prompt · image" --> GATE --> PLAN
+    PLAN -- "sizes every account" --> I
+    GATE --> E
+    RT -- "picks" --> A
+    A -- "prefetch · admit · lend" --> I
     MOE -- "binds in place" --> HOT & SLOTS
-    SSD & FAST -- "misses + prefetch,<br/>waited per slot" --> SLOTS
+    SSD -- "misses + prefetch,<br/>waited per slot" --> SLOTS
+    MOE & SSD -. "timed" .-> TRACE
+
+    style G fill:transparent,stroke:#b91c1c,stroke-width:4px
+    style E fill:transparent,stroke:#0f766e,stroke-width:2px
+    style A fill:transparent,stroke:#7c3aed,stroke-width:2px
+    style I fill:transparent,stroke:#b45309,stroke-width:2px
+    style S fill:transparent,stroke:#475569,stroke-width:2px,stroke-dasharray:6 4
 ```
 
-### Memory: planned, not hoped for
+The red rim is the cap. Only the SSD sits outside it, and the only
+traffic across the rim is expert bytes coming in through the slot ring.
+
+### G · Guarded: memory planned, not hoped for
 
 At open, streamoe sizes every account for the context you asked for —
 `n_ctx`, KV format, request slots, checkpoints, host buffers — and the
-expert hot tier takes exactly what is left. The plan for Qwen3.6-35B-A3B
-under a 4 GiB cap (n_ctx 4096, F32 KV), as measured on an M3 Pro:
+expert hot tier takes exactly what is left. Expert reads use
+`F_NOCACHE`, so the engine never grows the page cache and nothing else
+on the machine loses its file cache. The plan for Qwen3.6-35B-A3B
+(4-bit experts) under a 4 GiB cap (n_ctx 4096, F32 KV), as measured on
+an M3 Pro:
 
 ```mermaid
 pie showData
@@ -142,12 +184,13 @@ pie showData
     "Expert slot ring" : 0.09
 ```
 
-Measured footprint stays within 0.08 GiB of the plan. A Turbo4 KV cache
-shrinks the KV slice to 0.02 GiB and the hot tier grows by the
-difference; on models with large KV caches (OLMoE at n_ctx 4096) that
-trade alone made decode 44% faster.
+Measured footprint stays within 0.08 GiB of the plan; in every chat run
+at 4, 5 and 7 GiB caps the peak stayed under the cap (3.7 / 4.7 /
+6.7 GiB). A Turbo4 KV cache shrinks the KV slice to 0.02 GiB and the hot
+tier grows by the difference; on models with large KV caches (OLMoE at
+n_ctx 4096) that trade alone made decode 44% faster.
 
-### Memory reuse: prefill staging serves decode
+### I · In-memory: prefill staging serves decode
 
 The prefill staging buffer (0.42 GiB, one slot per expert) is only
 written while a prompt is read. During decode it would sit idle, so the
@@ -176,11 +219,36 @@ At a 4 GiB cap this lifts hot-tier hits from 51 / 22 / 42% to
 10–12% on two of them (124 → 112 and 135 → 119 ms), flat on the third.
 `STREAMMOE_HOT_LEND=0` turns it off.
 
-### One layer of decode
+### E · Expert: packed 3-bit
 
-Under a cap, experts are read with `F_NOCACHE` — no page cache, so
-nothing else on the machine loses its file cache. Each layer hides as
-much of that I/O as it can behind GPU work:
+Decode is bound by bytes from the SSD, so the cheapest expert is the
+smallest one that still gives the same answers. Packed 3-bit stores
+8 codes in 3 bytes instead of 4; the kernels keep the 4-bit element
+order and `w = scale · q + bias`, so packed and nibble-stored 3-bit
+give bit-identical output.
+
+```mermaid
+flowchart LR
+    classDef e fill:#0f766e,stroke:#134e4a,color:#ffffff
+    classDef i fill:#b45309,stroke:#78350f,color:#ffffff
+    classDef s fill:#475569,stroke:#1e293b,color:#ffffff
+
+    Q4["<b>4-bit expert</b> · 1.77 MB<br/>gate | up | down<br/>8 codes → one u32<br/>bf16 scale + bias per 64"]:::s
+    Q3["<b>Packed 3-bit expert</b> · 1.38 MB (−22%)<br/>gate | up | down<br/>8 codes → 3 bytes (24-bit pack)<br/>bf16 scale + bias per 64"]:::s
+    OPEN["<b>At open</b><br/>layout read from the<br/>layer file size"]:::e
+    K["<b>Kernels</b><br/>dequant_matvec_3bit (decode)<br/>gather_mm_id bits=3 (prefill)"]:::e
+    RAM["<b>4 GiB cap</b><br/>719 → 997 experts in RAM<br/>−20 to −25% per decode token"]:::i
+
+    Q4 -- "requant_experts.py<br/>pack_experts.py" --> Q3 --> OPEN --> K --> RAM
+```
+
+Against 4-bit: KL 0.048, the same top token 93% of the time, all 10
+scored tasks right. 2-bit broke tool calls, maths, JSON and code, so it
+is not offered.
+
+### A + S · One layer of decode
+
+Each layer hides as much of its I/O as it can behind GPU work:
 
 ```mermaid
 sequenceDiagram
@@ -192,9 +260,9 @@ sequenceDiagram
     participant S as SSD
 
     Note over C: layer L begins (layer L−1's GPU work drained)
-    C->>C: guess L's experts — cross-layer from L−1's residual,<br/>or the previous token's picks
+    C->>C: A · guess L's experts — cross-layer from L−1's residual,<br/>or the previous token's picks
     C->>H: drop guesses that are already hot
-    C-)IO: prefetch the rest into slot set L mod 2
+    C-)IO: S · prefetch the rest into slot set L mod 2
     par overlapped
         G->>G: attention + router logits
         Note right of G: full-attention layers under a cap run<br/>on CPU threads (attn_threads)
@@ -204,21 +272,22 @@ sequenceDiagram
     end
     G->>C: router logits
     C->>C: top-k on the model's own logits
-    C->>H: hot hits bind their RAM slot (zero copy, zero I/O)
+    C->>H: I · hot hits bind their RAM slot (zero copy, zero I/O)
     C->>S: misses: parallel pread → synced slots
-    C->>IO: wait only for the prefetched slots L picked — hits bind
+    C->>IO: A · wait only for the prefetched slots L picked
     Note over C,IO: an unused guess still in flight is not waited for
-    C->>G: K-expert matvec + combine, chained into L+1's norm
-    C->>H: count picks, admit misses hotter than a sampled victim (LFU)
+    C->>G: E · K-expert matvec + combine, chained into L+1's norm
+    C->>H: A · count picks, admit misses hotter than a sampled victim (LFU)
 ```
 
 On Qwen3.6-35B-A3B (40 layers, 256 experts, 8 picked per token) the
 cross-layer guess doubles prefetch hits over the previous-token guess
 (63 → 127 per token) and, with 6 experts prefetched, cuts decode time
-by about a fifth — with identical output.
+by about a fifth — with identical output. Guesses only decide *what to
+read early*; routing always uses the model's own logits.
 
-Where one decode token's ~120 ms goes at a 4 GiB cap (chat prompt,
-GPU timestamps and I/O counters):
+Where one decode token's ~120 ms goes at a 4 GiB cap (4-bit experts,
+chat prompt, GPU timestamps and I/O counters):
 
 ```mermaid
 pie showData
@@ -230,6 +299,29 @@ pie showData
 
 The CPU is ~95% idle (0.45 cores while decoding), so the levers are
 fewer bytes from disk and fewer, longer GPU bursts — not more threads.
+
+### S · Streaming: measured, not assumed
+
+`STREAMMOE_IO_TRACE=<file>` records every expert read and the phase of
+each layer; `tools/io_trace_report.py` turns it into disk busy / idle
+time. Packed 3-bit at a 4 GiB cap, one chat answer (tracing adds ~15%,
+so read it for proportions, not speed):
+
+```text
+prefill, 40 layer stages: 1474 ms, staging 971 ms, GPU between stages 503 ms; 72.7 experts/layer, 4.1 GB/s while staging
+decode, 120 tokens: 113.3 ms/token, disk busy 51.8 ms, idle 61.6 ms; 137 reads, 180 MiB per token
+  phase       wall ms  busy ms  idle ms
+  attention      80.5     29.4     51.1
+  misses         24.3     22.4      2.0
+  dispatch        8.5      0.0      8.5
+```
+
+Prefill staging runs at the SSD's limit (~4.1–4.6 GB/s here), and the
+disk's idle time in decode comes in ~1 ms pieces too short to fill with
+more prefetch — the tries are in
+[`docs/known-issues.md`](docs/known-issues.md). What lowers decode time
+now is fewer bytes per token (packed 3-bit, a bigger cap) and less GPU
+time.
 
 ### Mode A — one Mac, streaming
 
@@ -268,7 +360,7 @@ per-range snapshots. `crates/streammoe-net/` is the earlier prototype of
 the pipeline (TCP loopback tested); it stays as a reference and is not
 developed further here.
 
-### Vision
+### Vision inside the shield
 
 Qwen3.5 / 3.6 take images through a CPU vision encoder that lives inside
 the same cap: its weights stream from disk per image, its 137 MiB of
