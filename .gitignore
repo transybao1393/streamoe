@@ -101,3 +101,10 @@ Cargo.lock
 expert_index_*.json
 # Expert index written by the README setup steps
 expert_index.json
+
+# Requantized expert copies (tools/requant_experts.py → root-3bit/) and
+# quality-harness outputs (tools/chat `quality`: --save-ref log-probs,
+# per-run result JSON)
+root-*bit/
+ref_*.bin
+q_*.json
