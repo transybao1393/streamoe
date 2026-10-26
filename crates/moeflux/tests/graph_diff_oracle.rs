@@ -283,6 +283,7 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
         label: "test_rope",
         x: cpu_x,
         inv_freq: cpu_freq,
+        positions: None,
         n_tokens,
         num_heads,
         head_dim,
@@ -312,6 +313,7 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
         label: "test_rope",
         x: gpu_x,
         inv_freq: gpu_freq,
+        positions: None,
         n_tokens,
         num_heads,
         head_dim,
@@ -389,6 +391,104 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
          rotary stride bug",
         rotary_dim, head_dim
     );
+}
+
+
+// ============================================================================
+// Test: RopeNTokens with M-RoPE positions through both backends
+// ============================================================================
+
+/// Runs one `RopeNTokens` over `x` on `backend`; `positions` = `[n, 3]`.
+fn run_rope<B: Backend>(
+    backend: &mut B,
+    x: &[f32],
+    inv_freq: &[f32],
+    positions: Option<&[i32]>,
+    shape: (u32, u32, u32, u32),
+    start_pos: i32,
+) -> Vec<f32> {
+    let (n_tokens, num_heads, head_dim, rotary_dim) = shape;
+    let bx = backend.pool_mut().alloc(x.len() * 4, "x", false).unwrap();
+    let bf = backend.pool_mut().alloc(inv_freq.len() * 4, "inv_freq", false).unwrap();
+    backend.pool_mut().upload(bx, bytes_of_f32(x)).unwrap();
+    backend.pool_mut().upload(bf, bytes_of_f32(inv_freq)).unwrap();
+    let bp = positions.map(|p| {
+        let id = backend.pool_mut().alloc(p.len() * 4, "positions", false).unwrap();
+        let bytes: Vec<u8> = p.iter().flat_map(|v| v.to_le_bytes()).collect();
+        backend.pool_mut().upload(id, &bytes).unwrap();
+        id
+    });
+    let mut g = Graph::new();
+    g.push(Op::RopeNTokens {
+        label: "test_rope",
+        x: bx,
+        inv_freq: bf,
+        positions: bp,
+        n_tokens,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        start_pos,
+    });
+    backend.execute(&g, "diff_oracle").unwrap();
+    let mut out = vec![0u8; x.len() * 4];
+    backend.pool().download(bx, &mut out).unwrap();
+    f32_of_bytes(&out)
+}
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_rope_n_tokens_mrope() {
+    // An image-like block (t fixed, h/w on a grid) after text tokens,
+    // positions large enough for angles in the thousands.
+    let (n_tokens, num_heads, head_dim, rotary_dim) = (24u32, 16u32, 256u32, 64u32);
+    let half = (rotary_dim / 2) as usize;
+    let theta = 10_000_000.0f32;
+    let inv_freq: Vec<f32> =
+        (0..half).map(|i| 1.0 / theta.powf((2 * i) as f32 / rotary_dim as f32)).collect();
+    let total = (n_tokens * num_heads * head_dim) as usize;
+    let mut rng = Rng::new(0x3D_0B0E);
+    let x: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let mut pos = Vec::new();
+    for t in 0..n_tokens as i32 {
+        if t < 8 {
+            pos.extend([4000 + t; 3]); // text
+        } else {
+            let k = t - 8; // 4 x 4 image grid
+            pos.extend([4008, 4008 + k / 4, 4008 + k % 4]);
+        }
+    }
+    let shape = (n_tokens, num_heads, head_dim, rotary_dim);
+
+    let mut cpu_wf = dummy_weight_file("rope_m_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_out = run_rope(&mut cpu, &x, &inv_freq, Some(&pos), shape, 0);
+
+    let mut gpu_wf = dummy_weight_file("rope_m_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_buf = MtlWeightBuf::wrap(gpu_wf.wf.as_ref().unwrap(), metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_out = run_rope(&mut gpu, &x, &inv_freq, Some(&pos), shape, 0);
+    // Plain kernel on the same data: text rows must match the M-RoPE
+    // kernel bit for bit (equal axes = start_pos + t).
+    let gpu_plain = run_rope(&mut gpu, &x, &inv_freq, None, shape, 4000);
+
+    let cos = cosine_sim(&cpu_out, &gpu_out);
+    let max_abs =
+        cpu_out.iter().zip(&gpu_out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let row = (num_heads * head_dim) as usize;
+    let text_same = gpu_out[..8 * row] == gpu_plain[..8 * row];
+    // Image rows rotate differently from the plain kernel's.
+    let image_delta =
+        gpu_out[8 * row..].iter().zip(&gpu_plain[8 * row..]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    eprintln!(
+        "[rope_n_tokens_mrope] cos={cos:.9} max_abs={max_abs:.3e} text_bitwise={text_same} image_delta={image_delta:.3e}"
+    );
+    assert!(cos >= COSINE_FLOOR, "cosine {cos} below floor {COSINE_FLOOR} (max_abs={max_abs})");
+    assert!(max_abs < 1e-4, "max_abs {max_abs}");
+    assert!(text_same, "text rows differ from the plain RoPE kernel");
+    assert!(image_delta > 1e-2, "image rows were not rotated by their grid positions");
 }
 
 // ============================================================================

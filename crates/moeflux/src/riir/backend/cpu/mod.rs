@@ -923,6 +923,7 @@ impl Backend for CpuBackend {
             Op::RopeNTokens {
                 x,
                 inv_freq,
+                positions,
                 n_tokens,
                 num_heads,
                 head_dim,
@@ -931,6 +932,7 @@ impl Backend for CpuBackend {
                 ..
             } => {
                 let freq = self.read_f32(*inv_freq);
+                let pos = positions.map(|p| self.read_i32(p));
                 let mut x_buf = self.write_f32(*x);
                 rope_n_tokens_cpu(
                     &mut x_buf,
@@ -940,6 +942,7 @@ impl Backend for CpuBackend {
                     *head_dim as usize,
                     *rotary_dim as usize,
                     *start_pos,
+                    pos.as_deref(),
                 );
             }
             Op::ZeroBuffer { buf, n_bytes, .. } => {

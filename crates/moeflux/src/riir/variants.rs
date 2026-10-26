@@ -421,6 +421,30 @@ pub const ROPE_THETA: f32 = 10_000_000.0;
 #[cfg(any(feature = "model-cogito-v2-671b", feature = "model-olmoe-1b-7b"))]
 pub const ROPE_THETA: f32 = 10_000.0;
 
+/// Multimodal RoPE (`rope_parameters.mrope_section`, interleaved): of
+/// the `rotary_dim / 2` frequency pairs, pair `i` rotates by the
+/// height position when `i % 3 == 1 && i < 3 * s[1]`, by the width
+/// position when `i % 3 == 2 && i < 3 * s[2]`, else by the temporal
+/// one. A text token has all three equal, which is plain RoPE. `None`
+/// for variants without vision input (or not yet checked: A17B).
+#[cfg(feature = "model-qwen3-6-35b-a3b")]
+pub const MROPE_SECTION: Option<[usize; 3]> = Some([11, 11, 10]);
+#[cfg(not(feature = "model-qwen3-6-35b-a3b"))]
+pub const MROPE_SECTION: Option<[usize; 3]> = None;
+
+/// Which of a token's `[t, h, w]` positions frequency pair `i` uses
+/// under [`MROPE_SECTION`] `s`.
+#[inline]
+pub const fn mrope_axis(s: [usize; 3], i: usize) -> usize {
+    if i % 3 == 1 && i < 3 * s[1] {
+        1
+    } else if i % 3 == 2 && i < 3 * s[2] {
+        2
+    } else {
+        0
+    }
+}
+
 // --- KV cache / runtime limits -----------------------------------
 
 /// Maximum sequence length the KV cache buffers and the overflow

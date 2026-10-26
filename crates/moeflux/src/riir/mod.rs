@@ -366,6 +366,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// Under a memory cap: how many checkpoint buffers the plan holds
     /// ([`OpenConfig::max_checkpoints`]); `None` uncapped.
     checkpoint_planned: Option<usize>,
+    /// The `[t, h, w]` RoPE positions of the running
+    /// [`Self::eval_stage_mrope`] call, keyed by its first KV slot;
+    /// `None` (plain `slot` positions) otherwise.
+    rope_override: Option<(i32, Vec<[i32; 3]>)>,
     /// LRU order for `checkpoints`. Front = oldest, back = newest.
     /// When `checkpoints.len() > max_checkpoints`, evict from the
     /// front while skipping pos-0 (kept for repeat full-prefill
@@ -751,6 +755,7 @@ impl RsCtx<MetalBackend> {
             checkpoint_spare: Vec::new(),
             checkpoint_slot_bytes,
             checkpoint_planned: config.mem_cap.map(|_| config.max_checkpoints),
+            rope_override: None,
             checkpoint_order: VecDeque::new(),
             max_checkpoints: config.max_checkpoints,
             mla_buffers: None,
@@ -1630,7 +1635,7 @@ impl RsCtx<MetalBackend> {
                 moe_buffers,
                 deferred,
                 layer_idx_us,
-                pos,
+                [pos; 3],
                 k_active,
                 experts,
                 io_pool,
@@ -2092,6 +2097,47 @@ impl RsCtx<MetalBackend> {
         self.eval_request(ReqId::DEFAULT, input, start_pos, output)
     }
 
+    /// [`Self::eval_stage`] with multimodal RoPE: row `i` of `input`
+    /// goes to KV slot `start_pos + i` but is rotated by
+    /// `rope_pos[i] = [t, h, w]` (Qwen3.5 / Qwen3-VL interleaved
+    /// M-RoPE, [`variants::MROPE_SECTION`]). Image tokens take their
+    /// grid positions; text after an image continues from the image's
+    /// largest position + 1, so it no longer equals the slot — pass
+    /// `[p, p, p]` rows for it here too, decode included. Rows with
+    /// three equal positions `p == start_pos + i` give exactly
+    /// [`Self::eval_stage`]'s result.
+    pub fn eval_stage_mrope(
+        &mut self,
+        input: StageInput<'_>,
+        start_pos: usize,
+        rope_pos: &[[i32; 3]],
+        output: StageOutput<'_>,
+    ) -> Result<(), RsError> {
+        if variants::MROPE_SECTION.is_none() {
+            return Err(RsError::StageMismatch {
+                detail: format!("{} has no multimodal RoPE", VARIANT.name),
+            });
+        }
+        let n = self.stage_check(&input, &output)?;
+        if rope_pos.len() != n || rope_pos.iter().flatten().any(|&p| p < 0) {
+            return Err(RsError::EvalFailed);
+        }
+        let base = i32::try_from(start_pos).map_err(|_| RsError::PositionOutOfRange { start_pos, n_tokens: n })?;
+        self.rope_override = Some((base, rope_pos.to_vec()));
+        let r = self.eval_request(ReqId::DEFAULT, input, start_pos, output);
+        self.rope_override = None;
+        r
+    }
+
+    /// The RoPE position of the token at KV slot `slot`:
+    /// [`Self::eval_stage_mrope`]'s row for it, else `[slot; 3]`.
+    fn rope_pos_at(&self, slot: i32) -> [i32; 3] {
+        match &self.rope_override {
+            Some((base, rows)) => rows[(slot - base) as usize],
+            None => [slot; 3],
+        }
+    }
+
     /// [`Self::eval_stage`] on request `req`'s sequence (plan phase 4).
     /// `req` must be admitted ([`Self::admit_request`]); switching to it
     /// swaps its state in (no copy) if another request ran last.
@@ -2314,6 +2360,11 @@ impl RsCtx<MetalBackend> {
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
         let range = self.layer_range.clone();
+        // This chunk's `[t, h, w]` rows when running `eval_stage_mrope`.
+        let chunk_rope: Option<Vec<i32>> = self.rope_override.as_ref().map(|(base, rows)| {
+            let off = (start_pos - base) as usize;
+            rows[off..off + n].iter().flatten().copied().collect()
+        });
 
         // Field-disjoint mutable borrows. `io_pool` dropped here on
         // 2026-05-20 alongside the pread teardown — the batched
@@ -2356,6 +2407,13 @@ impl RsCtx<MetalBackend> {
         let full_attn_graph_scratch = full_attn_graph_scratch
             .as_ref()
             .expect("ensure_linear_resources");
+        if let Some(rows) = &chunk_rope {
+            let pos_id = full_attn_graph_scratch.positions.ok_or(RsError::EvalFailed)?;
+            backend
+                .pool_mut()
+                .upload(pos_id, bytemuck::cast_slice(rows))
+                .map_err(|_| RsError::EvalFailed)?;
+        }
         let moe_graph_scratch = moe_graph_scratch.as_ref().expect("ensure_linear_resources");
         let hidden_double_buffer = hidden_double_buffer
             .as_ref()
@@ -2476,6 +2534,7 @@ impl RsCtx<MetalBackend> {
                     &layer_caches[layer_idx],
                     layer_idx,
                     start_pos,
+                    chunk_rope.is_some(),
                     n,
                     k_active,
                     experts,
@@ -3106,6 +3165,7 @@ impl RsCtx<MetalBackend> {
         let k_active = self.k_active;
         let expert_io_mode = self.expert_io_mode;
         let range = self.layer_range.clone();
+        let rope_pos = self.rope_pos_at(pos);
 
         // Field-disjoint mutable borrows for the layer loop. Same
         // pattern as `layer_forward_dump_inner`.
@@ -3268,7 +3328,7 @@ impl RsCtx<MetalBackend> {
                     moe_buffers,
                     deferred,
                     layer_idx,
-                    pos,
+                    rope_pos,
                     k_active,
                     experts,
                     io_pool,

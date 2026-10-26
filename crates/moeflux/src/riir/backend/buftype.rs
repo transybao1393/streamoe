@@ -493,6 +493,11 @@ tag!(
     RopeInvFreqBuf
 );
 tag!(
+    /// Per-token multimodal RoPE positions — `[n_tokens, 3]` i32
+    /// (`t, h, w`). Persistent, host-uploaded per chunk. Read-only.
+    RopePosBuf
+);
+tag!(
     /// Token IDs — `[n_tokens]` i32. Host-uploaded; input to
     /// `EmbedGatherNTokens`.
     TokenIdsBuf

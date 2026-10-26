@@ -50,12 +50,12 @@ use crate::riir::attn::linear_attn_forward::{
     read_buffer_to_vec,
 };
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
-use crate::riir::attn::rope::apply_rotary_emb;
+use crate::riir::attn::rope::apply_mrope;
 use crate::riir::attn::kv_quant::{KvFormat, quantize_row, sdpa_cpu_quant_pool};
 use crate::riir::attn::sdpa::sdpa_cpu_pool;
 use crate::riir::backend::buftype::{
     AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf, QGateBuf, QProjOutBuf,
-    RopeInvFreqBuf, RouterLogitsBuf, VProjOutBuf,
+    RopeInvFreqBuf, RopePosBuf, RouterLogitsBuf, VProjOutBuf,
 };
 use crate::riir::backend::gpu::gpu_ctx::GpuLayerCtx;
 use crate::riir::backend::gpu::gpu_matvec::{MatvecPipelines, MatvecSpec, encode_matvec};
@@ -114,6 +114,9 @@ pub struct FullAttnGraphScratch {
     /// Precomputed vanilla-RoPE `inv_freq` table — persistent,
     /// read-only, uploaded once at construction.
     pub inv_freq: BufId<RopeInvFreqBuf>,
+    /// Per-token `[t, h, w]` RoPE positions for a multimodal chunk
+    /// (`[chunk, 3]` i32, host-uploaded); `None` without M-RoPE.
+    pub positions: Option<BufId<RopePosBuf>>,
     /// One-time `commit_plan` latch for `graph1` — cleared at
     /// construction, set by the first producer call. The MoE `graph2`
     /// has its own latch on `MoeGraphScratch`.
@@ -188,6 +191,11 @@ impl FullAttnGraphScratch {
             std::slice::from_raw_parts(inv_freq_host.as_ptr() as *const u8, half * f32_sz)
         })
         .expect("FullAttnGraphScratch::new inv_freq upload");
+        let positions: Option<BufId<RopePosBuf>> =
+            crate::riir::variants::MROPE_SECTION.is_some().then(|| {
+                pool.alloc(chunk * 3 * std::mem::size_of::<i32>(), "fags.rope_positions", true)
+                    .expect("FullAttnGraphScratch::new pool alloc")
+            });
 
         Self {
             normed,
@@ -201,6 +209,7 @@ impl FullAttnGraphScratch {
             o_proj_stack,
             gate_logits,
             inv_freq,
+            positions,
             commit_planned: std::cell::Cell::new(false),
         }
     }
@@ -219,14 +228,14 @@ impl FullAttnGraphScratch {
 /// `buffers.shared_out` hold the per-token GPU outputs; KV cache
 /// advances by 1.
 ///
-/// `pos` is the absolute KV position (matches the C side's `pos`
-/// argument to `apply_rotary_emb`).
+/// `pos` is the token's RoPE position `[t, h, w]` (all equal for text,
+/// [`apply_mrope`]); the KV slot is `kv_state.len`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     metal: &mut MetalContext,
     gpu: &GpuLayerCtx<'_>,
     layer_idx: usize,
-    pos: i32,
+    pos: [i32; 3],
     k_active: usize,
     kv_state: &mut KvCache,
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
@@ -423,7 +432,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     rms_norm_per_head_cpu(wf, &k_norm_name, k_heads, k_norm_dim, &mut k_host)?;
 
     // ── RoPE on q + k ────────────────────────────────────────────
-    apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
+    apply_mrope(pos, &mut q_host, &mut k_host)?;
 
     // ── KV append: canonical pool KV ─────────────────────────────
     let cache_pos = kv_state.len as usize;
@@ -613,7 +622,7 @@ pub(in crate::riir) fn full_attn_layer_forward(
     moe: &mut MoeBuffers,
     deferred: &mut crate::riir::moe::deferred::DeferredRing,
     layer_idx: usize,
-    pos: i32,
+    pos: [i32; 3],
     k_active: usize,
     expert_files: &ExpertFiles,
     pool: &rayon::ThreadPool,
@@ -706,6 +715,9 @@ pub(in crate::riir) fn batched_full_attn_layer_forward<B>(
     layer_cache: &LayerWeightCache,
     layer_idx: usize,
     start_pos: i32,
+    // Rotate by the `[t, h, w]` rows already uploaded to
+    // `scratch.positions` instead of `start_pos + t`.
+    mrope: bool,
     n_tokens: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
@@ -925,10 +937,12 @@ where
                 });
             }
         }
+        let positions = if mrope { scratch.positions } else { None };
         g.push(Op::RopeNTokens {
             label: "full_attn.q_rope",
             x: scratch.q_stack.into(),
             inv_freq: scratch.inv_freq,
+            positions,
             n_tokens: n,
             num_heads: num_attn_heads,
             head_dim,
@@ -939,6 +953,7 @@ where
             label: "full_attn.k_rope",
             x: scratch.k_proj_stack.into(),
             inv_freq: scratch.inv_freq,
+            positions,
             n_tokens: n,
             num_heads: num_kv_heads,
             head_dim,

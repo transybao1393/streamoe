@@ -45,7 +45,9 @@ pub fn residual_add_n_tokens_cpu(a: &[f32], b: &[f32], out: &mut [f32]) {
 /// `[rotary_dim, head_dim)` are untouched. Token `t`'s absolute
 /// position is `start_pos + t`. `inv_freq` is the precomputed
 /// `rotary_dim/2`-length frequency table. Same rotation as
-/// `attn::rope::apply_rotary_emb`.
+/// `attn::rope::apply_rotary_emb`. With `positions` (`[n_tokens, 3]`,
+/// multimodal RoPE) pair `i` of token `t` uses
+/// `positions[3 t + mrope_axis(i)]` instead — `attn::rope::apply_mrope`.
 #[allow(clippy::too_many_arguments)]
 pub fn rope_n_tokens_cpu(
     x: &mut [f32],
@@ -55,15 +57,21 @@ pub fn rope_n_tokens_cpu(
     head_dim: usize,
     rotary_dim: usize,
     start_pos: i32,
+    positions: Option<&[i32]>,
 ) {
     let half = rotary_dim / 2;
     debug_assert_eq!(inv_freq.len(), half);
     debug_assert_eq!(x.len(), n_tokens * num_heads * head_dim);
+    let sec = crate::riir::variants::MROPE_SECTION.unwrap_or([0; 3]);
     for token in 0..n_tokens {
-        let pos = (start_pos + token as i32) as f32;
+        let linear = start_pos + token as i32;
         for head in 0..num_heads {
             let base = token * num_heads * head_dim + head * head_dim;
             for i in 0..half {
+                let pos = match positions {
+                    Some(p) => p[3 * token + crate::riir::variants::mrope_axis(sec, i)],
+                    None => linear,
+                } as f32;
                 let angle = pos * inv_freq[i];
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();

@@ -190,11 +190,13 @@ pub fn prefill_scratch_bytes(v: Variant, chunk: usize) -> u64 {
             + num_v * Variant::LINEAR_VALUE_DIM
             + v.num_experts);
 
-    // FullAttnGraphScratch transients + the inv_freq table.
+    // FullAttnGraphScratch transients + the inv_freq table (+ the
+    // `[chunk, 3]` i32 M-RoPE positions where the variant has them).
     let k_raw = if v.qk_norm == crate::riir::variants::QkNorm::Full { kv_dim } else { 0 };
     let q_gate = if v.attn_output_gate { q_dim } else { 0 };
+    let mrope = if crate::riir::variants::MROPE_SECTION.is_some() { 3 } else { 0 };
     let full = chunk
-        * (2 * hidden + v.q_proj_dim() + k_raw + 2 * kv_dim + 2 * q_dim + q_gate + v.num_experts)
+        * (2 * hidden + v.q_proj_dim() + k_raw + 2 * kv_dim + 2 * q_dim + q_gate + v.num_experts + mrope)
         + v.rotary_dim() / 2;
 
     // MoeGraphScratch, `expert_base` excluded.

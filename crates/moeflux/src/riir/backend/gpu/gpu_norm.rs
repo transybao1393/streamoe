@@ -302,6 +302,43 @@ pub fn encode_rope_n_tokens_into(
     enc.end_encoding();
 }
 
+/// [`encode_rope_n_tokens_into`] with per-token `[t, h, w]` positions
+/// (`positions`: `[n_tokens, 3]` i32) — the `rope_n_tokens_mrope`
+/// kernel; `section` is the variant's `MROPE_SECTION`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_rope_n_tokens_mrope_into(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    x: &Buffer,
+    inv_freq: &Buffer,
+    positions: &Buffer,
+    n_tokens: u32,
+    num_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    section: [usize; 3],
+) {
+    let total = n_tokens * num_heads * (rotary_dim / 2);
+    let (h_lim, w_lim) = ((3 * section[1]) as u32, (3 * section[2]) as u32);
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x), 0);
+    enc.set_buffer(1, Some(inv_freq), 0);
+    enc.set_bytes(2, 4, (&n_tokens as *const u32).cast());
+    enc.set_bytes(3, 4, (&num_heads as *const u32).cast());
+    enc.set_bytes(4, 4, (&head_dim as *const u32).cast());
+    enc.set_bytes(5, 4, (&rotary_dim as *const u32).cast());
+    enc.set_buffer(6, Some(positions), 0);
+    enc.set_bytes(7, 4, (&h_lim as *const u32).cast());
+    enc.set_bytes(8, 4, (&w_lim as *const u32).cast());
+    let num_tgs = (total + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
 /// Encode a batched 4-bit token-embedding gather — see the
 /// `embed_gather_4bit` kernel in shaders.metal. For each of `n_tokens`
 /// tokens, row `token_ids[t]` of the affine-packed embedding tensor is

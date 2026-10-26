@@ -389,10 +389,15 @@ pub enum Op {
     ///
     /// In-place on `x`; `x` accepts QBuf or KProjOutBuf via the
     /// [`RmsNormIn`] union.
+    ///
+    /// `positions` (multimodal RoPE, [`crate::riir::variants::MROPE_SECTION`]):
+    /// token `t` rotates frequency pair `i` by `positions[t][mrope_axis(i)]`
+    /// instead of `start_pos + t`.
     RopeNTokens {
         label: &'static str,
         x: BufId<RmsNormIn>,
         inv_freq: BufId<RopeInvFreqBuf>,
+        positions: Option<BufId<RopePosBuf>>,
         n_tokens: u32,
         num_heads: u32,
         head_dim: u32,
@@ -864,8 +869,10 @@ impl Op {
         match self {
             Op::RmsNormBf16NTokens { x, .. } => vec![x.raw()],
             Op::RmsNormQkNTokens { x, .. } => vec![x.raw()],
-            Op::RopeNTokens { x, inv_freq, .. } => {
-                vec![x.raw(), inv_freq.raw()]
+            Op::RopeNTokens { x, inv_freq, positions, .. } => {
+                let mut r = vec![x.raw(), inv_freq.raw()];
+                r.extend(positions.map(|p| p.raw()));
+                r
             }
             Op::ResidualAddNTokens { a, b, .. } => vec![a.raw(), b.raw()],
             Op::ZeroBuffer { .. } => vec![],

@@ -118,6 +118,50 @@ pub fn apply_rotary_emb(pos: i32, q: &mut [f32], k: &mut [f32]) -> Result<(), Ro
     Ok(())
 }
 
+/// [`apply_rotary_emb`] with a `[t, h, w]` position (multimodal RoPE,
+/// [`crate::riir::variants::MROPE_SECTION`]): frequency pair `i` rotates
+/// by `pos[mrope_axis(i)]`. Equal components take the plain
+/// [`apply_rotary_emb`] path, so text tokens are bit-identical to it.
+pub fn apply_mrope(pos: [i32; 3], q: &mut [f32], k: &mut [f32]) -> Result<(), RopeError> {
+    if pos[0] == pos[1] && pos[1] == pos[2] {
+        return apply_rotary_emb(pos[0], q, k);
+    }
+    if let Some(&p) = pos.iter().find(|&&p| p < 0) {
+        return Err(RopeError::NegativePos { pos: p });
+    }
+    let sec = crate::riir::variants::MROPE_SECTION.expect("apply_mrope on a variant without M-RoPE");
+    let head_dim = VARIANT.head_dim;
+    let rotary_dim = VARIANT.rotary_dim();
+    let (num_heads, num_kv_heads) = (VARIANT.num_attn_heads, VARIANT.num_kv_heads);
+    if q.len() != num_heads * head_dim {
+        return Err(RopeError::QLen { got: q.len(), expected: num_heads * head_dim });
+    }
+    if k.len() != num_kv_heads * head_dim {
+        return Err(RopeError::KLen { got: k.len(), expected: num_kv_heads * head_dim });
+    }
+    let half = rotary_dim / 2;
+    let rdim_f = rotary_dim as f32;
+    let rot = |x: &mut [f32], heads: usize| {
+        for h in 0..heads {
+            let xh = &mut x[h * head_dim..h * head_dim + head_dim];
+            for i in 0..half {
+                // SAFETY: as in `apply_rotary_emb`.
+                let freq = unsafe { 1.0f32 / powf(ROPE_THETA, (2 * i) as f32 / rdim_f) };
+                let angle = pos[crate::riir::variants::mrope_axis(sec, i)] as f32 * freq;
+                let cos_a = unsafe { cosf(angle) };
+                let sin_a = unsafe { sinf(angle) };
+                let x0 = xh[i];
+                let x1 = xh[i + half];
+                xh[i] = x0 * cos_a - x1 * sin_a;
+                xh[i + half] = x0 * sin_a + x1 * cos_a;
+            }
+        }
+    };
+    rot(q, num_heads);
+    rot(k, num_kv_heads);
+    Ok(())
+}
+
 // =====================================================================
 // YaRN — extended-context RoPE for DeepSeek-V3 / Cogito-V2.
 //
@@ -441,5 +485,67 @@ mod tests {
                 x[i]
             );
         }
+    }
+
+    /// `mrope_axis` against Qwen3.5's `recomposition_frequencies`:
+    /// start from T everywhere, then overwrite `slice(1, 3*s[1], 3)`
+    /// with H and `slice(2, 3*s[2], 3)` with W.
+    #[cfg(feature = "model-qwen3-6-35b-a3b")]
+    #[test]
+    fn mrope_axis_matches_qwen_recomposition() {
+        use crate::riir::variants::{MROPE_SECTION, mrope_axis};
+        let s = MROPE_SECTION.unwrap();
+        let half = VARIANT.rotary_dim() / 2;
+        let mut want = vec![0usize; half];
+        for (axis, offset) in [(1usize, 1usize), (2, 2)] {
+            let mut i = offset;
+            while i < 3 * s[axis] && i < half {
+                want[i] = axis;
+                i += 3;
+            }
+        }
+        let got: Vec<usize> = (0..half).map(|i| mrope_axis(s, i)).collect();
+        assert_eq!(got, want);
+        assert_eq!(got.iter().filter(|&&a| a == 1).count(), s[1]);
+        assert_eq!(got.iter().filter(|&&a| a == 2).count(), s[2]);
+    }
+
+    /// Equal `[t, h, w]` is plain RoPE, bit for bit; distinct ones
+    /// rotate each pair by its own axis.
+    #[cfg(feature = "model-qwen3-6-35b-a3b")]
+    #[test]
+    fn mrope_equal_positions_are_plain_rope() {
+        use crate::riir::variants::{MROPE_SECTION, mrope_axis};
+        let qn = VARIANT.num_attn_heads * VARIANT.head_dim;
+        let kn = VARIANT.num_kv_heads * VARIANT.head_dim;
+        let q0: Vec<f32> = (0..qn).map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0).collect();
+        let k0: Vec<f32> = (0..kn).map(|i| ((i * 53 % 97) as f32 - 48.0) / 24.0).collect();
+        let (mut q1, mut k1) = (q0.clone(), k0.clone());
+        let (mut q2, mut k2) = (q0.clone(), k0.clone());
+        apply_rotary_emb(1234, &mut q1, &mut k1).unwrap();
+        apply_mrope([1234; 3], &mut q2, &mut k2).unwrap();
+        assert_eq!(q1, q2);
+        assert_eq!(k1, k2);
+
+        // Distinct axes: pair i of every head equals plain RoPE at
+        // the position of its own axis.
+        let pos = [7, 40, 900];
+        let (mut qm, mut km) = (q0.clone(), k0.clone());
+        apply_mrope(pos, &mut qm, &mut km).unwrap();
+        let s = MROPE_SECTION.unwrap();
+        let half = VARIANT.rotary_dim() / 2;
+        let hd = VARIANT.head_dim;
+        for p in pos {
+            let (mut qp, mut kp) = (q0.clone(), k0.clone());
+            apply_rotary_emb(p, &mut qp, &mut kp).unwrap();
+            for h in 0..VARIANT.num_attn_heads {
+                for i in (0..half).filter(|&i| pos[mrope_axis(s, i)] == p) {
+                    assert_eq!(qm[h * hd + i], qp[h * hd + i]);
+                    assert_eq!(qm[h * hd + i + half], qp[h * hd + i + half]);
+                }
+            }
+        }
+        // The unrotated tail of each head is untouched.
+        assert_eq!(qm[VARIANT.rotary_dim()..hd], q0[VARIANT.rotary_dim()..hd]);
     }
 }
