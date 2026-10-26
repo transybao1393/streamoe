@@ -40,6 +40,18 @@ __pycache__/
 # macOS
 .DS_Store
 
+# Third-party reference documents (vendor manuals, others' papers) are
+# not ours to redistribute — link to them instead. paper/ is flash-moe's
+# own paper and stays tracked.
+*.pdf
+!paper/*.pdf
+
+# Local secrets and environment (tokens, signing or license keys)
+.env
+.env.*
+*.pem
+*.key
+
 # Profiling / experiment artifacts
 *.gputrace/
 *.trace/
