@@ -1,98 +1,260 @@
 # streamoe
 
-Pure-Rust streaming-experts Mixture-of-Experts inference for Apple
-Silicon: run large MoE models — including their vision input — inside
-a hard, user-set memory cap, on one Mac or across a small cluster of
-Macs.
+**Big models. Small machines. Hard limits.**
 
-> **streamoe grew out of [moeflux](https://github.com/mdegans/moeflux).**
-> It keeps moeflux's engine and Metal kernels and rebuilds everything
-> around them: memory is governed by a strict budget, experts stream
-> from SSD through a fixed-size hot tier with no OS page cache, a model
-> can be split by layer range across nodes, several requests can share
-> the pipeline, and Qwen3.5 / 3.6 can take images. Git history keeps
-> the whole lineage (flash-moe → moeflux → streamoe); see
-> [Provenance](#provenance).
+streamoe is a pure-Rust Mixture-of-Experts inference engine for Apple
+Silicon, built on one conviction: *the size of a model should not
+decide which machine can run it — your memory budget should.* You set a
+cap; streamoe plans every byte at open, streams experts from SSD
+through a hot tier it manages itself, splits a model across Macs when
+one is not enough, and never takes memory it did not plan for.
+
+Today that means a 35-billion-parameter vision-language model —
+Qwen3.6-35B-A3B, 19.4 GB at 4-bit — answering questions about images
+in **4 GiB of RAM** on a shared laptop, at ~5 tokens per second, making
+the same greedy choices as the MLX reference.
+
+> **Lineage.** streamoe grew out of
+> [moeflux](https://github.com/mdegans/moeflux), which grew out of
+> [flash-moe](https://github.com/danveloper/flash-moe). It keeps their
+> engine and Metal kernels and rebuilds everything around them: a
+> strict memory contract, cache-free expert streaming with a
+> frequency-managed hot tier, layer-range pipelines across nodes,
+> multiple requests in flight, compact KV caches and vision input. Git
+> history keeps the whole lineage; see [Provenance](#provenance).
 >
 > **Naming in the code.** The crates, binaries and Cargo features still
 > carry the `moeflux` name (`crates/moeflux`, `use moeflux::Ctx`,
 > `moeflux-node`); the rename to `streamoe` comes in a later release.
 > Commands and code below use the names as they are today.
 >
-> The full design and phase plan is in
-> [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md); the
-> motivation is in
-> [`docs/moeflux fork proposed changes.md`](docs/moeflux%20fork%20proposed%20changes.md).
-> The revamp is in progress — see [Status](#status) for what exists
-> today and what is planned.
->
 > **License.** streamoe is source-available: free for personal,
 > academic and other noncommercial use; commercial use needs a license
 > from the author. Code inherited from moeflux and flash-moe stays MIT.
 > See [License](#license).
 
-## Goals
+## Direction
 
-- **Hard memory cap.** The engine never pushes total memory use past
-  the cap you set (e.g. 10 GB), including page cache it would cause,
-  so other services on the same machine are untouched. Everything is
-  reserved at open; if it does not fit, `open` fails before anything
-  else is affected.
-- **Streaming experts, designed for a hard cap.** Experts stream from
-  SSD with `F_NOCACHE` reads into a fixed hot tier and slot ring, with
-  profile-seeded, frequency-based caching and speculative prefetch.
-- **Compact KV cache.** The attention cache can be stored as F16 or
-  TurboQuant 4/3-bit instead of f32; under a cap the memory it frees
-  goes to the expert hot tier.
-- **Router hook.** After routing, the engine hands each layer's
-  picked experts and gate weights to a policy, which decides per
-  expert whether to run it at 4-bit, run it at 2-bit, or skip it.
-  The policy can live outside the engine; the engine exposes the hook.
-- **Vision input.** Qwen3.5 / 3.6 images run through a CPU vision
-  encoder whose buffers are counted in the cap, and reach the model at
-  their multimodal (M-RoPE) positions.
-- **Two modes, one code path.**
-  - *Mode A — single node:* Mac mini M4 24 GB, experts on an external
-    SSD, 10 GB cap.
-  - *Mode B — three-node pipeline:* M4 + 2 × M1 16 GB, each node runs
-    a contiguous layer range with its experts resident in RAM.
-- **Throughput:** several requests in flight across the pipeline.
-- **Telemetry:** per token, per layer, per tier.
+Inference engines usually ask *"how much memory does this model need?"*
+and stop there. streamoe turns the question around: *"here is the
+memory you may use — make the model fit, and make it fast."* Everything
+in the design follows from that inversion.
+
+- **Memory is a contract, not an estimate.** The cap covers weights,
+  KV, scratch, checkpoints, driver overhead, the vision encoder,
+  network buffers — and the page cache the engine would otherwise
+  cause. Every account is planned, allocated and touched at open. If
+  the plan does not fit, `open` fails before anything else on the
+  machine is affected.
+- **Disk is a tier, not a fallback.** A Mac's internal SSD reads
+  ~6.7 GB/s. With `F_NOCACHE` streaming, a fixed hot tier and
+  speculative prefetch, a model 4–6× larger than its budget decodes at
+  ~5 tokens per second.
+- **Speculation never changes the math.** Prefetch guesses, cross-layer
+  predictions and hot-tier admission only decide *what to read early*.
+  Routing always uses the model's own logits; output is identical
+  across caps.
+- **One code path from one Mac to a cluster.** The same engine runs the
+  whole model on a laptop or one contiguous slice of it on each node of
+  a pipeline.
+- **Every claim is measured.** Correctness is checked against MLX and
+  transformers, CPU against Metal, batched against per-token.
+  Telemetry counts hits, reads and waits per token, per layer and per
+  tier. Speed numbers in this README are measured (the one estimate is
+  labelled), and the ideas that did not pay off are written down in
+  [`docs/known-issues.md`](docs/known-issues.md) so nobody retries them
+  blind.
+
+Where it goes next: per-expert precision chosen at run time (4-bit,
+2-bit or skip, by a router policy outside the engine), node-to-node
+pipelines without a central hop, and more model families — see
+[Roadmap](#roadmap).
 
 ## Architecture
 
-The same engine runs in both modes, always inside a hard memory cap.
+### The whole system
 
-### Mode A — single node, streaming
+```mermaid
+flowchart TB
+    classDef app fill:#4f46e5,stroke:#312e81,color:#ffffff
+    classDef engine fill:#0f766e,stroke:#134e4a,color:#ffffff
+    classDef mem fill:#b45309,stroke:#78350f,color:#ffffff
+    classDef disk fill:#475569,stroke:#1e293b,color:#ffffff
 
-One Mac runs every layer. Experts live on the SSD; the most-used ones
-sit in a fixed-size hot tier in RAM, and the rest stream in on demand.
+    APP["<b>Application</b><br/>drama_llama · tools/chat · moeflux-coord"]:::app
+    API["<b>Ctx</b><br/>open_with · eval_prompt · eval_token<br/>eval_stage · eval_stage_mrope · requests · snapshots"]:::engine
+    PLAN["<b>Budget plan</b><br/>every account sized at open<br/>fails with OverBudget if it can't fit"]:::engine
+    VIS["<b>Vision encoder</b><br/>CPU · Accelerate GEMMs<br/>streams 0.85 GiB BF16 weights"]:::engine
+
+    subgraph LOOP["Forward pass · per layer"]
+        direction LR
+        ATT["<b>Attention</b><br/>GatedDeltaNet linear layers<br/>full-attention layers · MLA"]:::engine
+        RT["<b>Router</b><br/>top-k on the<br/>model's own logits"]:::engine
+        MOE["<b>K-expert matvec</b><br/>Metal · 4-bit"]:::engine
+        ATT --> RT --> MOE
+    end
+
+    subgraph MEM["RAM · inside the cap"]
+        direction LR
+        W["Non-expert<br/>weights"]:::mem
+        KV["KV cache<br/>F32 · F16 · Turbo4/3"]:::mem
+        HOT["<b>Hot tier</b><br/>LFU · profile-seeded"]:::mem
+        SLOTS["Slot ring<br/>synced + 2 prefetch sets"]:::mem
+    end
+
+    SSD[("<b>SSD</b><br/>packed experts<br/>F_NOCACHE pread")]:::disk
+    FAST[("<b>Fast disk tier</b><br/>optional copy of hot layers")]:::disk
+
+    APP --> API
+    APP -- "image" --> VIS -- "embeddings at M-RoPE positions" --> API
+    API --> PLAN --> MEM
+    API --> LOOP
+    LOOP <--> W & KV
+    MOE -- "binds in place" --> HOT & SLOTS
+    SSD & FAST -- "misses + prefetch" --> SLOTS
+```
+
+### Memory: planned, not hoped for
+
+At open, streamoe sizes every account for the context you asked for —
+`n_ctx`, KV format, request slots, checkpoints, host buffers — and the
+expert hot tier takes exactly what is left. The plan for Qwen3.6-35B-A3B
+under a 4 GiB cap (n_ctx 4096, F32 KV), as measured on an M3 Pro:
+
+```mermaid
+pie showData
+    title Qwen3.6-35B-A3B · 4 GiB cap (GiB)
+    "Hot tier (expert cache)" : 1.20
+    "Non-expert weights" : 1.29
+    "Runtime / Metal overhead" : 0.50
+    "Prefill staging" : 0.42
+    "Prefill scratch" : 0.23
+    "KV cache (F32)" : 0.15
+    "Linear-attention state" : 0.12
+    "Expert slot ring" : 0.09
+```
+
+Measured footprint stays within 0.08 GiB of the plan. A Turbo4 KV cache
+shrinks the KV slice to 0.02 GiB and the hot tier grows by the
+difference; on models with large KV caches (OLMoE at n_ctx 4096) that
+trade alone made decode 44% faster.
+
+### One layer of decode
+
+Under a cap, experts are read with `F_NOCACHE` — no page cache, so
+nothing else on the machine loses its file cache. Each layer hides as
+much of that I/O as it can behind GPU work:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as CPU
+    participant IO as I/O pool
+    participant G as GPU
+    participant H as Hot tier
+    participant S as SSD
+
+    Note over C: layer L begins (layer L−1's GPU work drained)
+    C->>C: guess L's experts — cross-layer from L−1's residual,<br/>or the previous token's picks
+    C->>H: drop guesses that are already hot
+    C-)IO: prefetch the rest into slot set L mod 2
+    par overlapped
+        G->>G: attention + router logits
+        Note right of G: full-attention layers under a cap run<br/>on CPU threads (attn_threads)
+    and
+        IO->>S: parallel F_NOCACHE pread
+        S-->>IO: expert bytes → prefetch slots
+    end
+    G->>C: router logits
+    C->>C: top-k on the model's own logits
+    C->>H: hot hits bind their RAM slot (zero copy, zero I/O)
+    C->>IO: wait for L's prefetch — hits bind their slot
+    C->>S: misses: parallel pread → synced slots
+    C->>G: K-expert matvec + combine, chained into L+1's norm
+    C->>H: count picks, admit misses hotter than a sampled victim (LFU)
+```
+
+On Qwen3.6-35B-A3B (40 layers, 256 experts, 8 picked per token) the
+cross-layer guess doubles prefetch hits over the previous-token guess
+(63 → 127 per token) and, with 6 experts prefetched, cuts decode time
+by about a fifth — with identical output.
+
+### Mode A — one Mac, streaming
+
+One machine runs every layer. A small hot tier serves the most-used
+experts from RAM; the rest stream from disk on demand.
 
 ```mermaid
 flowchart LR
-    subgraph A["Mode A · one Mac mini M4 · 10 GB cap"]
+    classDef mem fill:#b45309,stroke:#78350f,color:#ffffff
+    classDef disk fill:#475569,stroke:#1e293b,color:#ffffff
+    classDef engine fill:#0f766e,stroke:#134e4a,color:#ffffff
+
+    subgraph MAC["One Mac · e.g. 4–10 GiB cap"]
         direction LR
-        SSD["<b>SSD</b><br/>all experts<br/>read-only"] -- "load on miss" --> HOT["<b>Hot tier</b><br/>most-used experts<br/>in RAM"]
-        HOT -- "experts" --> ENGINE["<b>Engine</b><br/>all layers"]
-        ENGINE -- "tokens" --> APP["<b>Application</b>"]
+        HOT["<b>Hot tier</b><br/>most-picked experts<br/>fixed size"]:::mem
+        SLOTS["<b>Slot ring</b><br/>prefetched + synced"]:::mem
+        ENG["<b>Engine</b><br/>all layers<br/>GPU + CPU"]:::engine
+        HOT -- "zero-copy bind" --> ENG
+        SLOTS -- "bind" --> ENG
     end
+    SSD[("<b>SSD</b><br/>all experts")]:::disk -- "F_NOCACHE pread" --> SLOTS
+    PROF["Routing profile<br/>from earlier runs"] -. "seeds at open" .-> HOT
 ```
 
-### Mode B — three-node pipeline
+### Mode B — a pipeline of Macs
 
-Each Mac runs a slice of the layers and holds all of that slice's
-experts in RAM, so nothing streams from disk. Hidden states flow from
-node to node; the next token returns to the first node.
+Each node opens the model with a contiguous `layer_range` and its own
+cap. The coordinator drives the chain in a star: it sends token ids to
+the first node, relays each node's f32 hidden state to the next, and
+gets logits back from the last. f32 frames mean a split over the
+network computes exactly what the same split computes in one process.
 
 ```mermaid
 flowchart LR
-    subgraph B["Mode B · three Mac minis · 10 GB cap each"]
-        direction LR
-        N1["<b>Node 1 · M4</b><br/>embed + first layers"] -- "hidden state" --> N2["<b>Node 2 · M1</b><br/>middle layers"]
-        N2 -- "hidden state" --> N3["<b>Node 3 · M1</b><br/>last layers + head"]
-        N3 -- "next token" --> N1
-    end
+    classDef coord fill:#4f46e5,stroke:#312e81,color:#ffffff
+    classDef node fill:#0f766e,stroke:#134e4a,color:#ffffff
+
+    PL["<b>Planner</b><br/>ranges from each node's<br/>cap and measured speed"]:::coord
+    CO(["<b>moeflux-coord</b><br/>Chain · times every node"]):::coord
+    N1["<b>Node 1</b> · M4<br/>embed + layers 0..a"]:::node
+    N2["<b>Node 2</b> · M1<br/>layers a..b"]:::node
+    N3["<b>Node 3</b> · M1<br/>layers b..n + LM head"]:::node
+
+    PL -.-> CO
+    CO -- "token ids" --> N1
+    N1 -- "f32 hidden" --> CO
+    CO -- "f32 hidden" --> N2
+    N2 -- "f32 hidden" --> CO
+    CO -- "f32 hidden" --> N3
+    N3 -- "logits" --> CO
 ```
+
+Frames are a fixed 32-byte versioned header plus payload, read into
+buffers allocated once and counted in each node's cap. A direct
+node-to-node ring, which saves a hop per stage, is on the
+[Roadmap](#roadmap).
+
+### Vision
+
+Qwen3.5 / 3.6 take images through a CPU vision encoder that lives inside
+the same cap: its weights stream from disk per image, its 137 MiB of
+buffers are part of the plan.
+
+```mermaid
+flowchart LR
+    classDef engine fill:#0f766e,stroke:#134e4a,color:#ffffff
+    classDef disk fill:#475569,stroke:#1e293b,color:#ffffff
+
+    IMG["<b>Image</b><br/>resized to multiples of 32<br/>≤ 640 × 640"] --> PE["<b>Patch embed</b><br/>16 px patches<br/>+ learned positions"]:::engine
+    PE --> BL["<b>ViT blocks</b><br/>2-D axial RoPE<br/>full-image attention"]:::engine
+    BL --> MG["<b>Merger</b><br/>2 × 2 patches → 1 token"]:::engine
+    MG --> LM["<b>Language model</b><br/>eval_stage_mrope<br/>tokens at [t, h, w]"]:::engine
+    WT[("BF16 weights<br/>0.85 GiB on disk")]:::disk -. "F_NOCACHE, per matrix" .-> PE & BL & MG
+```
+
+The encoder matches transformers exactly and mlx_vlm to 0.997; a
+640 × 640 image becomes 400 tokens in ~3 s.
 
 ### Decode attention across cores
 
@@ -125,7 +287,9 @@ decode 55–58% faster; short contexts gain little, since attention is
 then a small part of each step.
 
 Details — memory accounts, the per-token data path, phases — are in
-[`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md).
+[`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md); the
+motivation is in
+[`docs/moeflux fork proposed changes.md`](docs/moeflux%20fork%20proposed%20changes.md).
 
 ### Repository layout
 
@@ -204,6 +368,25 @@ let mut ctx = Ctx::open_with(&weights, &manifest, &vocab, &experts_root, false, 
 Tests: run `scripts/check_test_host.sh` first; it says which tier
 (unit/kernel or model) this host can run. Fixed bugs, open issues and
 traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
+
+## Roadmap
+
+- **Router policy and per-expert precision** (phases 7–8). After
+  routing, a policy outside the engine decides per expert whether to
+  run it at 4-bit, at 2-bit or skip it — trading quality for I/O one
+  expert at a time instead of quantizing the whole model.
+- **Faster decode from the engine side.** At ~2.3 GB/s the SSD is far
+  from saturated; the largest remaining cost (~105 ms of a token) is
+  the CPU waiting on each layer's post-attention GPU command buffer.
+- **Direct node-to-node pipelines** for mode B, removing the
+  coordinator hop between stages.
+- **More model families.** Qwen3-30B-A3B (`qwen3_moe`) as a new
+  variant, then runtime variant dispatch instead of one compile-time
+  feature per model.
+- **The rename** — crates, binaries and features from `moeflux` to
+  `streamoe`.
+- **Verification at full size.** The uncapped a3b oracle suites and
+  a17b model runs need a host with ≥ 8 GiB to spare.
 
 ## Running Qwen3.6-35B-A3B on a small Mac
 
@@ -374,9 +557,10 @@ differential oracles during that rewrite. The Metal
 streaming-experts kernels were authored by **Claude Opus 4.6**
 (Anthropic) for flash-moe and carry over here. streamoe adds the
 memory cap, streaming, pipeline, KV-format, vision and tooling work
-described above on top of that. The math is the same
-linear algebra every inference engine runs — nothing here is
-claimed as novel.
+described above on top of that. The math is the same linear
+algebra every inference engine runs; what streamoe contributes is the
+systems design around it — the memory contract, the tiering, the
+speculation that never changes the output, and the pipeline.
 
 ## License
 
