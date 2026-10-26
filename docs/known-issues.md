@@ -106,6 +106,20 @@ Older engine history (graph mode, prefill, kernels) is in
   within noise because decode waits on disk reads, and `cmd2_3`
   (~15 small dependent dispatches per layer) is bound by dispatch
   latency, not bandwidth.
+- **3-bit experts read as much as 4-bit ones** (3-bit codes kept in
+  4-bit nibbles, 1.77 MB per expert). Packed 3-bit experts
+  (`tools/pack_experts.py`, 8 codes per 3 bytes, MLX's layout) are
+  1.38 MB, 22% smaller; the engine detects the layout from the layer
+  file size (`ExpertLayout`), sizes slots, staging and hot tier from
+  it, and runs `dequant_matvec_3bit_v3_experts` (decode) and
+  `streammoe_mm_id` with `bits = 3` (prefill). Both keep the 4-bit
+  kernels' element order and per-weight `scale * q + bias`, so packed
+  and nibble 3-bit give bit-identical output (`tests/packed_3bit.rs`,
+  `moe_mm_id_packed_3bit_matches_nibble_layout`; on the model: same
+  perplexity to every digit, KL 5e-12, 10/10 identical texts). a3b
+  chat at a 4 GiB cap, 4-bit → packed 3-bit: forward 118 → 89,
+  146 → 115, 121 → 97 ms/token; first word 1.57 → 1.11, 1.38 → 0.92,
+  1.36 → 0.90 s; hot tier 719 → 997 slots in the same memory.
 
 ## Precautions
 
@@ -127,6 +141,11 @@ Older engine history (graph mode, prefill, kernels) is in
 - `expert_io = Mmap` is rejected with `mem_cap` (file-backed pages
   escape the cap); a hot tier needs `Pread`.
 - `prefetch_lookahead` needs `prefetch_guess = PrevToken`.
+- Packed 3-bit experts need the default prefill path
+  (`MoeGatherIdFuse`): it is forced for them, and the
+  `STREAMMOE_MOE_GATHER_ID=0` fallbacks and the per-expert decode
+  fallback (hidden > 4096, Cogito) have 4-bit kernels only. Every
+  layer file must hold the same layout (`ExpertIoError::MixedLayouts`).
 - **Checkpoints cost cap memory up front.** Under `mem_cap`,
   `max_checkpoints` (default 4) full-context snapshots are planned
   whether or not they are used: on OLMoE at n_ctx 2048 F32 that is
@@ -220,6 +239,22 @@ Older engine history (graph mode, prefill, kernels) is in
   5–8% faster than n random ones (8 experts: 3.14 vs 3.39 ms) — a
   1.77 MB expert is already a large block. Worth it only bundled with
   a co-activation file layout, and decode reads ~1.5 misses per layer.
+- Using idle disk time during decode (a3b, 4 GiB cap, 2026-10-26; I/O
+  timeline trace of 314 tokens): of ~141 ms/token the disk is idle
+  ~54 ms, but ~45 ms of that is ~1.1 ms per layer while the GPU runs
+  attention — too short to absorb extra reads, which then delay the
+  miss reads (the critical path). Wider cross-layer prefetch: 8 guesses
+  within noise, 10 / 12 / 16 slower (up to 258 ms/token); misses fall
+  54 → 14 but total bytes grow faster. Guessing two layers ahead:
+  top-8 overlap 5.75/8 vs 6.37/8 one ahead — weaker. I/O threads at
+  user-interactive QoS and `io_threads` 12: no effect. Guessing layer 0
+  from the token embedding cuts its misses 6.57 → 4.49 per token but is
+  within noise end to end. Decode is bandwidth-bound: read fewer bytes.
+- Overlapping prefill staging with GPU work: staging already reads only
+  the routed experts at the SSD's peak (~4.6 GB/s); GPU time between
+  stages is ~0.33 s per short prefill, so the ceiling is −23% time to
+  first word with perfect guesses, realistically −10–15%, for staging
+  slots the GPU may still be reading.
 - All-2-bit experts, re-measured on a3b (2026-10-26): experts rounded
   to 4 levels (`tools/requant_experts.py`, kept in the 4-bit layout) vs
   the 4-bit model on 314 teacher-forced tokens and 10 scored tasks
@@ -227,6 +262,6 @@ Older engine history (graph mode, prefill, kernels) is in
   perplexity 1.15 → 1.64; broke a tool call (no opening `<tool_call>`),
   17 × 23 = 39, a JSON array of objects came back as flat strings, and
   `is_prime` returned True for every n ≤ 7. 3-bit (8 levels) held up:
-  KL 0.048, top-1 93%, perplexity 1.21, all 10 tasks right — the
-  candidate for a packed 3-bit expert format (−22% bytes per expert).
+  KL 0.048, top-1 93%, perplexity 1.21, all 10 tasks right — now the
+  packed 3-bit format (see Fixed > Speed).
 

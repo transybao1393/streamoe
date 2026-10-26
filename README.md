@@ -373,7 +373,7 @@ motivation is in
 | Decode attention threads (`attn_threads`, default 4) | Implemented — bit-identical output; on OLMoE at 2.7k context decode +55–58% tok/s (F32 and Turbo4) |
 | Vision for Qwen3.5 / 3.6 (`riir::vision` CPU encoder, `eval_stage_mrope`, `tools/export_vision.py`) | Implemented — encoder matches transformers exactly and mlx_vlm to 0.997; whole pipeline checked layer by layer against MLX on a3b under a 4 GiB cap (encoder 137 MiB, ~1–3 s per image). Small printed text reads poorly, as it does in MLX |
 | Decode I/O: per-slot prefetch waits, prefill staging lent to the hot tier (`STREAMMOE_HOT_LEND`), single-token `qmv` matvec kernel (`STREAMMOE_MATVEC_QMV`) | Implemented — on a3b at a 4 GiB cap decode 124 → 112 ms/tok on a short prompt; output unchanged |
-| Expert precision: 3-bit experts (`tools/requant_experts.py`, `root-3bit/`), quality harness (`tools/chat` `quality` bin: KL, top-1, perplexity, scored tasks), `--precision 4\|3` in the chat page | Implemented as a quality test — 3-bit vs 4-bit: KL 0.048, top-1 agreement 93%, 10/10 tasks; 2-bit fails 4 of 10. Same file size, so no speed gain until a packed 3-bit format |
+| Packed 3-bit experts (`tools/requant_experts.py` → `tools/pack_experts.py`, `root-3bit/`; layout detected from the files), quality harness (`tools/chat` `quality` bin: KL, top-1, perplexity, scored tasks), `--precision 4\|3` in the chat page | Implemented — 1.38 MB per expert vs 1.77 (−22%); vs 4-bit: KL 0.048, top-1 agreement 93%, 10/10 tasks; a3b at a 4 GiB cap −20 to −25% per decode token and −29 to −34% time to first word. 2-bit fails 4 of 10 tasks |
 | Router policy, per-expert precision | Planned — Phases 7–8 |
 
 Build with exactly one model feature (`model-qwen3-6-35b-a3b`,
@@ -407,10 +407,6 @@ traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
 
 ## Roadmap
 
-- **Packed 3-bit experts.** 3-bit experts already pass the quality
-  test (above) but are stored in the 4-bit layout. A packed 3-bit file
-  and matching kernels would cut disk reads per token by ~25% — the
-  main lever, since decode is disk-bound.
 - **Faster time to first word.** Expert staging is ~74% of prefill and
   runs one layer at a time while the CPU sits ~95% idle; staging layer
   L+1 while the GPU computes layer L could cut it by a third.
@@ -491,6 +487,20 @@ the defaults. The rest of a token (~105 ms) is the CPU waiting on the
 GPU's per-layer post-attention command buffer. On OLMoE-1B-7B the
 cross-layer guess did not help.
 
+Packed 3-bit experts (`--precision 3` in the chat page; see Setup) read
+22% fewer bytes per expert, and the same memory holds 997 instead of
+719 of them. Chat page at a 4 GiB cap, same prompts, greedy:
+
+| Prompt | 4-bit | Packed 3-bit | First word, 4-bit → 3-bit |
+| --- | --- | --- | --- |
+| Photosynthesis (120 tokens) | 118 ms/tok (8.5 tok/s) | **89 ms/tok (11.2 tok/s)** | 1.57 → 1.11 s |
+| JavaScript palindrome (74) | 146 ms/tok (6.8 tok/s) | **115 ms/tok (8.7 tok/s)** | 1.38 → 0.92 s |
+| Hiking packing list (120) | 121 ms/tok (8.2 tok/s) | **97 ms/tok (10.3 tok/s)** | 1.36 → 0.90 s |
+
+Quality against 4-bit: KL 0.048, the same top token 93% of the time,
+perplexity 1.15 → 1.21, all 10 scored tasks right (JSON, tool calls,
+arithmetic, code).
+
 ### Setup
 
 ```bash
@@ -504,6 +514,9 @@ python3 -I scripts/export_vocab.py $M/mlx-4bit/tokenizer.json $M/artifacts/vocab
 python3 -I tools/gen_expert_index.py --mlx-path $M/mlx-4bit --out $M/expert_index.json
 python3 -I repack_experts.py --index $M/expert_index.json --output-dir $M/root/packed_experts
 python3 -I tools/export_vision.py --model $M/mlx-4bit --out $M/artifacts   # optional: images
+# optional: packed 3-bit experts (13 GB more disk; ~25% faster, slightly lower quality)
+python3 -I tools/requant_experts.py $M/root --out 3=$M/root-3bit-nibble
+python3 -I tools/pack_experts.py $M/root-3bit-nibble $M/root-3bit && rm -r $M/root-3bit-nibble
 ```
 
 Conversion needs Python with NumPy, peaks under 0.3 GiB of RAM and
@@ -535,7 +548,7 @@ host qualifies. On a smaller host, run the model only under a cap.
 cd tools/chat
 cargo run --release -- --cap-gib 4 --n-ctx 8192
 # options: --kv f32|f16|turbo4, --attn-threads N, --guess cross|prev, --prefetch N,
-#          --precision 4|3 (3 needs $M/root-3bit from tools/requant_experts.py)
+#          --precision 4|3 (3 needs $M/root-3bit, see Setup)
 # open http://127.0.0.1:8077
 ```
 
@@ -544,8 +557,8 @@ cache, so each message prefills only the new text. The header shows
 memory against the cap and the context used; each answer shows tok/s,
 prefill speed, hot-tier hits and disk MiB per token. Thinking can be
 toggled. An **Experts** selector in the header switches between
-4-bit and 3-bit experts (the server restarts itself in ~2 s and frees
-the old model first, so memory stays under the cap). It defaults to the cross-layer guess with 6 experts prefetched
+4-bit and packed 3-bit experts (the server restarts itself in ~2 s
+and frees the old model first, so memory stays under the cap). It defaults to the cross-layer guess with 6 experts prefetched
 (≈ 7 tok/s on a 115-token answer at a 4 GiB cap). Stop the server
 (Ctrl-C) to give the memory back.
 

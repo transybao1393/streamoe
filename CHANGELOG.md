@@ -33,6 +33,13 @@
 
 ### Performance
 
+- Packed 3-bit experts: `tools/pack_experts.py` packs 3-bit codes 8 per
+  3 bytes (1.77 → 1.38 MB per expert on a3b); the engine detects the
+  layout from the expert files (`variants::ExpertLayout`,
+  `ExpertFiles::layout`) and runs 3-bit decode and prefill kernels with
+  output bit-identical to the same codes in 4-bit nibbles. a3b at a
+  4 GiB cap: −20 to −25% per decode token, −29 to −34% time to first
+  word vs 4-bit. `tools/chat --precision 3` uses it.
 - Decode waits per prefetch slot instead of for the whole layer's
   prefetch (−1.5 to −5% per token on a3b at a 4 GiB cap).
 - The prefill staging buffer is lent to the hot tier during decode
@@ -51,6 +58,10 @@
 
 ### Changed
 
+- `MoeGraphScratch::new` takes the expert size; `MoeBuffers::new_for`
+  sizes the decode slots for an `ExpertLayout` (`new` stays 4-bit);
+  `ExpertIoError` gains `MixedLayouts`; `streammoe-metal`'s
+  `MoeGatherIdCall` gains `bits`.
 - **Renamed moeflux → streammoe.** Crates `streammoe`, `streammoe-metal`,
   `streammoe-net` (directories `crates/streammoe*`), binaries
   `streammoe-node`, `streammoe-coord`, `streammoe-chat`, and env vars
