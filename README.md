@@ -14,9 +14,20 @@ Qwen3.6-35B-A3B, 19.4 GB at 4-bit — answering questions about images
 in **4 GiB of RAM** on a shared laptop, at ~5 tokens per second, making
 the same greedy choices as the MLX reference.
 
+<p align="center">
+  <img src="docs/media/chat-image.gif" width="800"
+       alt="tools/chat: an image is attached, the vision encoder runs, then Qwen3.6-35B-A3B describes it and counts three red dots at 6.1 tok/s inside a 4 GiB cap">
+  <br>
+  <sub><code>tools/chat</code> on an M3 Pro, 4 GiB cap · recorded in real time, not sped up ·
+  <b>6.1 tok/s</b> · 3.73 GiB peak · <a href="#chat-page">more samples</a></sub>
+</p>
+
 > **Lineage.** streamoe grew out of
 > [moeflux](https://github.com/mdegans/moeflux), which grew out of
-> [flash-moe](https://github.com/danveloper/flash-moe). It keeps their
+> [flash-moe](https://github.com/danveloper/flash-moe); the revamp
+> started on the author's moeflux fork,
+> [transybao1393/moeflux](https://github.com/transybao1393/moeflux).
+> It keeps their
 > engine and Metal kernels and rebuilds everything around them: a
 > strict memory contract, cache-free expert streaming with a
 > frequency-managed hot tier, layer-range pipelines across nodes,
@@ -503,6 +514,35 @@ toggled. It defaults to the cross-layer guess with 6 experts prefetched
 (≈ 7 tok/s on a 115-token answer at a 4 GiB cap). Stop the server
 (Ctrl-C) to give the memory back.
 
+#### What it looks like
+
+Recorded with headless Chrome against `tools/chat` on the M3 Pro
+(shared with other services), `--cap-gib 4 --n-ctx 4096`, default
+settings otherwise, temperature 0. Real time — the GIFs are not sped up.
+
+**Text** — 6.6 tok/s, 3.66 GiB of the 4 GiB cap:
+
+<p align="center"><img src="docs/media/chat-text.gif" width="800" alt="tools/chat answering a text question at 6.6 tok/s under a 4 GiB cap"></p>
+
+```text
+58 tok · 6.6 tok/s · prompt 39 tok at 14 tok/s · hot-tier hits 46% · 329 MiB/tok from disk · avg CPU 56%
+```
+
+**Image** — 280 image tokens encoded and read in ~6 s, then 6.1 tok/s,
+3.73 GiB peak. Each stage shows in the page as it happens:
+
+| 1 · Vision encoder running | 2 · Answer streaming | 3 · Done, with the turn's stats |
+| :---: | :---: | :---: |
+| ![The page shows "looking at the image…" while the CPU vision encoder runs](docs/media/chat-image-encoding.png) | ![The answer streams in; the CPU / RAM bar updates live](docs/media/chat-image-generating.png) | ![The finished answer: three red dots, with tok/s, hot-tier hits and disk reads per token](docs/media/chat-image-done.png) |
+
+```text
+162 tok · 6.1 tok/s · prompt 309 tok (280 image) at 52 tok/s · hot-tier hits 35% · 394 MiB/tok from disk · avg CPU 69%
+```
+
+The image is a drawing made for this demo (house, tree, sun, one bird
+and three red dots). The model names the house, tree and sun, counts
+the three dots correctly, and reads the single bird as two.
+
 A bar under the header shows the process's CPU (as cores used), its
 memory against the cap with the peak, and the host's reclaimable
 memory, sampled every second; it keeps updating while an answer is
@@ -549,7 +589,10 @@ quantized `kv_format`.
 
 streamoe is built on [mdegans/moeflux](https://github.com/mdegans/moeflux)
 (history up to moeflux `0.1.0-pre.4`, commit `a36ae3b`, is upstream's
-work). moeflux itself began as a fork of
+work). The revamp began on the author's fork,
+[transybao1393/moeflux](https://github.com/transybao1393/moeflux), where
+it was published under MIT up to commit `7d73350`; development
+continues here. moeflux itself began as a fork of
 [danveloper/flash-moe](https://github.com/danveloper/flash-moe) and
 was rewritten in Rust to the point of being a distinct codebase. The host-side engine is
 Rust on `metal-rs`; the original C/Objective-C functions served as
@@ -569,7 +612,8 @@ boundary.
 
 - **MIT** ([`LICENSE-MIT`](LICENSE-MIT)) — everything in the repository
   as of commit `7d73350`: the flash-moe and moeflux code it was built
-  on, and the streamoe work published under MIT up to that commit. Also
+  on, and the streamoe work published under MIT up to that commit on
+  [transybao1393/moeflux](https://github.com/transybao1393/moeflux). Also
   `crates/moeflux-metal/` (vendored MLX and llama.cpp kernels; see its
   own `NOTICE`) and `paper/`. Check out `7d73350` for the MIT-only code.
 - **PolyForm Noncommercial 1.0.0** ([`LICENSE`](LICENSE)) — every change
