@@ -501,6 +501,43 @@ Quality against 4-bit: KL 0.048, the same top token 93% of the time,
 perplexity 1.15 → 1.21, all 10 scored tasks right (JSON, tool calls,
 arithmetic, code).
 
+#### A bigger cap
+
+More memory keeps more experts in the hot tier, so fewer reads go to
+disk. Same three prompts (120 / 74 / 120 tokens), measured one run at
+a time on 2026-10-26; the host was slower that day than in the table
+above, so compare within this table:
+
+| Experts | Cap | Photosynthesis | JavaScript palindrome | Hiking packing list | Hot-tier hits | Disk wait / tok |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4-bit | 5 GiB | 116.5 ms (8.56 tok/s) | 165.0 ms (6.05 tok/s) | 125.4 ms (7.96 tok/s) | 70 / 45 / 64% | 28–69 ms |
+| 4-bit | 7 GiB | 108.9 ms (9.16 tok/s) | 131.1 ms (7.61 tok/s) | 114.1 ms (8.75 tok/s) | 84 / 63 / 78% | 18–39 ms |
+| Packed 3-bit | 5 GiB | 108.0 ms (9.24 tok/s) | 122.4 ms (8.16 tok/s) | 113.6 ms (8.79 tok/s) | 76 / 51 / 66% | 19–34 ms |
+| Packed 3-bit | 7 GiB | 105.8 ms (9.43 tok/s) | 111.3 ms (8.96 tok/s) | 104.2 ms (9.58 tok/s) | 89 / 72 / 81% | 13–24 ms |
+
+Two more GiB give 4-bit +7–26% tok/s and packed 3-bit +2–10%; the code
+prompt, which spreads over the most experts, gains most. Peak memory
+stayed under the cap (4.7 / 6.7 GiB). Packed 3-bit at 5 GiB is about as
+fast as 4-bit at 7 GiB.
+
+Larger caps, **estimated, not measured** (this 18 GB host can't spare
+them). Each token spends ~87–92 ms outside the disk wait (forward time
+minus disk wait at 7 GiB), and the disk wait goes to ~0 once every
+expert fits: packed 3-bit's 13.1 GiB of experts fit at a ~16 GiB cap,
+4-bit's 16.9 GiB at ~20 GiB (~2.7 GiB goes to everything else).
+
+| Experts | Cap | Experts held | Disk wait / tok | Forward / tok | tok/s |
+| --- | --- | --- | --- | --- | --- |
+| Packed 3-bit | 15 GiB | ~94% | ~1–3 ms | ~88–95 ms | ~10.5–11.5 |
+| Packed 3-bit | 20 GiB | all | ~0 | ~87–92 ms | ~11–11.5 |
+| 4-bit | 15 GiB | ~73% | ~3–6 ms | ~93–98 ms | ~10–10.5 |
+| 4-bit | 20 GiB | all | ~0 | ~89–92 ms | ~11 |
+
+Past ~16 GiB packed 3-bit gains nothing more: the ceiling of ~11 tok/s
+is GPU time per token, not the cap. A cap above the memory other
+programs leave free makes the machine swap and is slower than a small
+cap.
+
 ### Setup
 
 ```bash
