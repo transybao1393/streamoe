@@ -39,6 +39,10 @@ moeflux. The code still uses the `moeflux` names until the rename.
      sends that message — offer a draft, don't send anything.
 - Details of the vision work and how it was verified:
   `.claude/memory/vision_landed.md`.
+- **Known issues** — open bugs, fixed bugs, precautions for the shared
+  host, configuration rules and measured dead ends — live in
+  `docs/known-issues.md`. Read it before changing the engine; add an
+  entry when a bug is fixed or a trap is found.
 
 ## What moeflux is (the engine streamoe is built on)
 

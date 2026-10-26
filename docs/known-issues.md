@@ -40,7 +40,7 @@ Older engine history (graph mode, prefill, kernels) is in
 - **`kv_format` scratch** (`ff6619d`): a quantized KV cache needs an f32
   prefill scratch; it has its own account (`kv_scratch`) and is touched
   at open.
-- **Checkpoints outside the plan** (uncommitted). `checkpoint_pos`
+- **Checkpoints outside the plan** (`cb717b5`). `checkpoint_pos`
   allocated a `state_size()` buffer per checkpoint after open (~1 GiB
   each on OLMoE at n_ctx 4096 F32) and `restore_to` cloned one more.
   Now `Account::Checkpoints` = `max_checkpoints` × the largest state at
@@ -49,10 +49,10 @@ Older engine history (graph mode, prefill, kernels) is in
   place without a copy. Open footprint 99.8% of the lifetime peak
   through save / evict / restore / clear
   (`olmoe_checkpoints_stay_inside_the_cap`).
-- **Whole-model weights counted at raw length** (uncommitted): now
+- **Whole-model weights counted at raw length** (`cb717b5`): now
   rounded to whole 16 KiB pages like the allocation.
 - **Parked request slots' host `LinearAttnState` untouched at open**
-  (uncommitted): every slot's linear state is committed at a capped
+  (`cb717b5`): every slot's linear state is committed at a capped
   open.
 
 ### Correctness
@@ -63,7 +63,7 @@ Older engine history (graph mode, prefill, kernels) is in
 - **Metal kernel signature** (`ff6619d`, caught by the CPU-vs-Metal
   test): mixing `uint2` and `uint` thread-position inputs fails to
   compile at runtime. Use the same vector type for both.
-- **Flaky `footprint_is_readable_and_nonzero`** (uncommitted): asserted
+- **Flaky `footprint_is_readable_and_nonzero`** (`cb717b5`): asserted
   `peak >= current`, but the kernel updates the lifetime max lazily,
   so with other test threads allocating it failed intermittently.
 
