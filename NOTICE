@@ -25,8 +25,8 @@ repository is licensed in two parts. Git history marks the boundary.
 
   To get the MIT-only code, check out commit 7d73350.
 
-2. PolyForm Noncommercial License 1.0.0 — see LICENSE
------------------------------------------------------
+2. PolyForm Noncommercial License 1.0.0 — see LICENSE.md
+--------------------------------------------------------
 
   Every change made after commit 7d73350, outside the paths listed in
   1b and 1c, by transybao1393. That includes the multimodal RoPE

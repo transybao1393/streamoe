@@ -616,7 +616,7 @@ boundary.
   [transybao1393/moeflux](https://github.com/transybao1393/moeflux). Also
   `crates/moeflux-metal/` (vendored MLX and llama.cpp kernels; see its
   own `NOTICE`) and `paper/`. Check out `7d73350` for the MIT-only code.
-- **PolyForm Noncommercial 1.0.0** ([`LICENSE`](LICENSE)) — every change
+- **PolyForm Noncommercial 1.0.0** ([`LICENSE.md`](LICENSE.md)) — every change
   after `7d73350`, starting with vision input, and all future work.
 
 **Free:** personal study, research, experiments, hobby projects, and
