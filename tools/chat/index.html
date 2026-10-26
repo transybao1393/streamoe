@@ -31,6 +31,11 @@ header {
 header h1 { font-size: 15px; margin: 0; font-weight: 600; }
 #status { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
 header .sp { flex: 1; }
+header label.prec { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+header select {
+  font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+}
 button {
   font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer;
@@ -90,6 +95,9 @@ textarea {
   <h1>streammoe chat</h1>
   <span id="status">loading…</span>
   <span class="sp"></span>
+  <label class="prec" title="3-bit: experts rounded to 8 levels. Quality test vs 4-bit: 93% same top token, all 10 tasks right. Same speed until a packed 3-bit format lands. Switching reloads the model and clears the chat.">Experts
+    <select id="precision"><option value="4">4-bit</option><option value="3">3-bit</option></select>
+  </label>
   <button id="newchat">New chat</button>
 </header>
 <div id="sys">
@@ -162,14 +170,17 @@ function showMemory(m) {
 async function refresh() {
   try {
     const r = await fetch("/info").then(r => r.json());
-    window.modelName = `${r.info.model} · ${r.info.kv_format} KV`;
+    window.modelName = `${r.info.model} · ${r.info.precision}-bit experts · ${r.info.kv_format} KV`;
+    const sel = $("precision");
+    for (const o of sel.options) o.disabled = !(r.info.precisions || [4]).includes(+o.value);
+    sel.value = String(r.info.precision || 4);
     vision = r.info.vision;
     $("attach").style.display = vision ? "" : "none";
     showMemory(r.memory);
   } catch (e) { $("status").textContent = "server not reachable"; }
 }
 function setBusy(b) {
-  busy = b; $("send").disabled = b; $("newchat").disabled = b;
+  busy = b; $("send").disabled = b; $("newchat").disabled = b; $("precision").disabled = b;
 }
 function render(el, text, think) {
   const body = el.querySelector(".body");
@@ -298,6 +309,21 @@ $("newchat").onclick = async () => {
   if (busy) return;
   await fetch("/reset", { method: "POST" });
   log.innerHTML = ""; started = false; refresh(); $("input").focus();
+};
+$("precision").onchange = async (e) => {
+  const bits = +e.target.value;
+  if (busy || !confirm(`Reload the model with ${bits}-bit experts? This clears the chat.`)) { refresh(); return; }
+  setBusy(true);
+  $("status").textContent = `reloading with ${bits}-bit experts…`;
+  try { await fetch("/precision", { method: "POST", body: JSON.stringify({ bits }) }); } catch (_) {}
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const r = await fetch("/info").then(r => r.json());
+      if (r.info.precision === bits) break;
+    } catch (_) {}
+  }
+  log.innerHTML = ""; started = false; setBusy(false); refresh(); $("input").focus();
 };
 $("toggle-settings").onclick = (e) => {
   e.preventDefault();

@@ -13,6 +13,13 @@
 //! their M-RoPE positions. The encoder's buffers are counted in the cap
 //! (`host_buffers`). `/stats` (CPU and memory, sampled every second) is
 //! answered even while a turn runs.
+//!
+//! `--precision 3` reads experts from `root-3bit/` instead of `root/`
+//! (`tools/requant_experts.py`: 3-bit rounding kept in the 4-bit
+//! layout — same size and speed, slightly lower quality, until a packed
+//! 3-bit format exists). The page can switch: `POST /precision`
+//! re-executes this process with the other value, so the old model's
+//! memory is released before the new one opens and the cap holds.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -465,6 +472,14 @@ fn main() {
     cfg.prefetch_experts = Some(arg(&args, "--prefetch").map_or(6, |v| v.parse().unwrap()));
 
     let art = base.join("artifacts");
+    let precisions: Vec<u32> =
+        [(4, "root"), (3, "root-3bit")].into_iter().filter(|(_, d)| base.join(d).is_dir()).map(|(b, _)| b).collect();
+    let precision: u32 = arg(&args, "--precision").map_or(4, |v| v.parse().unwrap());
+    let root = base.join(if precision == 3 { "root-3bit" } else { "root" });
+    if !precisions.contains(&precision) {
+        eprintln!("[chat] --precision {precision}: {} not found", root.display());
+        std::process::exit(2);
+    }
     // Vision: open the encoder first so its buffers go into the plan.
     let vision_px: usize = arg(&args, "--vision-max-pixels").map_or(640 * 640, |v| v.parse().unwrap());
     let vision_threads: usize = arg(&args, "--vision-threads").map_or(4, |v| v.parse().unwrap());
@@ -490,7 +505,7 @@ fn main() {
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
-        &base.join("root"),
+        &root,
         false,
         &cfg,
     )
@@ -507,6 +522,8 @@ fn main() {
         "attn_threads": cfg.attn_threads,
         "prefetch_guess": format!("{:?}", cfg.prefetch_guess),
         "prefetch_experts": cfg.prefetch_experts,
+        "precision": precision,
+        "precisions": precisions,
         "open_secs": t.elapsed().as_secs_f64(),
         "vision": vision.as_ref().map(|v| json!({
             "max_pixels": v.max_pixels(),
@@ -582,6 +599,17 @@ fn main() {
                 let v = json!({"memory": chat.memory()});
                 json_ok(&mut stream, v)
             }
+            ("POST", "/precision") => {
+                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let bits = req["bits"].as_u64().unwrap_or(0) as u32;
+                if !precisions.contains(&bits) {
+                    respond(&mut stream, "400 Bad Request", "text/plain", "precision not available");
+                    continue;
+                }
+                json_ok(&mut stream, json!({"restarting": true, "precision": bits}));
+                drop(stream);
+                restart_with_precision(&args, bits);
+            }
             ("POST", "/chat") => {
                 let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -595,6 +623,28 @@ fn main() {
             _ => respond(&mut stream, "404 Not Found", "text/plain", "not found"),
         }
     }
+}
+
+/// Replace this process with the same command line at `--precision
+/// bits`. `exec` keeps the PID (a memory guard watching it carries on)
+/// and drops every mapping of the old model at once; the listening
+/// socket is close-on-exec, so the new process can bind the port.
+fn restart_with_precision(args: &[String], bits: u32) -> ! {
+    use std::os::unix::process::CommandExt;
+    let mut next: Vec<String> = Vec::new();
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--precision" {
+            it.next();
+        } else {
+            next.push(a.clone());
+        }
+    }
+    next.extend(["--precision".to_string(), bits.to_string()]);
+    eprintln!("[chat] switching to {bits}-bit experts: restarting");
+    let err = std::process::Command::new(std::env::current_exe().expect("current_exe")).args(&next).exec();
+    eprintln!("[chat] restart failed: {err}");
+    std::process::exit(1)
 }
 
 /// Reads one HTTP/1.1 request: method, path, body (by Content-Length).
