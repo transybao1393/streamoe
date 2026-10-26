@@ -10,9 +10,9 @@ bf16 scales | bf16 biases], affine groups of 64 along the input dim
 fits 2^bits evenly spaced levels between the group's min and max
 (MLX's affine scheme), and writes the codes back as 4-bit nibbles with
 the new scale and bias. The engine runs the result unchanged, so the
-output has exactly the rounding of a <bits>-bit model — a quality test
-before writing any packed 3-/2-bit kernels. Same file size: no speed
-change. Starting from the 4-bit values, not the original weights,
+output has exactly the rounding of a <bits>-bit model. Same file size,
+so no speed change; for 3-bit, `tools/pack_experts.py` then packs the
+codes 8 per 3 bytes, which the engine reads directly. Starting from the 4-bit values, not the original weights,
 slightly overstates the error of a real <bits>-bit conversion.
 
 Shape constants are Qwen3.6-35B-A3B's (hidden 2048, moe_intermediate 512).
