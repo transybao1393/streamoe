@@ -467,6 +467,9 @@ pub struct MoeGraphScratch {
     /// `BufId<ExpertBaseBuf>` to match the `Op::MoeGatherIdFuse` /
     /// `Op::MoeBatchedPermuteFuse` field type.
     pub expert_base: Option<BufId<ExpertBaseBuf>>,
+    /// Bytes per expert in `expert_base` / the layer mmap: the
+    /// `expert_stride` of the MoE ops (4-bit or packed 3-bit).
+    pub expert_stride: u64,
     /// Per-assignment-row expert slot table (`u32`), `chunk *
     /// k_active` wide — the gather kernel's `indices`. Filled per
     /// layer from `buckets`.
@@ -507,6 +510,7 @@ impl MoeGraphScratch {
         k_active: usize,
         mode: crate::riir::io::expert_io_mode::ExpertIoMode,
         chunk: usize,
+        expert_size: usize,
     ) -> Self {
         let v = VARIANT;
         let f32_sz = std::mem::size_of::<f32>();
@@ -583,7 +587,7 @@ impl MoeGraphScratch {
             )
             .expect("MoeGraphScratch::new pool alloc");
         // One staging buffer holding every expert's block at
-        // `expert_size_4bit()` stride. Allocated only in `Pread` mode
+        // `expert_size` stride. Allocated only in `Pread` mode
         // (the prefill gather GEMM reads from here instead of the
         // layer mmap); `Mmap` mode addresses the per-layer mmap
         // buffer directly. Persistent so the layer loop can rewrite
@@ -592,7 +596,7 @@ impl MoeGraphScratch {
         let expert_base: Option<BufId<ExpertBaseBuf>> = if mode.is_pread() {
             Some(
                 pool.alloc(
-                    v.num_experts * v.expert_size_4bit(),
+                    v.num_experts * expert_size,
                     "mgs.expert_base",
                     true,
                 )
@@ -637,6 +641,7 @@ impl MoeGraphScratch {
             out_sum,
             expert_indices,
             expert_base,
+            expert_stride: expert_size as u64,
             htpe,
             hids,
             commit_planned: std::cell::Cell::new(false),
@@ -2249,7 +2254,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             chain,
         )?;
     } else {
-        let expert_size = v.expert_size_4bit();
+        let expert_size = expert_files.expert_size();
         let mut expert_data = vec![0u8; k * expert_size];
         for slot in 0..k {
             let expert_idx = indices[slot] as usize;
@@ -3168,7 +3173,9 @@ where
             buf: moe.out_sum,
             n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
         });
-        if moe_gather_id_enabled() {
+        // Packed 3-bit experts have only the gather_mm_id kernel.
+        let q4 = moe.expert_stride == crate::riir::variants::ExpertLayout::Q4.expert_size() as u64;
+        if moe_gather_id_enabled() || !q4 {
             // New path: one-dispatch MoE matmul (`gather_mm_id.metal`).
             // Reuses the `bucket_gate` / `bucket_up` / `bucket_out`
             // BufIds as `gate_mid` / `up_mid` / `down_mid` scratch
@@ -3179,7 +3186,7 @@ where
             g.push(Op::MoeGatherIdFuse {
                 label: "moe.gather_id_fuse",
                 expert_base: expert_base_id,
-                expert_stride: v.expert_size_4bit() as u64,
+                expert_stride: moe.expert_stride,
                 indices: moe.routing_indices,
                 weights: moe.routing_weights,
                 // h_post_id is BufId<MoeInputBuf>: the post-norm MoE
@@ -3202,7 +3209,7 @@ where
             g.push(Op::MoeBatchedPermuteFuse {
                 label: "moe.permute_fuse",
                 expert_base: expert_base_id,
-                expert_stride: v.expert_size_4bit() as u64,
+                expert_stride: moe.expert_stride,
                 expert_indices: moe.expert_indices,
                 expert_slots,
                 bucket_input: moe.bucket_input,

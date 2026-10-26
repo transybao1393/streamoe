@@ -579,7 +579,9 @@ impl RsCtx<MetalBackend> {
         let n_ctx = config.n_ctx;
         let prefill_chunk = config.resolved_prefill_chunk();
         let layer_range = config.resolved_layer_range();
-        let expert_size = VARIANT.expert_size_4bit() as u64;
+        // 4-bit or packed 3-bit, from the expert files' size.
+        let expert_layout = io::expert_io::detect_layout(experts_dir, layer_range.clone());
+        let expert_size = expert_layout.expert_size() as u64;
         // Experts this context holds: the layer range's only.
         let range_expert_bytes = layer_range.len() as u64 * VARIANT.num_experts as u64 * expert_size;
         // Under a hard cap, experts are always pread-staged: mmap-direct
@@ -620,6 +622,7 @@ impl RsCtx<MetalBackend> {
                 config.max_requests,
                 prefill_chunk,
             );
+            plan.set_expert_size(expert_size);
             if config.host_buffers > 0 {
                 plan.set(budget::Account::HostBuffers, config.host_buffers);
             }
@@ -793,7 +796,7 @@ impl RsCtx<MetalBackend> {
     fn attach_hot_tier(&mut self, bytes: u64, profile: Option<&Path>) -> Result<(), RsError> {
         use io::hot_tier::{HotTier, load_profile};
         let v = VARIANT;
-        let expert_size = v.expert_size_4bit();
+        let expert_size = self.experts.expert_size();
         let capacity = HotTier::slots_for_bytes(bytes, expert_size);
         let device = self.metal_mut()?.device().to_owned();
         let hot = HotTier::new(&device, capacity, expert_size, v.num_layers, v.num_experts)
@@ -1049,8 +1052,9 @@ impl RsCtx<MetalBackend> {
     fn metal_and_moe_mut(&mut self) -> Result<(&mut MetalContext, &mut MoeBuffers), RsError> {
         self.ensure_backend()?;
         if self.moe_buffers.is_none() {
+            let layout = self.experts.layout();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.moe_buffers = Some(MoeBuffers::new(pool));
+            self.moe_buffers = Some(MoeBuffers::new_for(pool, layout));
         }
         let Self {
             backend,
@@ -1468,8 +1472,9 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(), RsError> {
         self.ensure_backend()?;
         if self.moe_buffers.is_none() {
+            let layout = self.experts.layout();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.moe_buffers = Some(MoeBuffers::new(pool));
+            self.moe_buffers = Some(MoeBuffers::new_for(pool, layout));
         }
         let Self {
             backend,
@@ -1835,8 +1840,9 @@ impl RsCtx<MetalBackend> {
             );
         }
         if self.moe_buffers.is_none() {
+            let layout = self.experts.layout();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.moe_buffers = Some(MoeBuffers::new(pool));
+            self.moe_buffers = Some(MoeBuffers::new_for(pool, layout));
         }
         if self.shared_expert_bufs.is_none() && VARIANT.shared_intermediate > 0 {
             self.shared_expert_bufs = Some(moe::cogito_moe_gpu::SharedExpertBuffers::new(&device));
@@ -2002,9 +2008,10 @@ impl RsCtx<MetalBackend> {
         if self.moe_graph_scratch.is_none() {
             let k_active = self.k_active;
             let mode = self.expert_io_mode;
+            let expert_size = self.experts.expert_size();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_graph_scratch = Some(attn::linear_attn_forward::MoeGraphScratch::new(
-                pool, k_active, mode, chunk,
+                pool, k_active, mode, chunk, expert_size,
             ));
         }
         if self.hidden_double_buffer.is_none() {
@@ -2018,8 +2025,9 @@ impl RsCtx<MetalBackend> {
                 Some(attn::linear_attn_forward::HeadTailScratch::new(pool, chunk));
         }
         if self.moe_buffers.is_none() {
+            let layout = self.experts.layout();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.moe_buffers = Some(MoeBuffers::new(pool));
+            self.moe_buffers = Some(MoeBuffers::new_for(pool, layout));
         }
         if self.lm_head_gpu.is_none() && self.has_head() {
             let Self {

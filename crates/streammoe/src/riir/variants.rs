@@ -398,6 +398,93 @@ impl Variant {
     }
 }
 
+/// Packed-expert layout at a given weight width: `[gate | up | down]`,
+/// each block `[weights | scales | biases]` with BF16 scales and biases
+/// per [`GROUP_SIZE`] weights (`w = q * scale + bias`). Only the weight
+/// plane depends on `bits`:
+///
+/// - 4-bit: 8 weights per `u32`, low nibble first (the MLX layout).
+/// - 3-bit: 8 weights per 3 bytes, a little-endian 24-bit pack with
+///   weight `i` at bits `3i..3i+3` (MLX's 3-bit layout).
+///
+/// The experts directory decides it ([`ExpertLayout::from_expert_size`]
+/// on the layer files' size); the variant's shapes are compile-time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertLayout {
+    /// Bits per weight: 4 or 3.
+    pub bits: u32,
+}
+
+impl ExpertLayout {
+    /// The converter's default layout (MLX 4-bit).
+    pub const Q4: Self = Self { bits: 4 };
+    /// Packed 3-bit (`tools/pack_experts.py`).
+    pub const Q3: Self = Self { bits: 3 };
+
+    /// Packed weight bytes of one `[rows, in_dim]` matrix row.
+    pub const fn row_bytes(&self, in_dim: usize) -> usize {
+        in_dim * self.bits as usize / 8
+    }
+    /// Packed weight bytes of one gate/up/down matrix.
+    pub const fn weight_bytes(&self) -> usize {
+        VARIANT.moe_intermediate * self.row_bytes(VARIANT.hidden_dim)
+    }
+    /// One `[weights | scales | biases]` block.
+    pub const fn block_bytes(&self) -> usize {
+        self.weight_bytes() + 2 * VARIANT.expert_scale_bytes()
+    }
+    /// Bytes per expert: gate + up + down.
+    pub const fn expert_size(&self) -> usize {
+        3 * self.block_bytes()
+    }
+
+    /// The layout whose expert is `size` bytes, if a supported one.
+    pub const fn from_expert_size(size: u64) -> Option<Self> {
+        if size == Self::Q4.expert_size() as u64 {
+            Some(Self::Q4)
+        } else if size == Self::Q3.expert_size() as u64 {
+            Some(Self::Q3)
+        } else {
+            None
+        }
+    }
+
+    /// `(weights, scales, biases)` byte offsets of block `block`
+    /// (0 = gate, 1 = up, 2 = down) within an expert.
+    pub const fn offsets(&self, block: usize) -> (usize, usize, usize) {
+        let w = block * self.block_bytes();
+        let s = w + self.weight_bytes();
+        (w, s, s + VARIANT.expert_scale_bytes())
+    }
+    pub const fn gate_w_off(&self) -> usize {
+        self.offsets(0).0
+    }
+    pub const fn gate_s_off(&self) -> usize {
+        self.offsets(0).1
+    }
+    pub const fn gate_b_off(&self) -> usize {
+        self.offsets(0).2
+    }
+    pub const fn up_w_off(&self) -> usize {
+        self.offsets(1).0
+    }
+    pub const fn up_s_off(&self) -> usize {
+        self.offsets(1).1
+    }
+    pub const fn up_b_off(&self) -> usize {
+        self.offsets(1).2
+    }
+    pub const fn down_w_off(&self) -> usize {
+        self.offsets(2).0
+    }
+    pub const fn down_s_off(&self) -> usize {
+        self.offsets(2).1
+    }
+    pub const fn down_b_off(&self) -> usize {
+        self.offsets(2).2
+    }
+}
+
 // --- Architecture-wide constants ---------------------------------
 
 /// RMS-norm epsilon, for every norm (input / post-attention / final,
@@ -840,6 +927,19 @@ mod tests {
         // 2-bit experts are half the size of 4-bit (only the weight
         // tensor shrinks; scales/biases are unchanged BF16).
         assert!(v.expert_size_2bit() < v.expert_size_4bit());
+        // The 4-bit ExpertLayout is the legacy *_4bit layout.
+        let q4 = ExpertLayout::Q4;
+        assert_eq!(q4.expert_size(), v.expert_size_4bit());
+        assert_eq!(
+            (q4.up_w_off(), q4.down_s_off(), q4.down_b_off()),
+            (v.up_w_off_4bit(), v.down_s_off_4bit(), v.down_b_off_4bit())
+        );
+        // 3-bit: weights shrink by a quarter, scales/biases stay.
+        let q3 = ExpertLayout::Q3;
+        assert_eq!(q3.weight_bytes() * 4, q4.weight_bytes() * 3);
+        assert_eq!(ExpertLayout::from_expert_size(q3.expert_size() as u64), Some(q3));
+        assert_eq!(ExpertLayout::from_expert_size(q4.expert_size() as u64), Some(q4));
+        assert_eq!(ExpertLayout::from_expert_size(1), None);
         // GQA: heads must group cleanly.
         if matches!(v.attn_kind, AttnKind::Gqa) {
             assert_eq!(v.num_attn_heads % v.num_kv_heads, 0);

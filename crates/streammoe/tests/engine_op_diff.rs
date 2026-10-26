@@ -232,8 +232,20 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
     // entirely: persistent buffers stay allocated, transients are
     // simply not lifetime-colored. Memory waste is acceptable for an
     // `#[ignore]`-gated test.
-    let scratch_a = MoeGraphScratch::new(backend.pool_mut(), K_ACTIVE, io_mode, streammoe::riir::BATCHED_CHUNK_SIZE);
-    let scratch_b = MoeGraphScratch::new(backend.pool_mut(), K_ACTIVE, io_mode, streammoe::riir::BATCHED_CHUNK_SIZE);
+    let scratch_a = MoeGraphScratch::new(
+        backend.pool_mut(),
+        K_ACTIVE,
+        io_mode,
+        streammoe::riir::BATCHED_CHUNK_SIZE,
+        VARIANT.expert_size_4bit(),
+    );
+    let scratch_b = MoeGraphScratch::new(
+        backend.pool_mut(),
+        K_ACTIVE,
+        io_mode,
+        streammoe::riir::BATCHED_CHUNK_SIZE,
+        VARIANT.expert_size_4bit(),
+    );
     let hidden_out_a: BufId<HiddenBuf> = backend
         .pool_mut()
         .alloc(

@@ -57,12 +57,20 @@ use crate::riir::backend::gpu::metal::{
 };
 use crate::riir::backend::{BufId, BufferPool, MetalBufferPool};
 use crate::riir::moe::moe_router::ExpertBuckets;
-use crate::riir::variants::{GROUP_SIZE, SharedExpertGate, VARIANT, Variant};
+use crate::riir::variants::{ExpertLayout, GROUP_SIZE, SharedExpertGate, VARIANT, Variant};
 
 /// Pipeline name for the MoE combine kernel — varies by variant.
 /// Cogito-V2 / DeepSeek-V3 use the unscaled raw-add path; Qwen3 MoE
 /// keeps the sigmoid-gated path. Mirrors `deepseek_moe_cpu`'s
 /// unconditional `out[i] += shared[i]` (moe_cpu.rs:168-173).
+/// The K-expert decode matvec for `layout`'s weight width.
+fn experts_kernel_name(layout: ExpertLayout) -> &'static str {
+    match layout.bits {
+        3 => "dequant_matvec_3bit_v3_experts",
+        _ => "dequant_matvec_4bit_v3_experts",
+    }
+}
+
 fn combine_kernel_name() -> &'static str {
     match VARIANT.shared_expert_gate {
         SharedExpertGate::SigmoidGate => "moe_combine_residual",
@@ -397,6 +405,9 @@ pub struct MoeBuffers {
     /// here; CPU `noaux_tc` routing reads it back via
     /// [`Self::gate_logits_to_vec`]. ~1 KB at num_experts=256.
     gate_logits: BufId<DeprecatedCogitoBuf>,
+    /// Packed layout of the experts the slots hold (sizes the slots
+    /// and picks the 4- or 3-bit expert kernels).
+    layout: ExpertLayout,
 }
 
 impl MoeBuffers {
@@ -414,15 +425,20 @@ impl MoeBuffers {
     /// 2 MiB alignment per the C path's 3.6× DMA win
     /// (`metal_infer/infer.m:1196`).
     pub fn new(pool: &mut MetalBufferPool) -> Self {
+        Self::new_for(pool, ExpertLayout::Q4)
+    }
+
+    /// [`Self::new`] for experts in `layout` (slot size and kernels).
+    pub fn new_for(pool: &mut MetalBufferPool, layout: ExpertLayout) -> Self {
         let v: Variant = VARIANT;
         const TWO_MIB: usize = 2 * 1024 * 1024;
         let f32_size = std::mem::size_of::<f32>();
         let data_synced: [BufId<DeprecatedCogitoBuf>; MAX_K] = std::array::from_fn(|_| {
-            pool.alloc_aligned(v.expert_size_4bit(), TWO_MIB, "moe.data_synced", true)
+            pool.alloc_aligned(layout.expert_size(), TWO_MIB, "moe.data_synced", true)
         });
         let data_prefetch: [[BufId<DeprecatedCogitoBuf>; MAX_K]; 2] = std::array::from_fn(|_| {
             std::array::from_fn(|_| {
-                pool.alloc_aligned(v.expert_size_4bit(), TWO_MIB, "moe.data_prefetch", true)
+                pool.alloc_aligned(layout.expert_size(), TWO_MIB, "moe.data_prefetch", true)
             })
         });
         // Defense-in-depth: assert 2 MiB alignment held. The pool's
@@ -507,6 +523,7 @@ impl MoeBuffers {
             moe_hidden,
             combine_params,
             gate_logits,
+            layout,
         }
     }
 
@@ -638,6 +655,10 @@ impl MoeBuffers {
     /// Owned-form accessor for the post-combine hidden buffer. Phase 5
     /// GPU residual stream uses this to read the MoE output directly
     /// into a downstream `residual_add` dispatch without a host bounce.
+    pub fn layout(&self) -> ExpertLayout {
+        self.layout
+    }
+
     pub fn moe_hidden_ref<'p>(&self, pool: &'p MetalBufferPool) -> &'p metal::Buffer {
         pool.handle(self.moe_hidden)
     }
@@ -770,7 +791,7 @@ pub(crate) fn gpu_batched_experts_encode(
         shared_gate_score,
     } = payload;
     let v = VARIANT;
-    validate_inputs(actual_k, expert_data, expert_weights)?;
+    validate_inputs(actual_k, expert_data, expert_weights, bufs.layout().expert_size())?;
     let k = actual_k as usize;
     if h_post.len() != v.hidden_dim {
         return Err(ExpertForwardError::BadHPostLen {
@@ -798,13 +819,10 @@ pub(crate) fn gpu_batched_experts_encode(
     // gate/up matvecs while down (in_dim=2048) stays on v3.
     let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let v3_experts = metal
-        .pipeline("dequant_matvec_4bit_v3_experts")
-        .ok()
-        .cloned();
+    let v3_experts = metal.pipeline(experts_kernel_name(bufs.layout())).ok().cloned();
     let combine_flat = metal.pipeline(combine_flat_kernel_name())?.clone();
 
-    let expert_size = v.expert_size_4bit();
+    let expert_size = bufs.layout().expert_size();
     for slot in 0..k {
         let src = &expert_data[slot * expert_size..(slot + 1) * expert_size];
         let dst = buffer_pool.as_mut_slice_u8(bufs.data_synced_id(slot));
@@ -890,10 +908,7 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
 
     let matvec = MatvecPipelines::fetch(metal)?;
     let swiglu = metal.pipeline("swiglu_fused")?.clone();
-    let v3_experts = metal
-        .pipeline("dequant_matvec_4bit_v3_experts")
-        .ok()
-        .cloned();
+    let v3_experts = metal.pipeline(experts_kernel_name(bufs.layout())).ok().cloned();
     let combine_flat = metal.pipeline(combine_flat_kernel_name())?.clone();
 
     {
@@ -929,8 +944,8 @@ fn validate_inputs(
     actual_k: i32,
     expert_data: &[u8],
     expert_weights: &[f32],
+    expert_size: usize,
 ) -> Result<(), ExpertForwardError> {
-    let v = VARIANT;
     if actual_k < 1 || (actual_k as usize) > MAX_K {
         return Err(ExpertForwardError::BadK {
             actual: actual_k,
@@ -938,7 +953,7 @@ fn validate_inputs(
         });
     }
     let k = actual_k as usize;
-    let expected_data_len = k * v.expert_size_4bit();
+    let expected_data_len = k * expert_size;
     if expert_data.len() != expected_data_len {
         return Err(ExpertForwardError::BadExpertDataLen {
             expected: expected_data_len,
@@ -997,6 +1012,7 @@ fn emit_batched_experts(
     }
 
     let use_batched = v.hidden_dim <= 4096 && k <= MAX_K && v3_experts.is_some();
+    let lay = bufs.layout();
 
     if use_batched {
         let v3e = v3_experts.unwrap();
@@ -1019,9 +1035,9 @@ fn emit_batched_experts(
                 v.moe_intermediate as u32,
                 v.hidden_dim as u32,
                 group_size,
-                v.gate_w_off_4bit() as u32,
-                v.gate_s_off_4bit() as u32,
-                v.gate_b_off_4bit() as u32,
+                lay.gate_w_off() as u32,
+                lay.gate_s_off() as u32,
+                lay.gate_b_off() as u32,
                 k_u32,
                 0,
             );
@@ -1034,9 +1050,9 @@ fn emit_batched_experts(
                 v.moe_intermediate as u32,
                 v.hidden_dim as u32,
                 group_size,
-                v.up_w_off_4bit() as u32,
-                v.up_s_off_4bit() as u32,
-                v.up_b_off_4bit() as u32,
+                lay.up_w_off() as u32,
+                lay.up_s_off() as u32,
+                lay.up_b_off() as u32,
                 k_u32,
                 0,
             );
@@ -1069,9 +1085,9 @@ fn emit_batched_experts(
                 v.hidden_dim as u32,
                 v.moe_intermediate as u32,
                 group_size,
-                v.down_w_off_4bit() as u32,
-                v.down_s_off_4bit() as u32,
-                v.down_b_off_4bit() as u32,
+                lay.down_w_off() as u32,
+                lay.down_s_off() as u32,
+                lay.down_b_off() as u32,
                 k_u32,
                 v.moe_intermediate as u32,
             );
@@ -1082,6 +1098,7 @@ fn emit_batched_experts(
         // whose 7168 hidden won't fit the batched kernel's x_shared, or
         // k > MAX_K). The batched matvec now chunks experts in groups of
         // 8, so a17b's k=10 takes the batched path above, not this one.
+        assert_eq!(lay, ExpertLayout::Q4, "[moe] per-expert fallback has 4-bit kernels only");
         for slot in 0..k {
             let (wb, base_off) = expert_bindings[slot];
             let gate_buf = buffer_pool.handle(bufs.gate_id(slot));
@@ -1443,6 +1460,11 @@ pub fn encode_moe_batched_permute_fuse(
     gather: bool,
 ) {
     debug_assert_eq!(expert_slots.len(), buckets.expert_ids.len());
+    assert_eq!(
+        expert_stride,
+        ExpertLayout::Q4.expert_size() as u64,
+        "[moe] permute-fuse prefill has 4-bit kernels only (packed 3-bit takes MoeGatherIdFuse)"
+    );
     if gather {
         encode_moe_gather(
             cmdbuf,
@@ -1730,6 +1752,10 @@ pub fn encode_moe_gather_id_fuse(
     }
     let hidden_dim = v.hidden_dim as u32;
     let moe_inter = v.moe_intermediate as u32;
+    // The expert stride is the layout's expert size (4-bit or packed
+    // 3-bit); the kernel unpacks either.
+    let lay = ExpertLayout::from_expert_size(expert_stride)
+        .unwrap_or_else(|| panic!("[moe] expert stride {expert_stride} matches no expert layout"));
 
     // --- 1. map0 ---
     kernels.encode(
@@ -1780,7 +1806,7 @@ pub fn encode_moe_gather_id_fuse(
                 k,
                 ne11,
                 nb02: expert_stride,
-                nb01_w: (k_in / 2) as u64,
+                nb01_w: lay.row_bytes(k_in as usize) as u64,
                 nb01_s: (k_in / 32) as u64, // (K/64)*2 bytes
                 packed_off,
                 scales_off,
@@ -1788,6 +1814,7 @@ pub fn encode_moe_gather_id_fuse(
                 nb10: 4,
                 nb11,
                 nb12,
+                bits: lay.bits,
             },
         );
     };
@@ -1798,9 +1825,9 @@ pub fn encode_moe_gather_id_fuse(
         gate_mid,
         hidden_dim,
         moe_inter,
-        v.gate_w_off_4bit() as u64,
-        v.gate_s_off_4bit() as u64,
-        v.gate_b_off_4bit() as u64,
+        lay.gate_w_off() as u64,
+        lay.gate_s_off() as u64,
+        lay.gate_b_off() as u64,
         /* ne11 */ 1,
         /* nb11 */ 0,
         /* nb12 */ (hidden_dim * 4) as u64,
@@ -1811,9 +1838,9 @@ pub fn encode_moe_gather_id_fuse(
         up_mid,
         hidden_dim,
         moe_inter,
-        v.up_w_off_4bit() as u64,
-        v.up_s_off_4bit() as u64,
-        v.up_b_off_4bit() as u64,
+        lay.up_w_off() as u64,
+        lay.up_s_off() as u64,
+        lay.up_b_off() as u64,
         /* ne11 */ 1,
         /* nb11 */ 0,
         /* nb12 */ (hidden_dim * 4) as u64,
@@ -1839,9 +1866,9 @@ pub fn encode_moe_gather_id_fuse(
         down_mid,
         moe_inter,
         hidden_dim,
-        v.down_w_off_4bit() as u64,
-        v.down_s_off_4bit() as u64,
-        v.down_b_off_4bit() as u64,
+        lay.down_w_off() as u64,
+        lay.down_s_off() as u64,
+        lay.down_b_off() as u64,
         /* ne11 */ k,
         /* nb11 */ (moe_inter * 4) as u64,
         /* nb12 */ (k * moe_inter * 4) as u64,

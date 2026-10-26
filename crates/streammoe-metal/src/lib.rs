@@ -854,7 +854,7 @@ struct MoeMmIdArgs {
     n_tokens: i32,
     k: i32,
     ne11: i32,
-    _pad: i32,
+    bits: i32,
 }
 
 /// `constant` args struct for [`MoeCombineTopkCall`]. Layout must
@@ -957,6 +957,9 @@ pub struct MoeGatherIdCall<'a> {
     /// Activation per-token byte stride. `4 * K_in` for gate/up;
     /// `4 * k * K_in` for down.
     pub nb12: u64,
+    /// Weight width: 4, or 3 for packed 3-bit experts (8 weights per
+    /// 3 bytes, MLX's layout). `nb01_w` and the offsets must match.
+    pub bits: u32,
 }
 
 /// Reduce `mid[n_tokens, k, hidden]` × `weights[n_tokens, k]` →
@@ -1057,7 +1060,7 @@ impl KernelCall for MoeGatherIdCall<'_> {
             n_tokens: self.n_tokens as i32,
             k: self.k as i32,
             ne11: self.ne11 as i32,
-            _pad: 0,
+            bits: self.bits as i32,
         };
 
         let enc = cmdbuf.new_compute_command_encoder();

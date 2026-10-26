@@ -1198,6 +1198,127 @@ kernel void dequant_matvec_4bit_v3_experts(
 
 
 // ============================================================================
+// Multi-expert batched matvec, packed 3-bit weights
+//
+// dequant_matvec_4bit_v3_experts for experts in the packed 3-bit layout:
+// 8 weights per 3 bytes, a little-endian 24-bit pack with weight i at
+// bits 3i..3i+3 (MLX's 3-bit layout). Same lanes, same element order,
+// same fma per weight as the 4-bit kernel, so a 3-bit expert gives
+// bit-identical output whether it is stored packed or in 4-bit nibbles.
+// ============================================================================
+
+kernel void dequant_matvec_3bit_v3_experts(
+    device const char* blob0   [[buffer(0)]],
+    device const char* blob1   [[buffer(1)]],
+    device const char* blob2   [[buffer(2)]],
+    device const char* blob3   [[buffer(3)]],
+    device const char* blob4   [[buffer(4)]],
+    device const char* blob5   [[buffer(5)]],
+    device const char* blob6   [[buffer(6)]],
+    device const char* blob7   [[buffer(7)]],
+    device const float* x      [[buffer(8)]],
+    device float*       out    [[buffer(9)]],
+    constant uint& out_dim       [[buffer(10)]],
+    constant uint& in_dim        [[buffer(11)]],
+    constant uint& group_size    [[buffer(12)]],
+    constant uint& w_byte_off    [[buffer(13)]],
+    constant uint& s_byte_off    [[buffer(14)]],
+    constant uint& b_byte_off    [[buffer(15)]],
+    constant uint& num_row_tiles [[buffer(16)]],
+    constant uint& k_active      [[buffer(17)]],
+    constant uint& input_stride  [[buffer(18)]],
+    // Global index of the first expert in THIS dispatch. The kernel
+    // binds at most 8 expert blobs (blob0..blob7), so callers with
+    // k_active > 8 dispatch in chunks of <=8 experts, each chunk
+    // passing its own `expert_base` so the x/out indexing stays in the
+    // global [0, k) expert space. `expert_k` below is chunk-local
+    // (0..k_active for this dispatch); `expert_base + expert_k` is the
+    // global slot.
+    constant uint& expert_base   [[buffer(19)]],
+    uint tgid_flat  [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid_flat / num_row_tiles;
+    if (expert_k >= k_active) return;
+    uint row_tile = tgid_flat % num_row_tiles;
+    uint row = row_tile * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    // Select this expert's blob
+    device const char* blob;
+    switch (expert_k) {
+        case 0: blob = blob0; break;
+        case 1: blob = blob1; break;
+        case 2: blob = blob2; break;
+        case 3: blob = blob3; break;
+        case 4: blob = blob4; break;
+        case 5: blob = blob5; break;
+        case 6: blob = blob6; break;
+        default: blob = blob7; break;
+    }
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Cache this expert's input slice. `input_stride == 0` broadcasts
+    // one shared input across experts (gate/up); otherwise it's the
+    // per-expert row pitch (down). Index in the global expert space.
+    threadgroup float x_shared[4096];
+    device const float* x_k = x + (expert_base + expert_k) * input_stride;
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x_k[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Point to this expert's weights for the requested projection:
+    // 3 bytes per 8-weight pack, `packed_cols * 3` bytes per row.
+    device const uchar* w_row =
+        (device const uchar*)(blob + w_byte_off) + row * packed_cols * 3;
+    device const uint16_t* s_row =
+        (device const uint16_t*)(blob + s_byte_off) + row * num_groups;
+    device const uint16_t* b_row =
+        (device const uint16_t*)(blob + b_byte_off) + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        device const uchar* p = w_row + col * 3;
+        uint packed = uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16);
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0x7), sx0, bx0);
+        acc += fma(float((packed >>  3) & 0x7), sx1, bx1);
+        acc += fma(float((packed >>  6) & 0x7), sx2, bx2);
+        acc += fma(float((packed >>  9) & 0x7), sx3, bx3);
+        acc += fma(float((packed >> 12) & 0x7), sx4, bx4);
+        acc += fma(float((packed >> 15) & 0x7), sx5, bx5);
+        acc += fma(float((packed >> 18) & 0x7), sx6, bx6);
+        acc += fma(float((packed >> 21) & 0x7), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[(expert_base + expert_k) * out_dim + row] = sum;
+    }
+}
+
+
+// ============================================================================
 // Flat-buffer variant of moe_combine_residual
 //
 // Reads K expert outputs from a contiguous [K, dim] buffer instead of

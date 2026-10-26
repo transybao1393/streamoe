@@ -128,6 +128,7 @@ pub const ALL_KERNELS: &[&str] = &[
     "conv1d_state_update",
     "conv1d_step",
     "dequant_matvec_2bit",
+    "dequant_matvec_3bit_v3_experts",
     "dequant_matvec_4bit",
     "dequant_matvec_4bit_batched",
     "dequant_matvec_4bit_fast",

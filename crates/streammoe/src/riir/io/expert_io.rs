@@ -48,7 +48,7 @@ use streammoe_metal::ResidencySet;
 
 use crate::riir::backend::buftype::ExpertBaseBuf;
 use crate::riir::backend::{BufId, MetalBufferPool};
-use crate::riir::variants::{VARIANT, Variant};
+use crate::riir::variants::{ExpertLayout, VARIANT, Variant};
 
 /// Disable kernel readahead on a successfully-opened layer fd.
 /// Mirrors `fcntl(fd, F_RDAHEAD, 0)` in the C path at
@@ -126,6 +126,11 @@ pub enum ExpertIoError {
          {primary} bytes (stale or partial copy?)"
     )]
     FastCopyMismatch { layer: usize, fast: u64, primary: u64 },
+    #[error(
+        "layer {layer} holds {bits}-bit experts but layer {first_layer} holds \
+         {first_bits}-bit ones (mixed experts directory?)"
+    )]
+    MixedLayouts { layer: usize, bits: u32, first_layer: usize, first_bits: u32 },
     #[error("I/O error reading layer {layer}: {source}")]
     Io {
         layer: usize,
@@ -173,8 +178,10 @@ pub struct ExpertFiles {
     expert_rset: Option<ResidencySet>,
     /// `Some(file)` if the layer file opened, `None` if it was missing.
     layers: Vec<Option<File>>,
-    /// Bytes per expert blob for the active variant. Hard-coded to
-    /// 4-bit; 2-bit needs a separate field if the path lands.
+    /// Packed layout of the opened files ([`layout_of_len`]); every
+    /// opened layer agrees.
+    layout: ExpertLayout,
+    /// Bytes per expert blob: `layout.expert_size()`.
     expert_size: usize,
     /// Directory the files were opened relative to. Kept for
     /// diagnostics / debug-impl; never re-read.
@@ -209,6 +216,30 @@ pub struct ExpertFiles {
     /// Per layer: `true` if the file was opened from the fast dir
     /// ([`Self::open_range_tiered`]).
     fast: Vec<bool>,
+}
+
+/// Layout of a layer file `len` bytes long: the one whose
+/// `num_experts` experts fill it exactly, else 4-bit (the legacy
+/// assumption; reads past a short file still fail as short reads).
+pub fn layout_of_len(len: u64) -> ExpertLayout {
+    let n = VARIANT.num_experts as u64;
+    if len % n == 0 {
+        ExpertLayout::from_expert_size(len / n).unwrap_or(ExpertLayout::Q4)
+    } else {
+        ExpertLayout::Q4
+    }
+}
+
+/// Layout of the experts under `experts_dir/packed_experts/`, from the
+/// first layer file in `range` present on disk (4-bit if none is).
+/// [`ExpertFiles::open_range_tiered`] checks that the rest agree.
+pub fn detect_layout(experts_dir: &Path, range: std::ops::Range<usize>) -> ExpertLayout {
+    let dir = experts_dir.join("packed_experts");
+    range
+        .filter_map(|i| std::fs::metadata(dir.join(format!("layer_{i:02}.bin"))).ok())
+        .map(|m| layout_of_len(m.len()))
+        .next()
+        .unwrap_or(ExpertLayout::Q4)
 }
 
 pub use super::io_stats::ExpertIoStats;
@@ -274,6 +305,8 @@ impl ExpertFiles {
         let mut layers = Vec::with_capacity(v.num_layers);
         let mut fast = vec![false; v.num_layers];
         let mut mmap_layers: Vec<Option<Mmap>> = (0..v.num_layers).map(|_| None).collect();
+        // First opened layer's layout; the rest must match it.
+        let mut layout: Option<(usize, ExpertLayout)> = None;
         for i in 0..v.num_layers {
             if !range.contains(&i) {
                 layers.push(None);
@@ -298,6 +331,20 @@ impl ExpertFiles {
             }
             match File::open(&path) {
                 Ok(f) => {
+                    let len = f.metadata().map_err(|e| ExpertIoError::Io { layer: i, source: e })?.len();
+                    let this = layout_of_len(len);
+                    match layout {
+                        None => layout = Some((i, this)),
+                        Some((first_layer, first)) if first != this => {
+                            return Err(ExpertIoError::MixedLayouts {
+                                layer: i,
+                                bits: this.bits,
+                                first_layer,
+                                first_bits: first.bits,
+                            });
+                        }
+                        Some(_) => {}
+                    }
                     disable_readahead(&f);
                     if nocache {
                         crate::riir::io::weight_file::set_nocache(&f)
@@ -330,18 +377,21 @@ impl ExpertFiles {
         }
         let mmap_buffers = (0..v.num_layers).map(|_| None).collect();
         let mmap_buf_ids = (0..v.num_layers).map(|_| None).collect();
+        let layout = layout.map_or(ExpertLayout::Q4, |(_, l)| l);
         eprintln!(
-            "[experts] {} layer(s) opened ({} from the fast dir), {} mmap'd{} \
+            "[experts] {} layer(s) opened ({} from the fast dir), {}-bit, {} mmap'd{} \
              (Metal buffers built on first batched call)",
             layers.iter().filter(|f| f.is_some()).count(),
             fast.iter().filter(|&&f| f).count(),
+            layout.bits,
             mmap_layers.iter().filter(|m| m.is_some()).count(),
             if nocache { ", F_NOCACHE" } else { "" }
         );
         Ok(Self {
             expert_rset: None,
             layers,
-            expert_size: v.expert_size_4bit(),
+            layout,
+            expert_size: layout.expert_size(),
             experts_dir: experts_dir.to_path_buf(),
             mmap_buffers,
             mmap_buf_ids,
@@ -790,6 +840,16 @@ impl ExpertFiles {
     /// Number of layers (matches [`Variant::num_layers`]).
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Packed layout of the opened expert files.
+    pub fn layout(&self) -> ExpertLayout {
+        self.layout
+    }
+
+    /// Bytes per expert blob (`layout().expert_size()`).
+    pub fn expert_size(&self) -> usize {
+        self.expert_size
     }
 
     /// `true` iff `layer_idx`'s file was opened from the fast dir.

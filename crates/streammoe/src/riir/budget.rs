@@ -284,6 +284,17 @@ impl BudgetPlan {
         }
     }
 
+    /// Re-size the expert accounts for `expert`-byte experts (e.g. a
+    /// 3-bit [`crate::riir::variants::ExpertLayout`]; the plan starts
+    /// at 4-bit). The slots follow `MoeBuffers::new`; staging stays 0
+    /// if the mode has none.
+    pub fn set_expert_size(&mut self, expert: u64) {
+        self.set(Account::ExpertSlots, 3 * MAX_K as u64 * round_up(expert, TWO_MIB));
+        if self.get(Account::PrefillStaging) > 0 {
+            self.set(Account::PrefillStaging, VARIANT.num_experts as u64 * expert);
+        }
+    }
+
     /// Add (or replace) one account.
     pub fn set(&mut self, account: Account, bytes: u64) {
         match self.entries.iter_mut().find(|(a, _)| *a == account) {
@@ -485,7 +496,13 @@ mod tests {
             let _lin = LinearAttnGraphScratch::new(&mut pool, chunk);
             let _full = FullAttnGraphScratch::new(&mut pool, chunk);
             // Mmap mode: no `expert_base` (that is `prefill_staging`).
-            let _moe = MoeGraphScratch::new(&mut pool, v.num_experts_per_tok, ExpertIoMode::Mmap, chunk);
+            let _moe = MoeGraphScratch::new(
+                &mut pool,
+                v.num_experts_per_tok,
+                ExpertIoMode::Mmap,
+                chunk,
+                v.expert_size_4bit(),
+            );
             let _hdb = HiddenDoubleBuffer::new(&mut pool, chunk);
             let _hts = HeadTailScratch::new(&mut pool, chunk);
             let want = prefill_scratch_bytes(v, chunk);

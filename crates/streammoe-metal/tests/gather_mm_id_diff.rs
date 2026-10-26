@@ -316,6 +316,7 @@ fn run_case(
             nb10: 4,
             nb11: 0,
             nb12: (k_in * 4) as u64,
+            bits: 4,
         },
     );
     cmdbuf.commit();
@@ -593,6 +594,7 @@ fn run_down_shape_case(
             nb10: 4,
             nb11: (k_in * 4) as u64,
             nb12: (k * k_in * 4) as u64,
+            bits: 4,
         },
     );
     cmdbuf.commit();
@@ -734,4 +736,151 @@ fn moe_mm_id_diff_k10_down() {
         /* n_out */ 256,
         /* seed */ 0xA17B_D0_5C,
     );
+}
+
+// --- packed 3-bit weights ----------------------------------------------------
+
+/// Pack 4-bit nibble words whose codes are all <= 7 into the 3-bit
+/// layout: 8 codes per 3 bytes, little-endian, code i at bits 3i..3i+3.
+fn pack_3bit(words: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 3);
+    for &w in words {
+        let mut p = 0u32;
+        for i in 0..8 {
+            p |= ((w >> (4 * i)) & 0x7) << (3 * i);
+        }
+        out.extend_from_slice(&p.to_le_bytes()[..3]);
+    }
+    out
+}
+
+/// One gate-shape `streammoe_mm_id` over `n_experts` blocks of
+/// `[weights | scales | biases]` (weights `w_bytes`, `bits` wide).
+#[allow(clippy::too_many_arguments)]
+fn run_gather_bits(
+    device: &Device,
+    kernels: &Kernels,
+    weights: &[Vec<u8>],
+    scales: &[Vec<u16>],
+    biases: &[Vec<u16>],
+    bits: u32,
+    indices: &[i32],
+    activations: &[f32],
+    n_tokens: usize,
+    k: usize,
+    k_in: usize,
+    n_out: usize,
+) -> Vec<f32> {
+    let n_experts = weights.len();
+    let (w_bytes, s_bytes) = (weights[0].len(), scales[0].len() * 2);
+    let per_expert = w_bytes + 2 * s_bytes;
+    let mut blob = Vec::with_capacity(per_expert * n_experts);
+    for e in 0..n_experts {
+        blob.extend_from_slice(&weights[e]);
+        blob.extend(scales[e].iter().flat_map(|s| s.to_le_bytes()));
+        blob.extend(biases[e].iter().flat_map(|b| b.to_le_bytes()));
+    }
+    let shared = MTLResourceOptions::StorageModeShared;
+    let buf_of = |bytes: &[u8]| device.new_buffer_with_data(bytes.as_ptr().cast(), bytes.len() as u64, shared);
+    let weights_buf = buf_of(&blob);
+    let indices_buf = buf_of(unsafe { std::slice::from_raw_parts(indices.as_ptr().cast(), indices.len() * 4) });
+    let act_buf = buf_of(unsafe { std::slice::from_raw_parts(activations.as_ptr().cast(), activations.len() * 4) });
+    let htpe_buf = device.new_buffer((n_experts * 4) as u64, shared);
+    let hids_buf = device.new_buffer((n_experts * n_tokens * 4) as u64, shared);
+    let out_buf = buf_of(&vec![0u8; n_tokens * k * n_out * 4]);
+    let queue = device.new_command_queue();
+    let cmdbuf = queue.new_command_buffer();
+    kernels.encode(
+        cmdbuf,
+        &MoeIdMap0Call {
+            indices: &indices_buf,
+            indices_offset: 0,
+            htpe: &htpe_buf,
+            htpe_offset: 0,
+            hids: &hids_buf,
+            hids_offset: 0,
+            n_experts: n_experts as u32,
+            n_tokens: n_tokens as u32,
+            k: k as u32,
+        },
+    );
+    kernels.encode(
+        cmdbuf,
+        &MoeGatherIdCall {
+            src0: &weights_buf,
+            src0_offset: 0,
+            src1: &act_buf,
+            src1_offset: 0,
+            htpe: &htpe_buf,
+            htpe_offset: 0,
+            hids: &hids_buf,
+            hids_offset: 0,
+            dst: &out_buf,
+            dst_offset: 0,
+            k_in: k_in as u32,
+            n_out: n_out as u32,
+            n_experts: n_experts as u32,
+            n_tokens: n_tokens as u32,
+            k: k as u32,
+            ne11: 1,
+            nb02: per_expert as u64,
+            nb01_w: (k_in * bits as usize / 8) as u64,
+            nb01_s: (k_in / 32) as u64,
+            packed_off: 0,
+            scales_off: w_bytes as u64,
+            biases_off: (w_bytes + s_bytes) as u64,
+            nb10: 4,
+            nb11: 0,
+            nb12: (k_in * 4) as u64,
+            bits,
+        },
+    );
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+    unsafe { std::slice::from_raw_parts(out_buf.contents() as *const f32, n_tokens * k * n_out).to_vec() }
+}
+
+/// Packed 3-bit experts give bit-identical results to the same 3-bit
+/// codes stored in 4-bit nibbles, and both match the CPU reference.
+#[test]
+fn moe_mm_id_packed_3bit_matches_nibble_layout() {
+    let (n_experts, n_tokens, k, k_in, n_out) = (16, 48, 8, 512, 128);
+    let mut rng = XorShift::new(0x3B17_0001);
+    let mut experts: Vec<_> = (0..n_experts).map(|_| gen_expert(&mut rng, n_out, k_in)).collect();
+    for (packed, _, _) in experts.iter_mut() {
+        for w in packed.iter_mut() {
+            *w &= 0x7777_7777; // every code 0..7
+        }
+    }
+    let activations: Vec<f32> = (0..n_tokens * k_in).map(|_| rng.unit()).collect();
+    let mut indices = Vec::with_capacity(n_tokens * k);
+    for _ in 0..n_tokens {
+        let mut row: Vec<i32> = Vec::new();
+        while row.len() < k {
+            let e = (rng.next_u64() % n_experts as u64) as i32;
+            if !row.contains(&e) {
+                row.push(e);
+            }
+        }
+        indices.extend(row);
+    }
+    let device = Device::system_default().expect("no Metal device for test");
+    let kernels = Kernels::new(&device).expect("build streammoe-metal kernels");
+    let scales: Vec<_> = experts.iter().map(|e| e.1.clone()).collect();
+    let biases: Vec<_> = experts.iter().map(|e| e.2.clone()).collect();
+    let nibbles: Vec<Vec<u8>> =
+        experts.iter().map(|e| e.0.iter().flat_map(|w| w.to_le_bytes()).collect()).collect();
+    let packed: Vec<Vec<u8>> = experts.iter().map(|e| pack_3bit(&e.0)).collect();
+    assert_eq!(packed[0].len() * 4, nibbles[0].len() * 3);
+    let run = |w: &[Vec<u8>], bits| {
+        run_gather_bits(&device, &kernels, w, &scales, &biases, bits, &indices, &activations, n_tokens, k, k_in, n_out)
+    };
+    let q4 = run(&nibbles, 4);
+    let q3 = run(&packed, 3);
+    let differ = q4.iter().zip(&q3).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    assert_eq!(differ, 0, "{differ} of {} outputs differ between layouts", q4.len());
+    let cpu = cpu_reference(&experts, &indices, &activations, n_out, k_in, n_tokens, k);
+    let cos = cosine(&cpu, &q3);
+    assert!(cos >= COSINE_FLOOR, "packed 3-bit vs CPU cosine {cos}");
+    eprintln!("[packed-3bit] {} outputs bit-identical across layouts; cosine vs CPU {cos:.6}", q3.len());
 }

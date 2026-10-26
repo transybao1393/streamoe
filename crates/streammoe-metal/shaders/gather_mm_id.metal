@@ -96,6 +96,10 @@ struct streammoe_mm_id_args {
     // ne11 for the activation tensor: 1 for gate/up (no slot dim),
     // k for down. Matches llama.cpp's broadcast handling.
     int32_t  ne11;
+    // Weight width: 4 (8 nibbles per u32, low first) or 3 (8 weights
+    // per 3 bytes, little-endian 24-bit packs — MLX's 3-bit layout).
+    // `nb01_w` and the offsets above already follow it.
+    int32_t  bits;
 };
 
 // ===============================================================
@@ -312,10 +316,11 @@ kernel void streammoe_mm_id(
         // the within-K-tile byte offset (il0 splits the 16-byte
         // NK=32 slab into two halves); `loop_k / 2` is the K-tile
         // byte offset within the row (2 nibbles = 1 byte).
+        // 3-bit: 16 weights = 2 packs = 6 bytes, `loop_k * 3 / 8`.
+        const bool q3 = args.bits == 3;
         device const uint8_t * w_thread = x_packed_base
             + args.nb01_w * (r0 + lr0)
-            + 8 * il0
-            + (loop_k / 2);
+            + (q3 ? 6 * il0 + (loop_k * 3) / 8 : 8 * il0 + (loop_k / 2));
 
         // Scale/bias for this thread's group. Group index =
         // `(loop_k) / GROUP_SIZE = loop_k / 64`. nb01_s is the
@@ -335,16 +340,31 @@ kernel void streammoe_mm_id(
         // The permutation matches llama.cpp's "pre-tensor" sa store
         // pattern at lines 9794-9815 of ggml-metal.metal.
         float dq[16];
-        #pragma unroll
-        for (short i = 0; i < 8; i++) {
-            uint8_t byte = w_thread[i];
-            dq[2 * i + 0] = scale * (float)(byte & 0x0f) + bias;
-            // Note: the high nibble represents the *next* element
-            // in the K direction. MLX's dequant uses `scale/16` for
-            // the high-nibble scale because it bit-shifts the high
-            // nibble in place; we extract via shift so plain `scale`
-            // applies. Match the llama.cpp dequant convention here.
-            dq[2 * i + 1] = scale * (float)((byte >> 4) & 0x0f) + bias;
+        if (q3) {
+            // Two 24-bit packs; same `scale * q + bias` per weight, so
+            // a 3-bit expert in either layout dequantizes identically.
+            #pragma unroll
+            for (short p = 0; p < 2; p++) {
+                uint pack = (uint)w_thread[3 * p]
+                          | ((uint)w_thread[3 * p + 1] << 8)
+                          | ((uint)w_thread[3 * p + 2] << 16);
+                #pragma unroll
+                for (short i = 0; i < 8; i++) {
+                    dq[8 * p + i] = scale * (float)((pack >> (3 * i)) & 0x7) + bias;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (short i = 0; i < 8; i++) {
+                uint8_t byte = w_thread[i];
+                dq[2 * i + 0] = scale * (float)(byte & 0x0f) + bias;
+                // Note: the high nibble represents the *next* element
+                // in the K direction. MLX's dequant uses `scale/16` for
+                // the high-nibble scale because it bit-shifts the high
+                // nibble in place; we extract via shift so plain `scale`
+                // applies. Match the llama.cpp dequant convention here.
+                dq[2 * i + 1] = scale * (float)((byte >> 4) & 0x0f) + bias;
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
