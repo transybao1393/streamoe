@@ -113,3 +113,7 @@ expert_index.json
 root-*bit/
 ref_*.bin
 q_*.json
+
+# owner notes (chat export, decision review)
+chat-history.md
+owner-review.md
