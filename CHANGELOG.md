@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-beta.2 — 2026-10-28
+
+Second beta: long runs now stay inside the memory cap (a leak of
+autoreleased Metal objects is fixed), the mmap-vs-pread test is exact
+again, and more of the a3b model suites ran.
 
 ### Fixed
 
