@@ -194,8 +194,8 @@
 
     <rect x="760" y="440" width="150" height="80" rx="12" fill="#b45309"/>
     <text class="box-t" x="835" y="468" text-anchor="middle">Hot tier</text>
-    <text class="box-s" x="835" y="487" text-anchor="middle">LFU · zero-copy bind</text>
-    <text class="box-s" x="835" y="503" text-anchor="middle">+ lent prefill staging</text>
+    <text class="box-s" x="835" y="487" text-anchor="middle">LFU · fades in ~13 tok</text>
+    <text class="box-s" x="835" y="503" text-anchor="middle">+ lent prefill buffers</text>
   </g>
 
   <!-- flow labels -->

@@ -88,10 +88,10 @@ larger than the shield — fast.
 
 | | Principle | What does it |
 | --- | --- | --- |
-| **A** · Adaptive | Fit the work to the cap and to what the model is doing right now | cross-layer expert guesses, per-slot prefetch waits, LFU hot-tier admission, lending idle buffers, 4-bit or packed 3-bit experts |
+| **A** · Adaptive | Fit the work to the cap and to what the model is doing right now | cross-layer expert guesses, per-slot prefetch waits, LFU hot-tier admission that forgets old topics in ~13 tokens, lending idle buffers, 4-bit or packed 3-bit experts |
 | **E** · Expert | Make every routed expert cheap to read and to run | packed 3-bit layout (−22% bytes, detected at open), fused gather kernels (`gather_mm_id`), `qmv` for single-token matvecs |
 | **G** · Guarded | Memory is a contract, not an estimate | the budget plan at open (`OverBudget` before anything is touched), `F_NOCACHE` so neighbours keep their page cache, vision and KV inside the plan |
-| **I** · In-memory | Bytes already in RAM do as much work as they can | the hot tier (zero-copy bind), the slot ring, compact KV (F16, Turbo4/3), prefill staging lent to decode |
+| **I** · In-memory | Bytes already in RAM do as much work as they can | the hot tier (zero-copy bind), the slot ring, compact KV (F16, Turbo4/3), prefill staging and scratch lent to decode |
 | **S** · Streaming | Disk is a tier, and its time is measured | parallel `F_NOCACHE` pread overlapped with GPU work, `STREAMMOE_IO_TRACE` and `STREAMMOE_GPU_TIMING` timelines |
 
 ### Data flow
@@ -562,6 +562,27 @@ Decode tok/s over all three prompts:
 - Several requests at once (`eval_requests`, batch 4) give 1.30–1.33×
   the total throughput; speculative decoding with the match-length
   guard (`spec_bench`) gives 1.08–1.12×, 1.17–1.26× on copy-heavy text.
+
+How it got here — the same test at every cap on the 2026-10-26
+build and on the 2026-10-28 build (both on the same shared host with
+other apps running):
+
+| Cap | 4-bit, 2026-10-26 → 10-28 | Packed 3-bit, 2026-10-26 → 10-28 |
+| --- | --- | --- |
+| 3 GiB | 6.5 → 8.3 (+28%) | 7.5 → 9.4 (+25%) |
+| 4 GiB | 7.4 → 10.2 (+38%) | 8.1 → 11.4 (+41%) |
+| 5 GiB | 7.9 → 11.5 (+46%) | 8.6 → 13.1 (+52%) |
+| 6 GiB | 8.3 → 12.8 (+54%) | 9.2 → 14.2 (+54%) |
+
+What each part is worth today, switching one off at a time (4-bit,
+4 GiB cap, 10.2 tok/s with everything on):
+
+| Switched off | tok/s | Worth |
+| --- | --- | --- |
+| Hot tier forgets old topics in ~13 tokens (back to ~205) | 8.5 | +20% |
+| Idle prefill staging and scratch lent to the hot tier | 8.8 | +16% |
+| Cross-layer expert guess (back to the previous-token guess) | 9.1 | +12% |
+| Prefill scratch lent (staging still lent) | 9.7 | +5% |
 
 Per-prompt numbers, hot-tier hits, disk reads, prefetch and reuse
 comparisons, multi-token passes, the per-token breakdown and vision

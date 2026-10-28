@@ -60,10 +60,13 @@ How to read it:
   measured*: this 18 GB host can't spare that much). A cap above what
   other programs leave free makes the machine swap and is slower than
   a small cap.
-- These runs are 25–54% faster than the 2026-10-26 build's at the same
-  caps (more at bigger caps). Most of that is the hot-tier changes (each measured on its own
-  in [`known-issues.md`](known-issues.md)); the host also ran faster on
-  2026-10-28, so only compare numbers taken in one batch.
+- **25–54% faster than the 2026-10-26 build** at the same caps, more
+  at bigger caps (4 GiB: 7.4 → 10.2 tok/s 4-bit, 8.1 → 11.4 packed
+  3-bit), on the same shared host with other apps running. It comes
+  from the hot tier: forgetting old topics in ~13 tokens instead of
+  ~205 and lending the idle prefill scratch as well as the staging
+  (each measured on its own in [Prefetch and reuse](#prefetch-and-reuse)
+  and [`known-issues.md`](known-issues.md)).
 - First word is time to the first streamed token for a ~25-token
   prompt; the chat template plus a short question prefills slowly
   because each token picks new experts. Long prompts prefill far
