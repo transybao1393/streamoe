@@ -15,6 +15,20 @@
   the staging buffer; `STREAMMOE_HOT_LEND=0` still turns all lending
   off.
 
+- The hot tier's popularity counters halve every 4096 recorded picks
+  (~13 tokens on a3b) instead of every 65536 (~205 tokens), so the
+  previous topic's experts stop holding slots within a sentence. a3b
+  chat at a 4 GiB cap, mean of 2 alternating rounds, greedy output
+  identical, peak unchanged (3.61–3.65 GiB): packed 3-bit 11.44 /
+  8.20 / 9.15 → 12.01 / 10.22 / 11.65 tok/s on the three standard
+  prompts (hot-tier hits 67 / 43 / 59% → 73 / 61 / 72%), 4-bit
+  9.55 / 7.17 / 8.80 → 10.48 / 8.59 / 10.61 (61 / 38 / 57% → 67 /
+  56 / 70%). A prose → code → prose chat in one session, per turn:
+  packed 3-bit 11.45 / 8.25 / 9.83 → 11.73 / 9.30 / 11.28 tok/s,
+  4-bit 9.50 / 6.68 / 8.35 → 9.93 / 8.08 / 10.01. 16384 and 1024
+  gain less. `STREAMMOE_HOT_DECAY=<picks>` sets the period (65536
+  restores the old one).
+
 ### Added
 
 - `budget_cap::a3b_prefill_after_lent_decode_matches_first_prefill`:

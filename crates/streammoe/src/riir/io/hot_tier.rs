@@ -41,8 +41,24 @@ use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 /// Upper bound per backing Metal buffer.
 pub const CHUNK_BYTES: usize = 1 << 30;
 
-/// Halve every counter after this many recorded picks.
-const DECAY_EVERY: u64 = 1 << 16;
+/// Halve every counter after this many recorded picks
+/// (`STREAMMOE_HOT_DECAY=<picks>` overrides it). 4096 is ~13 tokens
+/// on a3b (40 layers × 8 picks): the last topic's experts cool within
+/// a sentence. 1 << 16 (~205 tokens) held them for a whole answer.
+const DECAY_EVERY: u64 = 1 << 12;
+
+/// The decay period: `STREAMMOE_HOT_DECAY` if set to a positive
+/// number, else [`DECAY_EVERY`]. Read once.
+fn decay_every() -> u64 {
+    static EVERY: OnceLock<u64> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("STREAMMOE_HOT_DECAY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DECAY_EVERY)
+    })
+}
 
 /// Victims sampled per admission.
 const VICTIM_SAMPLES: usize = 8;
@@ -135,6 +151,8 @@ pub struct HotTier {
     expert_size: usize,
     num_layers: usize,
     num_experts: usize,
+    /// Halve every counter after this many recorded picks.
+    decay_every: u64,
     inner: Mutex<Inner>,
 }
 
@@ -205,6 +223,7 @@ impl HotTier {
             expert_size,
             num_layers,
             num_experts,
+            decay_every: decay_every(),
             inner: Mutex::new(Inner {
                 map: HashMap::with_capacity(capacity),
                 owner: vec![None; capacity],
@@ -225,6 +244,11 @@ impl HotTier {
     /// Slots in the tier, lent slots included while they are lent.
     pub fn capacity(&self) -> usize {
         self.active_capacity(&self.inner.lock().unwrap())
+    }
+
+    /// Recorded picks between halvings of the popularity counters.
+    pub fn decay_every(&self) -> u64 {
+        self.decay_every
     }
 
     fn lent_slots(&self) -> usize {
@@ -350,7 +374,7 @@ impl HotTier {
         g.counts[i] = g.counts[i].saturating_add(n);
         let before = g.picks;
         g.picks += n as u64;
-        for _ in before / DECAY_EVERY..g.picks / DECAY_EVERY {
+        for _ in before / self.decay_every..g.picks / self.decay_every {
             for c in g.counts.iter_mut() {
                 *c >>= 1;
             }
@@ -644,6 +668,25 @@ mod tests {
         t.begin_epoch();
         assert!(t.offer(2, 2, &blob(9)));
         assert!(!t.contains(0, 0));
+    }
+
+    #[test]
+    fn decay_halves_once_per_period_crossed() {
+        let mut t = tier(1);
+        t.decay_every = 4;
+        let count = |t: &HotTier, i: usize| t.counts()[i];
+        // 3 picks: no boundary crossed yet.
+        t.record_picks(0, 0, 3);
+        assert_eq!(count(&t, 0), 3);
+        // 3 → 4 crosses one boundary: (3 + 1) >> 1.
+        t.record_pick(0, 1);
+        assert_eq!((count(&t, 0), count(&t, 1)), (1, 0));
+        // A bucket of 9 picks (4 → 13) crosses 8 and 12: halved twice.
+        t.record_picks(1, 2, 9);
+        assert_eq!((count(&t, 0), count(&t, 10)), (0, 2));
+        // 13 → 15 crosses nothing.
+        t.record_picks(1, 2, 2);
+        assert_eq!(count(&t, 10), 4);
     }
 
     #[test]

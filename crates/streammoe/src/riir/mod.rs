@@ -872,11 +872,12 @@ impl RsCtx<MetalBackend> {
             .map_err(|_| RsError::InitFailed)?;
         }
         eprintln!(
-            "[hot_tier] {} slots ({}), seeded {} (layers {:?})",
+            "[hot_tier] {} slots ({}), seeded {} (layers {:?}), decay every {} picks",
             capacity,
             budget::fmt_gib(bytes),
             self.experts.hot_tier().map_or(0, |h| h.stats().resident),
-            self.layer_range
+            self.layer_range,
+            self.experts.hot_tier().map_or(0, |h| h.decay_every())
         );
         Ok(())
     }

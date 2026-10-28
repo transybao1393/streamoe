@@ -174,6 +174,26 @@ history of `.claude/memory/`, which is no longer tracked.
   chat at a 4 GiB cap, 4-bit → packed 3-bit: forward 118 → 89,
   146 → 115, 121 → 97 ms/token; first word 1.57 → 1.11, 1.38 → 0.92,
   1.36 → 0.90 s; hot tier 719 → 997 slots in the same memory.
+- **Old popularity held the hot tier for ~200 tokens**: counters
+  halved every 65536 picks, ~205 tokens on a3b (40 layers × 8 picks),
+  so after a topic change the previous topic's experts still beat the
+  new ones in admission for most of an answer (hits 23% on a code
+  prompt vs 47% on prose). They now halve every 4096 picks (~13
+  tokens). a3b chat at a 4 GiB cap, mean of 2 alternating rounds,
+  greedy output identical in every arm, peak unchanged
+  (3.61–3.65 GiB): packed 3-bit 11.44 / 8.20 / 9.15 → 12.01 /
+  10.22 / 11.65 tok/s on the three standard prompts (forward 87.2 →
+  83.1, 121.9 → 97.6, 111.5 → 85.7 ms/token; io wait 29.6 → 26.3,
+  54.0 → 37.3, 43.0 → 28.1 ms/token; hits 67 / 43 / 59% → 73 / 61 /
+  72%); 4-bit 9.55 / 7.17 / 8.80 → 10.48 / 8.59 / 10.61 (hits 61 /
+  38 / 57% → 67 / 56 / 70%). A prose → code → prose chat in one
+  session (200 tokens a turn), per turn: packed 3-bit 11.45 / 8.25 /
+  9.83 → 11.73 / 9.30 / 11.28 tok/s (hits 68 / 42 / 57% → 73 / 58 /
+  72%), 4-bit 9.50 / 6.68 / 8.35 → 9.93 / 8.08 / 10.01 (63 / 37 /
+  54% → 66 / 53 / 68%). 16384 picks gains about half as much; 1024
+  is a little behind 4096 everywhere (it is still LFU, just a short
+  memory — cf. the LRU dead end). `STREAMMOE_HOT_DECAY=<picks>` sets
+  the period, read once at open and printed in the `[hot_tier]` line.
 
 ## Precautions
 
