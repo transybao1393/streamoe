@@ -147,9 +147,11 @@ pie showData
 With packed 3-bit experts the prefill staging shrinks to 0.33 GiB and
 the hot tier grows to 1.14 GiB. In the [speed runs](docs/benchmarks.md#speed) the peak
 stayed 0.26–0.31 GiB under every cap (2.7 / 3.7 / 4.7 / 5.7 GiB at
-3 / 4 / 5 / 6 GiB). One known exception: very long runs can outgrow the
-0.5 GiB runtime allowance — open in
-[`docs/known-issues.md`](docs/known-issues.md). A Turbo4 KV cache
+3 / 4 / 5 / 6 GiB). Long runs hold too: a 130-token prompt plus a
+128-token answer under a 4 GiB cap grows by 1 MiB between the 16th and
+the 128th token, at the default 0.5 GiB runtime allowance (it grew
+without bound before a missing autorelease pool was added, 2026-10-28;
+`budget_cap::a3b_long_decode_stays_under_4gib_cap` now guards it). A Turbo4 KV cache
 shrinks the KV slice to 0.02 GiB and the hot tier grows by the
 difference; on models with large KV caches (OLMoE-1B-7B at n_ctx 4096)
 that trade alone made decode 44% faster.
