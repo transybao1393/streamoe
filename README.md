@@ -411,7 +411,7 @@ variables are spelled `streammoe` / `STREAMMOE_*`.
 
 ## Status
 
-**Beta** — `0.2.0-beta.2`, based on moeflux `0.1.0-pre.4`. APIs may still change before 0.2.0; changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
+**Beta** — `0.2.0-beta.3`, based on moeflux `0.1.0-pre.4`. APIs may still change before 0.2.0; changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
 
 | Area | State |
 | --- | --- |

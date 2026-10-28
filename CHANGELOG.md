@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.2.0-beta.3 — 2026-10-28
+
+Third beta: faster decode under a cap. a3b at a 4 GiB cap now decodes
+10.2 tok/s with 4-bit experts and 11.4 with packed 3-bit (7.4 / 8.1 on
+beta.1's build; 8.3–14.2 tok/s from a 3 to a 6 GiB cap), from a hot
+tier that forgets old topics in ~13 tokens and also borrows the idle
+prefill scratch. `spec_bench` speculative decoding drafts only on long
+matches and is now 1.08–1.12× plain decode.
 
 ### Changed
 
