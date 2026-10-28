@@ -69,6 +69,18 @@ use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::snapshot::state::KvCache;
 use crate::riir::variants::{QkNorm, VARIANT};
 
+/// `STREAMMOE_DECODE_SDPA`: `Some(true)` forces the GPU SDPA decode
+/// path, `Some(false)` the CPU one, `None` (unset or `auto`) leaves
+/// the choice to the expert I/O mode.
+fn decode_sdpa_override() -> Option<bool> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("STREAMMOE_DECODE_SDPA").as_deref() {
+        Ok("gpu") => Some(true),
+        Ok("cpu") => Some(false),
+        _ => None,
+    })
+}
+
 /// Run-lifetime scratch for the batched full-attn `graph1`.
 ///
 /// The full-attn counterpart of
@@ -531,6 +543,13 @@ pub(in crate::riir) fn full_attn_host_attention(
     // expert-streaming-bound decode, so the cost is negligible. In `Mmap`
     // mode (a3b — fits RAM, no streaming pressure) keep GPU SDPA: ~17%
     // faster full-attn with no eviction.
+    //
+    // The two paths sum in a different order, so mmap and pread decode
+    // agree to rounding (~1e-5 on the logits), not bit for bit, once
+    // `kv_len` reaches 32. `STREAMMOE_DECODE_SDPA=cpu|gpu` overrides
+    // the I/O-mode gate (the other conditions still apply);
+    // `tests/expert_source_equivalence.rs` sets `cpu` to compare the
+    // expert sources bit for bit.
     let kv_len = kv_state.len;
     // A quantized cache (`kv_format` ≠ F32) always takes the CPU
     // path, which reads the stored rows directly.
@@ -538,7 +557,7 @@ pub(in crate::riir) fn full_attn_host_attention(
         && kv_state.fmt == KvFormat::F32
         && kv_len >= 32
         && (kv_len as usize) < crate::riir::variants::GPU_KV_SEQ
-        && !gpu.expert_io_mode.is_pread();
+        && decode_sdpa_override().unwrap_or(!gpu.expert_io_mode.is_pread());
 
     let gpu_attn_args = if gpu_attn_ready {
         // Stage Q + q_gate (both post-norm + RoPE for q) into the

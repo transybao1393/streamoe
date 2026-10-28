@@ -4,6 +4,13 @@
 //! same prompt and must produce **bit-identical** logits and the same
 //! greedy tokens.
 //!
+//! Every run here forces the CPU decode attention
+//! (`STREAMMOE_DECODE_SDPA=cpu`). By default mmap mode takes the GPU
+//! SDPA once the KV cache holds 32 rows and pread mode the CPU one;
+//! the two sum in a different order, so mmap and pread would agree to
+//! ~1e-5 on the logits (same greedy tokens), not bit for bit, for a
+//! reason that has nothing to do with the expert bytes.
+//!
 //! Needs the a3b model; check the host first:
 //! ```text
 //! scripts/check_test_host.sh
@@ -24,6 +31,9 @@ const N_CTX: usize = 2048;
 const DECODE: usize = 16;
 
 fn open(cfg: OpenConfig) -> Ctx {
+    // SAFETY: set before the first open in this process reads it, and
+    // always to the same value; nothing else touches the environment.
+    unsafe { std::env::set_var("STREAMMOE_DECODE_SDPA", "cpu") };
     let p = default_a3b_paths();
     Ctx::open_with(&p.weights, &p.manifest, &p.vocab, &p.root, false, &cfg).expect("open")
 }
