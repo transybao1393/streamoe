@@ -137,6 +137,57 @@ mod model {
         assert!(fp.peak <= cap, "peak footprint {} over cap {cap}", fp.peak);
     }
 
+    /// A long decode at the default `runtime_overhead`: a 130-token
+    /// prompt, then 128 tokens one at a time under a 4 GiB cap. Every
+    /// `eval_token` re-checks the footprint, so going over fails the
+    /// call, and the footprint must stay flat once decode is warm (it
+    /// grew ~0.33 MiB per token while metal-rs' autoreleased command
+    /// buffers piled up). `STREAMMOE_TEST_ROOT` swaps in another expert
+    /// root (e.g. packed 3-bit).
+    #[test]
+    #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+    fn a3b_long_decode_stays_under_4gib_cap() {
+        let cap = 4 * GIB;
+        let p = diff_helpers::default_a3b_paths();
+        let root = std::env::var_os("STREAMMOE_TEST_ROOT").map_or(p.root.clone(), PathBuf::from);
+        let cfg = OpenConfig { n_ctx: 4096, mem_cap: Some(cap), max_checkpoints: 0, ..OpenConfig::default() };
+        let mut ctx = Ctx::open_with(&p.weights, &p.manifest, &p.vocab, &root, false, &cfg).expect("open");
+        let open = ctx.footprint().expect("footprint").current;
+        let mut logits = vec![0f32; ctx.n_vocab()];
+        let prompt: Vec<i32> = (0..130).map(|i| 1000 + 7 * i).collect();
+        ctx.eval_prompt(&prompt, 0, 0, &mut logits).expect("prefill");
+        let gib = |b: u64| b as f64 / GIB as f64;
+        let mut warm = 0;
+        for i in 0..128 {
+            let tok = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as i32)
+                .unwrap();
+            if let Err(e) = ctx.eval_token(tok, prompt.len() + i, 0, &mut logits) {
+                panic!("decode token {i}: {e:?}");
+            }
+            if i % 16 == 15 {
+                let fp = ctx.footprint().expect("footprint");
+                if i == 15 {
+                    warm = fp.current;
+                }
+                eprintln!(
+                    "[budget_cap] token {:3}: footprint {:.3} GiB (+{:.0} MiB since open), peak {:.3}",
+                    i + 1,
+                    gib(fp.current),
+                    (fp.current as f64 - open as f64) / (1 << 20) as f64,
+                    gib(fp.peak)
+                );
+            }
+        }
+        let fp = ctx.footprint().expect("footprint");
+        assert!(fp.peak <= cap, "peak footprint {} over cap {cap}", fp.peak);
+        let growth = fp.current.saturating_sub(warm);
+        assert!(growth < 8 << 20, "footprint grew {growth} bytes over 112 warm decode tokens");
+    }
+
     #[test]
     #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
     fn a3b_tiny_cap_fails_at_open() {

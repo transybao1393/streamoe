@@ -122,7 +122,7 @@ impl RsCtx<MetalBackend> {
         self.experts.begin_epoch();
         let t0 = std::time::Instant::now();
         let positions: Vec<usize> = (start_pos..start_pos + n).collect();
-        self.decode_multi_inner(tokens, &positions, None, logits)?;
+        crate::riir::with_autorelease_pool(|| self.decode_multi_inner(tokens, &positions, None, logits))?;
         if let Some(m) = self.multi_decode.as_mut() {
             m.last_pass = Some((start_pos, n));
         }
@@ -174,18 +174,20 @@ impl RsCtx<MetalBackend> {
         let (metal, _, buffer_pool) = backend.parts_mut();
         let main = linear_buffers.as_ref().ok_or(RsError::EvalFailed)?;
         let (conv, delta) = &multi_decode.as_ref().expect("checked").rollback[keep - 1];
-        let cmdbuf = metal.queue_clone().new_command_buffer().to_owned();
-        let blit = cmdbuf.new_blit_command_encoder();
-        for (src, dst) in conv.iter().zip(main.conv_state.iter()) {
-            let (src, dst) = (buffer_pool.handle(*src), buffer_pool.handle(*dst));
-            blit.copy_from_buffer(src, 0, dst, 0, src.length());
-        }
-        for (src, dst) in delta.iter().zip(main.delta_state.iter()) {
-            let (src, dst) = (buffer_pool.handle(*src), buffer_pool.handle(*dst));
-            blit.copy_from_buffer(src, 0, dst, 0, src.length());
-        }
-        blit.end_encoding();
-        metal.commit_and_wait_labeled(&cmdbuf, "multi.rewind");
+        crate::riir::with_autorelease_pool(|| {
+            let cmdbuf = metal.queue_clone().new_command_buffer().to_owned();
+            let blit = cmdbuf.new_blit_command_encoder();
+            for (src, dst) in conv.iter().zip(main.conv_state.iter()) {
+                let (src, dst) = (buffer_pool.handle(*src), buffer_pool.handle(*dst));
+                blit.copy_from_buffer(src, 0, dst, 0, src.length());
+            }
+            for (src, dst) in delta.iter().zip(main.delta_state.iter()) {
+                let (src, dst) = (buffer_pool.handle(*src), buffer_pool.handle(*dst));
+                blit.copy_from_buffer(src, 0, dst, 0, src.length());
+            }
+            blit.end_encoding();
+            metal.commit_and_wait_labeled(&cmdbuf, "multi.rewind");
+        });
         Ok(())
     }
 
@@ -222,7 +224,7 @@ impl RsCtx<MetalBackend> {
         let t0 = std::time::Instant::now();
         let tokens: Vec<i32> = batch.iter().map(|b| b.1).collect();
         let positions: Vec<usize> = batch.iter().map(|b| b.2).collect();
-        self.decode_multi_inner(&tokens, &positions, Some(&slots), logits)?;
+        crate::riir::with_autorelease_pool(|| self.decode_multi_inner(&tokens, &positions, Some(&slots), logits))?;
         let ns = t0.elapsed().as_nanos() as u64 / n as u64;
         for _ in 0..n {
             self.experts.counters().record_decode(ns);

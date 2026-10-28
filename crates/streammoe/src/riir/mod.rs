@@ -166,6 +166,16 @@ enum EvalTokenMode {
     Batched,
 }
 
+/// Run `f` inside an Objective-C autorelease pool, drained on return.
+/// metal-rs hands out command buffers, encoders and labels
+/// autoreleased; with no pool on the calling thread they stay alive
+/// until the thread exits, so a long decode grew the footprint by
+/// ~0.35 MiB per token on a3b and went over the cap. Every public
+/// `eval_*` runs its GPU work in here, before `check_cap`.
+pub(crate) fn with_autorelease_pool<R>(f: impl FnOnce() -> R) -> R {
+    metal::objc::rc::autoreleasepool(f)
+}
+
 fn eval_token_mode() -> EvalTokenMode {
     use std::sync::OnceLock;
     static MODE: OnceLock<EvalTokenMode> = OnceLock::new();
@@ -2210,11 +2220,13 @@ impl RsCtx<MetalBackend> {
         }
         self.activate_slot(slot);
         self.experts.begin_epoch();
-        if n == 1 && eval_token_mode() == EvalTokenMode::Oracle {
-            self.step_internal_per_token_oracle(input, start_pos as i32, output)?;
-        } else {
-            self.step_internal(input, start_pos as i32, output)?;
-        }
+        with_autorelease_pool(|| {
+            if n == 1 && eval_token_mode() == EvalTokenMode::Oracle {
+                self.step_internal_per_token_oracle(input, start_pos as i32, output)
+            } else {
+                self.step_internal(input, start_pos as i32, output)
+            }
+        })?;
         self.check_cap("eval_stage")
     }
 
@@ -2244,11 +2256,13 @@ impl RsCtx<MetalBackend> {
         self.require_full_range("eval_prompt")?;
         self.activate_slot(0);
         self.experts.begin_epoch();
-        self.step_internal(
-            StageInput::Tokens(tokens),
-            start_pos as i32,
-            StageOutput::Logits(&mut logits[..]),
-        )?;
+        with_autorelease_pool(|| {
+            self.step_internal(
+                StageInput::Tokens(tokens),
+                start_pos as i32,
+                StageOutput::Logits(&mut logits[..]),
+            )
+        })?;
         self.check_cap("eval_prompt")
     }
 
@@ -2283,16 +2297,16 @@ impl RsCtx<MetalBackend> {
         self.activate_slot(0);
         self.experts.begin_epoch();
         let input = StageInput::Tokens(std::slice::from_ref(&token));
-        match eval_token_mode() {
+        with_autorelease_pool(|| match eval_token_mode() {
             EvalTokenMode::Oracle => self.step_internal_per_token_oracle(
                 input,
                 pos as i32,
                 StageOutput::Logits(logits),
-            )?,
+            ),
             EvalTokenMode::Batched => {
-                self.step_internal(input, pos as i32, StageOutput::Logits(logits))?
+                self.step_internal(input, pos as i32, StageOutput::Logits(logits))
             }
-        }
+        })?;
         self.check_cap("eval_token")
     }
 

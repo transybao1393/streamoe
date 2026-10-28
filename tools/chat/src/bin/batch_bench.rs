@@ -3,7 +3,7 @@
 //! a time.
 //!
 //!   batch_bench --model DIR [--root DIR] [--cap-gib 5] [--tokens 64]
-//!               [--overhead-mib 768]
+//!               [--overhead-mib 512]
 //!
 //! Four prompts become four admitted requests, each prefilled once and
 //! saved. Then, from the saved states, every request greedy-decodes
@@ -78,7 +78,7 @@ fn main() {
         max_decode_tokens: N_REQ,
         prefetch_guess: PrefetchGuess::CrossLayer,
         prefetch_experts: Some(6),
-        runtime_overhead: arg(&args, "--overhead-mib").map_or(768, |v| v.parse::<u64>().unwrap()) << 20,
+        runtime_overhead: arg(&args, "--overhead-mib").map_or(OpenConfig::default().runtime_overhead, |v| v.parse::<u64>().unwrap() << 20),
         ..OpenConfig::default()
     };
     let art = base.join("artifacts");

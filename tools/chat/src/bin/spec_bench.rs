@@ -3,7 +3,7 @@
 //! `rewind_tokens`, against plain one-token decode on the same prompts.
 //!
 //!   spec_bench --model DIR [--root DIR] [--cap-gib 4] [--tokens 128]
-//!              [--max-draft 3] [--prompts FILE] [--overhead-mib 768]
+//!              [--max-draft 3] [--prompts FILE] [--overhead-mib 512]
 //!
 //! Per prompt: prefill, save the state, greedy-decode `--tokens` tokens
 //! with `eval_token` (plain). Restore and decode again speculatively:
@@ -77,9 +77,7 @@ fn main() {
         prefetch_guess: PrefetchGuess::CrossLayer,
         prefetch_experts: Some(6),
         max_decode_tokens: max_draft + 1,
-        // Above the 512 MiB default: long runs outgrow it (see
-        // docs/known-issues.md); both modes get the same hot tier.
-        runtime_overhead: arg(&args, "--overhead-mib").map_or(768, |v| v.parse::<u64>().unwrap()) << 20,
+        runtime_overhead: arg(&args, "--overhead-mib").map_or(OpenConfig::default().runtime_overhead, |v| v.parse::<u64>().unwrap() << 20),
         ..OpenConfig::default()
     };
     let art = base.join("artifacts");
