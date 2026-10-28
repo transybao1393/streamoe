@@ -79,6 +79,30 @@ How to read it:
   full-attention layers, 2 KV heads), so F32 KV costs little and Turbo4
   gains nothing measurable.
 
+## Compared with MLX
+
+*Setup: the standard host (M3 Pro, 18 GB, shared with other apps, 6.4 GiB
+reclaimable at the start), Qwen3.6-35B-A3B from the same
+`mlx-community/Qwen3.6-35B-A3B-4bit` files, the photosynthesis prompt,
+greedy, 120 tokens max; MLX 0.32.4 with mlx-lm 0.32.2
+(`mlx_lm generate`); 2026-10-28.*
+
+| | streamoe, 4 GiB cap | MLX (no memory cap) |
+| --- | --- | --- |
+| Memory for the model | 3.6 GiB peak (the whole process) | 18,605 MB by mlx-lm's own estimate, above its recommended 12,288 MB on this Mac |
+| Decode | 10.7 tok/s | ~3 tokens in 628 s (~0.005 tok/s), then stopped |
+| Effect on the host | none: `F_NOCACHE` reads, inside the cap | swap 15.5 of 16 GB used; reclaimable memory 6.4 → 3.7 GiB |
+
+MLX loads every weight into GPU memory, so on a Mac with less free
+memory than the model it pages to swap and barely makes progress.
+streamoe keeps 1.29 GiB of non-expert weights and a hot tier in RAM and
+streams the rest. MLX would be the faster engine on a Mac with room for
+the whole model; this compares what each does inside the memory a
+shared 18 GB Mac can give. MLX was run once and stopped by hand: its
+GPU memory does not show in the process's RSS, so the RSS guard used
+for these runs could not stop it. llama.cpp was not measured (the
+installed build predates Qwen3.6 support).
+
 ## Prefetch and reuse
 
 *Setup: standard, 4-bit experts, 4 GiB cap; one setting changed per

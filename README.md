@@ -141,6 +141,12 @@ the 2026-10-26 build's figure for comparison:
 - The gain over 2026-10-26 comes from the hot tier: forgetting old
   topics in ~13 tokens (+20%) and borrowing idle prefill memory
   (+16%).
+- **Against MLX** on the same Mac, same 4-bit files and prompt: MLX
+  needs 18.6 GB for the model (more than this 18 GB Mac can spare with
+  other apps open), filled 15.5 of 16 GB of swap and produced about
+  3 tokens in 10 minutes before it was stopped; streamoe decodes the
+  same prompt at 10.7 tok/s in 3.6 GiB
+  ([details](docs/benchmarks.md#compared-with-mlx)).
 - Per-prompt numbers, what each feature is worth, multi-token passes
   and where a token's time goes: [`docs/benchmarks.md`](docs/benchmarks.md).
 
