@@ -407,6 +407,26 @@ history of `.claude/memory/`, which is no longer tracked.
   5–8% faster than n random ones (8 experts: 3.14 vs 3.39 ms) — a
   1.77 MB expert is already a large block. Worth it only bundled with
   a co-activation file layout, and decode reads ~1.5 misses per layer.
+- GPU SDPA for full-attention decode under a cap
+  (`STREAMMOE_DECODE_SDPA=gpu`; pread mode defaults to the CPU SDPA
+  once `kv_len` ≥ 32): a3b chat at a 4 GiB cap, n_ctx 4096, F32 KV,
+  cpu vs gpu, mean of 2 alternating rounds, 2026-10-28 — packed 3-bit
+  11.53 / 8.51 / 10.27 → 11.62 / 8.76 / 9.95 tok/s, 4-bit 9.19 / 7.30 /
+  8.85 → 9.72 / 7.08 / 9.21 (−3 to +6% per prompt, mean +1%, run-to-run
+  spread ±5%); greedy output identical, peak 3.60–3.65 GiB either way.
+  At these context lengths (≤ ~200 rows) the CPU SDPA is a sliver of
+  the token, and the GPU path still needs CMD1's round trip for the
+  host-side norms, RoPE and KV append. Default left as is; may matter
+  at long contexts — unmeasured.
+- One serial compute encoder per command buffer instead of one per
+  dispatch (~1000 small dispatches per decode token, same kernels and
+  order, so bit-identical): 0.398 vs 0.404 ms per 15-matvec layer
+  command buffer in a microbench with or without 1 ms CPU gaps, and
+  flat end to end — a3b chat at a 4 GiB cap, separate vs merged, mean
+  of 2 alternating rounds: packed 3-bit 11.25 / 8.33 / 10.14 → 11.45 /
+  8.77 / 10.04 tok/s, 4-bit 9.50 / 7.11 / 8.69 → 9.38 / 7.24 / 8.62
+  (mean +1%, within noise); greedy output identical. Encoder
+  boundaries cost nothing measurable on the M3 Pro; reverted.
 - Using idle disk time during decode (a3b, 4 GiB cap, 2026-10-26; I/O
   timeline trace of 314 tokens): of ~141 ms/token the disk is idle
   ~54 ms, but ~45 ms of that is ~1.1 ms per layer while the GPU runs
