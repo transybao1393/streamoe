@@ -10,10 +10,9 @@ history of `.claude/memory/`, which is no longer tracked.
 
 | Issue | Impact | Plan |
 | --- | --- | --- |
-| A 128-token decode after a ~130-token prompt goes over a 4 or 5 GiB cap (`OverBudget` in `eval_token`, footprint = cap). | The plan gives the hot tier everything left under the cap. On longer runs the unplanned footprint grows past the 512 MiB `runtime_overhead`. 8 tokens peak at 3.89 GiB; 48 tokens after a 25-token prompt fit. The multi-token buffers are now planned (`max_decode_tokens`, `multi_decode` account). | Find what grows (pool is flat at 0.83 GiB; likely driver / file-backed pages). Until then `runtime_overhead` 768 MiB fits (`spec_bench` default). |
 | Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) is slower than plain decode: 0.79× / 0.92× on rewrite / code prompts, 1.02× on free text (packed 3-bit, 4 GiB cap, `spec_bench`). Output is token-identical. | A verify pass of ~4 tokens costs ~425 ms in real use (310 ms in `verify_bench`, where every draft is right) and yields 2.4–2.9 tokens; break-even is ~310–370 ms. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; draft only on long matches. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
-| `diff_oracle`, the mmap-mode tests (`mmap_matches_pread`, `engine_op_diff`), the 10 GiB-cap tests and all a17b / Cogito model tests have not run (this host has ~7 GiB reclaimable; `diff_oracle` opens two contexts at once). | The other a3b model suites pass (2026-10-26): `mlx_regression`, `smoke`, `checkpoint_restore`, `consecutive_eval_prompt`, `mrope`, `layer_range`, `requests`, `streaming`, `expert_source_equivalence`, `budget_cap`, plus `graph_diff_oracle` and `batched_diff_oracle`. Suites that open uncapped ran under `STREAMMOE_TEST_CAP_GIB=4` (pread + hot tier instead of the uncapped path). | Run the rest on a host with ≥ 8 GiB free and the a17b / Cogito weights. |
+| `diff_oracle`, the 10 GiB-cap tests and all a17b / Cogito model tests have not run on this host (~7 GiB reclaimable, no a17b / Cogito weights). `diff_oracle` cannot run under a cap at all: the cap check measures the whole process, and the tests hold two contexts in one process, so the second open sees the first's ~2.5 GiB (`OverBudget: footprint 5.09 GiB exceeds cap 3.00 GiB` at a 3 GiB cap with no checkpoints). | Every other a3b model suite passes: on 2026-10-26 `mlx_regression`, `smoke`, `checkpoint_restore`, `consecutive_eval_prompt`, `mrope`, `layer_range`, `requests`, `streaming`, `expert_source_equivalence`, `budget_cap`, `graph_diff_oracle`, `batched_diff_oracle`; on 2026-10-28 `vision` (cosine 1.000000 on 3 images), `engine_op_diff` (with `STREAMMOE_EXPERT_IO=mmap`) and `mmap_matches_pread` (after the fix below). Suites that open uncapped ran under `STREAMMOE_TEST_CAP_GIB=4`. | `diff_oracle` uncapped with ~8 GiB free; the 10 GiB-cap tests with 10 GiB free; a17b / Cogito where their weights are. |
 | Vision reads small or short printed text unreliably ("STOP" → "SOM" / "Form", "HELLO 2026" → "HILLCO" at 128–160 image tokens); scenes, colors, layout and counting are right. | Not an engine bug: on the same image embeddings, MLX (mlx_vlm, 4-bit) has the same top tokens ("F", "S", "T" for "STOP"); the engine follows MLX layer by layer (cosine ≥ 0.99 at layer 32, 0.96 on the last token at layer 40, bf16 vs f32); positions equal mlx_vlm's `get_rope_index`; the encoder matches transformers exactly and mlx_vlm to 0.997; all 92 160 packed expert tensors are byte-identical to the safetensors. | Use larger images. Re-check against a bf16 / 8-bit checkpoint if text reading matters. |
 | Decode kernels run 3–4× slower than in isolation (a3b, 4 GiB cap: GPU busy ~87 of ~143 ms/token; LM head 9–11 ms vs 2.8 ms). | Reproduced without the model (`tests/matvec_decode_bench.rs`, `matvec_decode_load_pattern`): ~1 ms GPU bursts separated by ~1 ms CPU gaps leave the GPU in a slow state. A spin kernel on a second queue during the gaps restores speed when the GPU is slow but costs 8–15 ms/token when it is not. | Fewer, longer GPU bursts per token; non-blocking keep-alive in the engine; wire `dequant_matvec_4bit_qmv` (+37–55% bandwidth in isolation) into `encode_matvec`. |
 
@@ -56,6 +55,27 @@ history of `.claude/memory/`, which is no longer tracked.
 - **Parked request slots' host `LinearAttnState` untouched at open**
   (`cb717b5`): every slot's linear state is committed at a capped
   open.
+- **Long decodes went over the cap** (a 128-token decode after a
+  ~130-token prompt hit `OverBudget` in `eval_token` at 4 and 5 GiB;
+  `spec_bench` needed `runtime_overhead` 768 MiB). metal-rs hands out
+  command buffers, encoders and labels autoreleased, and the engine
+  never drained an autorelease pool, so every one stayed alive until
+  the calling thread exited: the footprint grew ~0.33 MiB per decode
+  token, without bound (a Metal-only probe: 10,000 command buffers of
+  8 encoders kept 16.2 MiB; 0.4 MiB inside a pool). Every public
+  `eval_*` (and `rewind_tokens`) now runs its GPU work inside
+  `objc::rc::autoreleasepool`, drained before `check_cap`. a3b packed
+  3-bit, 4 GiB cap, default 512 MiB overhead
+  (`budget_cap::a3b_long_decode_stays_under_4gib_cap`, 130-token
+  prompt + 128 tokens): +25 → +66 MiB from token 16 to 128 before,
+  +25 → +26 MiB after (the test now fails if warm decode grows 8 MiB).
+  `spec_bench` (three prompts, ~1,150 tokens): `OverBudget` at
+  4.00 GiB on the third prompt before; peak 3.78 GiB after, with the
+  benches back on the default overhead. `verify_bench` peak 3.85 →
+  3.77 GiB, decode speed unchanged (eval_token 115.5 / 114.5 ms/tok
+  before, 114.4 / 117.6 after, alternating runs); outputs unchanged
+  (`spec_bench` / `verify_bench` match plain decode, `mlx_regression`
+  passes).
 
 ### Correctness
 
@@ -65,6 +85,17 @@ history of `.claude/memory/`, which is no longer tracked.
 - **Metal kernel signature** (`ff6619d`, caught by the CPU-vs-Metal
   test): mixing `uint2` and `uint` thread-position inputs fails to
   compile at runtime. Use the same vector type for both.
+- **`mmap_matches_pread` failed** (step 0 bit-identical; from the first
+  `eval_token`, 243,030 logits differ by up to 1.07e-5; greedy tokens
+  identical). Not the expert bytes: the decode attention gate in
+  `full_attn_forward.rs` sends full-attention layers to the GPU SDPA in
+  mmap mode and to the CPU SDPA in pread mode (kept off the GPU for
+  a17b's streaming) once the KV cache holds 32 rows, and the two sum
+  in a different order. The test's 48-token prompt crosses 32 at its
+  first decode step. `STREAMMOE_DECODE_SDPA=cpu|gpu` now overrides the
+  gate; `expert_source_equivalence.rs` sets `cpu` for every run, and
+  mmap vs pread is bit-identical again (all 17 steps; ~6 min, peak RSS
+  1.5 GiB). Default behavior is unchanged in both modes.
 - **Flaky `footprint_is_readable_and_nonzero`** (`cb717b5`): asserted
   `peak >= current`, but the kernel updates the lifetime max lazily,
   so with other test threads allocating it failed intermittently.
@@ -175,6 +206,11 @@ history of `.claude/memory/`, which is no longer tracked.
   reductions sum in a different order, so a code at a level boundary
   can flip (reconstructions agree to ~1e-13 relative). Batched prefill
   vs per-token decode agree at cosine 0.9975 (Turbo4), not 1.0.
+- **mmap and pread decode differ by rounding** once a full-attention
+  KV cache holds 32 rows: mmap mode uses the GPU SDPA, pread mode the
+  CPU one (~1e-5 on the logits, same greedy tokens on the tests). Set
+  `STREAMMOE_DECODE_SDPA=cpu` (or `gpu`) on both to compare them bit
+  for bit.
 - **Turbo3 is slower than Turbo4**: its 3-bit unpack costs more than
   the 0.04 GiB of extra hot tier saves. Prefer Turbo4.
 
@@ -255,8 +291,17 @@ history of `.claude/memory/`, which is no longer tracked.
   `consecutive_eval_prompt`, `checkpoint_restore`, `diff_oracle`) take
   `STREAMMOE_TEST_CAP_GIB=<n>` to open under a cap; 4 is the smallest
   that holds the default checkpoints. `diff_oracle` opens two contexts
-  at once, so it still needs ~8 GiB. Run model tests under a memory
-  guard, one binary at a time.
+  at once; the cap check measures the whole process, so it cannot run
+  under any cap and needs an uncapped run with ~8 GiB free. Run model
+  tests under a memory guard, one binary at a time.
+- `engine_op_diff` and `mmap_matches_pread` need mmap mode; the auto
+  gate picks pread on an 18 GB host, so `engine_op_diff` needs
+  `STREAMMOE_EXPERT_IO=mmap` (`mmap_matches_pread` sets the mode
+  itself). `vision` needs `STREAMMOE_VISION_DIR` (the exported
+  `vision_weights`) and `STREAMMOE_VISION_REF` (reference embeddings).
+- A cap counts the whole process, the caller's buffers included: a
+  `state_save` buffer or logits rows the application holds come out
+  of `runtime_overhead` unless passed as `host_buffers`.
 - `cargo fmt` is not a gate (the crate is ~600 hunks off rustfmt); match
   the surrounding style, don't bulk-reformat.
 - zsh does not word-split variables (`$G commit` fails): export

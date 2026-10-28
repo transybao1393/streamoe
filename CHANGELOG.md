@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Long decodes went over the memory cap: Metal command buffers and
+  encoders are autoreleased and the engine never drained a pool, so
+  the footprint grew ~0.33 MiB per token until `OverBudget`. Every
+  public `eval_*` and `rewind_tokens` now runs inside an autorelease
+  pool. A 130-token prompt + 128-token decode stays flat at a 4 GiB cap
+  with the default 512 MiB `runtime_overhead`; `spec_bench` and
+  `batch_bench` drop their 768 MiB default for the library's.
+- `mmap_matches_pread` failed: mmap mode decodes full attention with
+  the GPU SDPA and pread mode with the CPU one (≥ 32 KV rows), which
+  round differently (~1e-5). The test now forces the CPU path in both
+  modes and is bit-identical.
+
+### Added
+
+- `STREAMMOE_DECODE_SDPA=cpu|gpu`: overrides the expert-I/O-mode gate
+  for decode attention (default unchanged).
+- `budget_cap::a3b_long_decode_stays_under_4gib_cap`: long decode under
+  a 4 GiB cap at the default overhead; fails if warm decode grows.
+
+### Tests
+
+- Run on 2026-10-28 (a3b, M3 Pro, ~7 GiB free): `vision` passes
+  (cosine 1.000000 on 3 images), `engine_op_diff` passes with
+  `STREAMMOE_EXPERT_IO=mmap`, `mmap_matches_pread` passes after the fix.
+  `diff_oracle` cannot run under a cap (two contexts in one process;
+  the cap counts the whole process) and needs ~8 GiB free uncapped.
+
 ## 0.2.0-beta.1 — 2026-10-27
 
 First beta. Highlights: vision input, packed 3-bit experts, several

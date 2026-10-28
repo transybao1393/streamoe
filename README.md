@@ -407,7 +407,7 @@ variables are spelled `streammoe` / `STREAMMOE_*`.
 | OLMoE-1B-7B variant (small test model: converter, NumPy reference, model tests under a cap) | Implemented — the model-level test bed on hosts without a3b weights |
 | Expert streaming: mmap mode, pread + speculative prefetch, slot ring | Exists |
 | Differential oracles (CPU vs Metal, batched vs per-token, MLX) | Exists |
-| `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; tested on a3b by the model suites ([Tests](#tests)): open fails before any I/O when the plan doesn't fit, checkpoints planned inside a 4 GiB cap |
+| `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; tested on a3b by the model suites ([Tests](#tests)): open fails before any I/O when the plan doesn't fit, checkpoints planned inside a 4 GiB cap, a 128-token decode stays flat inside a 4 GiB cap at the default overhead |
 | `F_NOCACHE` reads, fixed hot tier, routing profiles, expert-IO counters | Implemented — Phase 2; tested on a3b by the model suites ([Tests](#tests)): hot-tier sizes and profile seeding give bit-identical logits |
 | Layer-range execution (`layer_range`, `eval_stage`, f32 hidden in/out, per-range snapshots) | Implemented — Phase 3; tested on a3b by the model suites ([Tests](#tests)): whole-model `eval_stage` bit-identical to `eval_prompt`, 40 layers vs 20 + 10 + 10 within tolerance, per-range snapshots round-trip |
 | Per-request state (`max_requests` pool, `admit_request` / `drop_request` / `eval_request`) | Implemented — Phase 4; tested on a3b by the model suites ([Tests](#tests)): interleaved requests bit-identical to sequential runs |
@@ -459,16 +459,19 @@ STREAMMOE_TEST_CAP_GIB=4 cargo test --release --features model-qwen3-6-35b-a3b \
     -- --include-ignored --test-threads=1 --skip resuming_prefill_after_seq_rm_matches_full_prefill
 ```
 
-Last full run (2026-10-26, M3 Pro with 7 GiB free, release build):
+Last full run 2026-10-26, with the 2026-10-28 additions marked (M3 Pro
+with 7 GiB free, release build):
 
 | Suite | a3b result |
 | --- | --- |
 | `mlx_regression` (argmax and top-20 vs the MLX golden), `smoke` | pass |
 | `checkpoint_restore` (23), `consecutive_eval_prompt` (3), `mrope` (3) | pass |
-| `layer_range` (4), `requests` (1), `streaming` (7), `expert_source_equivalence` (2), `budget_cap` (1) | pass |
+| `layer_range` (4), `requests` (1), `streaming` (7), `expert_source_equivalence` (2) | pass |
+| `expert_source_equivalence::mmap_matches_pread`, `budget_cap` (2, with the long decode under a 4 GiB cap) — 2026-10-28 | pass |
+| `vision` (3 images vs reference embeddings, cosine 1.000000), `engine_op_diff` (with `STREAMMOE_EXPERT_IO=mmap`) — 2026-10-28 | pass |
 | `graph_diff_oracle` (22, CPU vs Metal), `batched_diff_oracle` (33, batched vs per-token kernels) | pass |
 | The default tier (169 unit and kernel tests, no model files) | pass |
-| `diff_oracle` (opens two contexts at once), the two 10 GiB-cap tests, `mmap_matches_pread` and `engine_op_diff` (need mmap mode), `vision` (needs reference embeddings) | not run — need ≥ 8 GiB free or extra data |
+| `diff_oracle` (two contexts in one process, so it cannot run under a cap), the two 10 GiB-cap tests | not run — need ~8 / 10 GiB free |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` | known failure, skipped ([known issues](docs/known-issues.md)) |
 | a17b and Cogito model tests | not run — no weights on this host |
 
