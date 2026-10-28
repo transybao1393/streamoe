@@ -19,7 +19,7 @@
 //! but not clean file-backed pages, so mmap'd model files sit outside
 //! it. Under a cap the engine reads experts with `pread` (never
 //! mmap-direct); `F_NOCACHE` reads that keep them out of the page
-//! cache are part of the same plan (`docs/fork-upgrade-plan.md`).
+//! cache are part of the same plan.
 
 use std::ops::Range;
 
@@ -39,8 +39,7 @@ const TWO_MIB: u64 = 2 << 20;
 /// 2026-10-25): ≈ 60 MiB above the exactly-planned bytes at open, and
 /// the peak through a 25-token prefill + 32 decode steps stays within
 /// 5 MiB of that. 512 MiB is that plus a > 5× margin for longer
-/// prefill chunks and larger variants (`docs/fork-upgrade-plan.md`
-/// §10). Only used under a cap.
+/// prefill chunks and larger variants. Only used under a cap.
 pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB / 2;
 
 /// One named slice of the cap.

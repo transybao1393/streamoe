@@ -225,7 +225,7 @@ Numbers below use the standard setup in `docs/benchmarks.md`.
 
 ## 0.2.0-alpha.1 — 2026-10-26
 
-First alpha of the fork revamp (`docs/fork-upgrade-plan.md`), on top
+First alpha of the fork revamp, on top
 of moeflux `0.1.0-pre.4`. The version is `0.2.0` because, in semver,
 `0.1.0-alpha.*` would sort before `0.1.0-pre.4`. APIs may still
 change. Known gaps and precautions: [`docs/known-issues.md`](docs/known-issues.md).

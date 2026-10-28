@@ -291,11 +291,6 @@ assignment above is illustrative. *Setup: OLMoE-1B-7B, 2.7k-token
 context, F32 and Turbo4 KV:* this made decode 55–58% faster; short contexts gain little, since attention is
 then a small part of each step.
 
-Details — memory accounts, the per-token data path, phases — are in
-[`docs/fork-upgrade-plan.md`](fork-upgrade-plan.md); the
-motivation is in
-[`docs/moeflux fork proposed changes.md`](moeflux%20fork%20proposed%20changes.md).
-
 ## Repository layout
 
 The project is called streamoe; its crates, binaries and environment
@@ -329,4 +324,4 @@ variables are spelled `streammoe` / `STREAMMOE_*`.
   bins), and
   `mlx_reference/` — the MLX reference diff harness
   (`crates/streammoe/tests/mlx_regression.rs` regenerates its goldens).
-- `docs/` — design notes and the upgrade plan.
+- `docs/` — architecture, benchmarks, status and tests, known issues, the chat page and model variants.

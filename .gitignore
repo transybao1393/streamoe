@@ -117,3 +117,7 @@ q_*.json
 # owner notes (chat export, decision review)
 chat-history.md
 owner-review.md
+
+# Internal working docs (plans, proposals, exploration notes) — kept
+# locally, not published
+docs/dev/
