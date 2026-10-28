@@ -98,9 +98,9 @@ p_needle.json
 # attn_threads measurement runs
 kv/attn/
 
-# Rust
+# Rust (Cargo.lock is committed: the workspace ships binaries and
+# everyone should build the same dependency versions)
 target/
-Cargo.lock
 
 # Generated per-variant index (rebuild via tools/gen_expert_index.py)
 expert_index_*.json
