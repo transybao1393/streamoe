@@ -22,10 +22,12 @@
 //!
 //! - **Lent slots.** Memory another phase owns while it is idle can be
 //!   lent to the tier as extra slots ([`HotTier::lend`]): the prefill
-//!   staging buffer (one block per expert, 0.42 GiB on a3b) is unused
-//!   during decode, already counted in the budget and already resident.
+//!   staging buffer (one block per expert, 0.42 GiB on a3b) and the
+//!   batched-prefill scratch (0.23 GiB at chunk 512) are unused during
+//!   decode, already counted in the budget and already resident.
 //!   [`HotTier::reclaim`] empties the lent slots and stops using them
-//!   before the owner writes the buffer again.
+//!   before the owner writes the buffers again; a [`Loan::scrub`]
+//!   buffer gets the bytes the tier wrote zeroed first.
 //!
 //! Counters can be saved as a routing profile and used to seed the
 //! tier at open ([`HotTier::seed_from_counts`]), so a fresh process
@@ -64,6 +66,26 @@ pub enum HotTierError {
     },
     #[error("not a routing profile (bad magic or length)")]
     ProfileFormat,
+}
+
+/// A buffer lent to the tier ([`HotTier::lend`]): as many whole slots
+/// as fit in its length.
+pub struct Loan {
+    pub buffer: Buffer,
+    /// Zero every slot the tier wrote when the loan is reclaimed, for
+    /// an owner that does not overwrite every byte it reads (scratch
+    /// whose padding rows a kernel may read: expert bytes read as f32
+    /// can be NaN, stale activations can't).
+    pub scrub: bool,
+}
+
+/// A [`Loan`] placed after the tier's own slots.
+struct Lent {
+    buffer: Buffer,
+    /// First slot index (`>= capacity`).
+    first: usize,
+    slots: usize,
+    scrub: bool,
 }
 
 /// Point-in-time hot-tier counters.
@@ -107,9 +129,9 @@ pub struct HotTier {
     chunks: Vec<Buffer>,
     slots_per_chunk: usize,
     capacity: usize,
-    /// Buffer lent by another phase and its slot count, slots
-    /// `capacity..capacity + n` ([`Self::lend`]). Set once.
-    lent: OnceLock<(Buffer, usize)>,
+    /// Buffers lent by other phases, slots `capacity..` in order
+    /// ([`Self::lend`]). Set once.
+    lent: OnceLock<Vec<Lent>>,
     expert_size: usize,
     num_layers: usize,
     num_experts: usize,
@@ -206,40 +228,51 @@ impl HotTier {
     }
 
     fn lent_slots(&self) -> usize {
-        self.lent.get().map_or(0, |&(_, n)| n)
+        self.lent.get().and_then(|l| l.last()).map_or(0, |l| l.first + l.slots - self.capacity)
     }
 
     fn active_capacity(&self, g: &Inner) -> usize {
         self.capacity + if g.lent_active { self.lent_slots() } else { 0 }
     }
 
-    /// Lend `buffer` (at least `slots * expert_size` bytes) to the tier
-    /// as `slots` extra slots, or re-lend it after [`Self::reclaim`].
-    /// The first call fixes the buffer; later calls must pass the same
-    /// one (others are ignored). The owner must not touch the buffer
-    /// until it calls [`Self::reclaim`], and no GPU work of the owner
-    /// may still read it.
-    pub fn lend(&self, buffer: &Buffer, slots: usize) {
-        if slots == 0 || (buffer.length() as usize) < slots * self.expert_size {
-            return;
-        }
-        let (lent, n) = self.lent.get_or_init(|| (buffer.clone(), slots));
-        if lent.contents() != buffer.contents() {
-            return;
+    /// Lend the buffers `loans` returns to the tier as extra slots, or
+    /// re-lend them after [`Self::reclaim`]. `loans` runs on the first
+    /// call only, which fixes the set; each buffer gives
+    /// `length / expert_size` slots (smaller ones none). The owners
+    /// must not touch the buffers until [`Self::reclaim`], and no GPU
+    /// work of theirs may still read them. Returns the lent slot count.
+    pub fn lend(&self, loans: impl FnOnce() -> Vec<Loan>) -> usize {
+        let lent = self.lent.get_or_init(|| {
+            let mut first = self.capacity;
+            let mut out = Vec::new();
+            for Loan { buffer, scrub } in loans() {
+                let slots = buffer.length() as usize / self.expert_size;
+                if slots > 0 {
+                    out.push(Lent { buffer, first, slots, scrub });
+                    first += slots;
+                }
+            }
+            out
+        });
+        let n = self.lent_slots();
+        if lent.is_empty() {
+            return 0;
         }
         let mut g = self.inner.lock().unwrap();
         if g.lent_active {
-            return;
+            return n;
         }
         let total = self.capacity + n;
         g.owner.resize(total, None);
         g.last_bound.resize(total, 0);
         g.lent_active = true;
         g.stats.capacity = total;
+        n
     }
 
-    /// Empty the lent slots and stop using them, so the owner can write
-    /// the buffer. No GPU work may still read the experts in them (the
+    /// Empty the lent slots and stop using them, so the owners can
+    /// write the buffers; zero the slots written in [`Loan::scrub`]
+    /// buffers. No GPU work may still read the experts in them (the
     /// caller is between tokens). Returns how many were resident.
     pub fn reclaim(&self) -> usize {
         let mut g = self.inner.lock().unwrap();
@@ -247,10 +280,18 @@ impl HotTier {
             return 0;
         }
         let mut evicted = 0;
-        for s in self.capacity..self.capacity + self.lent_slots() {
-            if let Some(k) = g.owner[s].take() {
-                g.map.remove(&k);
-                evicted += 1;
+        for l in self.lent.get().map_or(&[][..], Vec::as_slice) {
+            for s in l.first..l.first + l.slots {
+                if let Some(k) = g.owner[s].take() {
+                    g.map.remove(&k);
+                    evicted += 1;
+                    if l.scrub {
+                        // SAFETY: the slot lies inside `l.buffer`; no
+                        // GPU work reads it (caller contract) and the
+                        // lock excludes CPU readers.
+                        unsafe { std::ptr::write_bytes(self.slot_ptr(s as u32), 0, self.expert_size) };
+                    }
+                }
             }
         }
         g.lent_active = false;
@@ -262,8 +303,12 @@ impl HotTier {
     fn slot_location(&self, slot: u32) -> (&Buffer, usize) {
         let slot = slot as usize;
         if slot >= self.capacity {
-            let (buf, _) = self.lent.get().expect("lent slot without a lent buffer");
-            return (buf, (slot - self.capacity) * self.expert_size);
+            let l = self
+                .lent
+                .get()
+                .and_then(|ls| ls.iter().find(|l| slot < l.first + l.slots))
+                .expect("lent slot without a lent buffer");
+            return (&l.buffer, (slot - l.first) * self.expert_size);
         }
         (
             &self.chunks[slot / self.slots_per_chunk],
@@ -637,12 +682,20 @@ mod tests {
         assert!(!t.contains(0, 0));
     }
 
+    fn shared(len: usize) -> Buffer {
+        let dev = Device::system_default().unwrap();
+        dev.new_buffer(len as NSUInteger, MTLResourceOptions::StorageModeShared)
+    }
+
+    fn loan(buffer: &Buffer, scrub: bool) -> Loan {
+        Loan { buffer: buffer.clone(), scrub }
+    }
+
     #[test]
     fn lent_slots_hold_experts_until_reclaimed() {
         let t = tier(2);
-        let dev = Device::system_default().unwrap();
-        let staging = dev.new_buffer((3 * ES) as NSUInteger, MTLResourceOptions::StorageModeShared);
-        t.lend(&staging, 3);
+        let staging = shared(3 * ES);
+        assert_eq!(t.lend(|| vec![loan(&staging, false)]), 3);
         assert_eq!(t.capacity(), 5);
         for e in 0..5 {
             assert!(t.offer(0, e, &blob(e as u8 + 1)));
@@ -657,20 +710,59 @@ mod tests {
         assert_eq!(t.reclaim(), 3);
         assert_eq!((t.capacity(), t.stats().resident), (2, 2));
         assert!(t.contains(0, 1) && !t.contains(0, 2));
+        // Without scrub the owner's bytes are left as the tier wrote them.
+        let lent = unsafe { std::slice::from_raw_parts(staging.contents() as *const u8, 3 * ES) };
+        assert!(lent[2 * ES..].iter().all(|&b| b == 5));
         // Full again at 2: a new expert can't land in a reclaimed slot.
         t.record_picks(1, 0, 9);
         t.begin_epoch();
         assert!(t.offer(1, 0, &blob(9)));
         assert_eq!(t.stats().resident, 2);
         // Re-lend: empty lent slots fill first.
-        t.lend(&staging, 3);
+        assert_eq!(t.lend(|| unreachable!("the set is fixed by the first lend")), 3);
         assert!(t.offer(2, 0, &blob(7)));
         assert_eq!((t.capacity(), t.stats().resident), (5, 3));
-        // Another buffer is ignored once one is fixed.
-        let other = dev.new_buffer((8 * ES) as NSUInteger, MTLResourceOptions::StorageModeShared);
-        t.reclaim();
-        t.lend(&other, 8);
-        assert_eq!(t.capacity(), 2);
+    }
+
+    #[test]
+    fn several_loans_map_slots_and_scrub_what_was_written() {
+        let t = tier(1);
+        // 2 slots + remainder, too small for any, 1 slot (scrubbed).
+        let (a, tiny, b) = (shared(2 * ES + ES / 2), shared(ES - 1), shared(ES));
+        unsafe { std::ptr::write_bytes(a.contents() as *mut u8, 0xAA, 2 * ES + ES / 2) };
+        let n = t.lend(|| vec![loan(&a, true), loan(&tiny, true), loan(&b, false)]);
+        assert_eq!((n, t.capacity()), (3, 4));
+        for e in 0..4 {
+            assert!(t.offer(1, e, &blob(e as u8 + 1)));
+        }
+        // Slot 1 is a's first block, slot 3 is b's.
+        assert_eq!(t.lookup(1, 1).map(|(buf, off)| (buf.contents(), off)), Some((a.contents(), 0)));
+        assert_eq!(t.lookup(1, 3).map(|(buf, off)| (buf.contents(), off)), Some((b.contents(), 0)));
+        assert_eq!(t.reclaim(), 3);
+        let a_bytes = unsafe { std::slice::from_raw_parts(a.contents() as *const u8, 2 * ES + ES / 2) };
+        let b_bytes = unsafe { std::slice::from_raw_parts(b.contents() as *const u8, ES) };
+        // a's two written slots are zeroed, its unused tail untouched;
+        // b (no scrub) keeps the tier's bytes.
+        assert!(a_bytes[..2 * ES].iter().all(|&x| x == 0));
+        assert!(a_bytes[2 * ES..].iter().all(|&x| x == 0xAA));
+        assert!(b_bytes.iter().all(|&x| x == 4));
+        // An empty slot is not scrubbed: re-lend, fill only slot 1.
+        t.begin_epoch();
+        t.lend(|| unreachable!());
+        unsafe { std::ptr::write_bytes(a.contents() as *mut u8, 0xBB, 2 * ES) };
+        assert!(t.offer(2, 0, &blob(9)));
+        assert_eq!(t.reclaim(), 1);
+        assert!(a_bytes[..ES].iter().all(|&x| x == 0));
+        assert!(a_bytes[ES..2 * ES].iter().all(|&x| x == 0xBB));
+    }
+
+    #[test]
+    fn nothing_to_lend_leaves_the_tier_alone() {
+        let t = tier(2);
+        let tiny = shared(ES / 2);
+        assert_eq!(t.lend(|| vec![loan(&tiny, false)]), 0);
+        assert_eq!(t.lend(Vec::new), 0);
+        assert_eq!((t.capacity(), t.reclaim()), (2, 0));
     }
 
     #[test]

@@ -73,6 +73,12 @@ impl MetalBufferPool {
         self.layout_frozen = true;
     }
 
+    /// `true` after [`Self::freeze_layout`]: every BufId keeps the
+    /// buffer it was allocated with for the pool's lifetime.
+    pub fn layout_frozen(&self) -> bool {
+        self.layout_frozen
+    }
+
     /// Write every [`Self::alloc_aligned`] buffer once. Their heap
     /// backing is not zeroed at allocation (unlike [`BufferPool::alloc`]),
     /// so its pages stay uncommitted — invisible to the footprint —

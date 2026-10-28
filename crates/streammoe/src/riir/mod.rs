@@ -1920,25 +1920,140 @@ impl RsCtx<MetalBackend> {
     }
 
     /// Decode doesn't use the prefill staging buffer (one block per
-    /// expert, [`budget::Account::PrefillStaging`]), so lend it to the
-    /// hot tier as extra slots until the next batched prefill reclaims
-    /// it. Already counted in the budget and already resident, so the
-    /// tier grows (637 → 893 slots on a3b at a 4 GiB cap) without new
-    /// memory. No-op when already lent, without a hot tier or staging
-    /// buffer, or with `STREAMMOE_HOT_LEND=0`.
-    fn lend_staging_to_hot_tier(&self) {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var("STREAMMOE_HOT_LEND").map_or(true, |v| v != "0")) {
+    /// expert, [`budget::Account::PrefillStaging`]) or the batched
+    /// prefill scratch ([`budget::Account::PrefillScratch`]), so lend
+    /// both to the hot tier as extra slots until the next batched
+    /// prefill reclaims them ([`Self::step_internal`]). Already counted
+    /// in the budget and already resident, so the tier grows (on a3b at
+    /// a 4 GiB cap, 4-bit: 637 → 893 slots with the staging, → 1012
+    /// with the scratch too) without new memory. Only `step_internal`
+    /// touches the scratch; single-token decode, `eval_tokens` /
+    /// `eval_requests` (their own `MultiDecodeBuffers`) and
+    /// `rewind_tokens` don't. The scratch is lent only once the pool
+    /// layout is frozen (a capped open), so its buffers stay fixed, and
+    /// without the `inv_freq` table, which is uploaded once. Scratch
+    /// slots are zeroed on reclaim (`Loan::scrub`). No-op when already
+    /// lent or without a hot tier; `STREAMMOE_HOT_LEND=0` lends
+    /// nothing, `STREAMMOE_HOT_LEND_SCRATCH=0` only the staging.
+    fn lend_idle_to_hot_tier(&self) {
+        static ENABLED: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+        let &(staging, scratch) = ENABLED.get_or_init(|| {
+            let on = |k: &str| std::env::var(k).map_or(true, |v| v != "0");
+            (on("STREAMMOE_HOT_LEND"), on("STREAMMOE_HOT_LEND") && on("STREAMMOE_HOT_LEND_SCRATCH"))
+        });
+        if !staging {
             return;
         }
-        let (Some(hot), Some(mgs), Some(backend)) =
-            (self.experts.hot_tier(), self.moe_graph_scratch.as_ref(), self.backend.as_ref())
-        else {
+        let (Some(hot), Some(backend)) = (self.experts.hot_tier(), self.backend.as_ref()) else {
             return;
         };
-        if let Some(id) = mgs.expert_base {
-            hot.lend(backend.pool().handle(id), VARIANT.num_experts);
+        hot.lend(|| {
+            use io::hot_tier::Loan;
+            let pool = backend.pool();
+            let mut loans = Vec::new();
+            if let Some(id) = self.moe_graph_scratch.as_ref().and_then(|m| m.expert_base) {
+                loans.push(Loan { buffer: pool.handle(id).clone(), scrub: false });
+            }
+            if scratch && pool.layout_frozen() {
+                let bufs = self.prefill_scratch_buffers();
+                let n = loans.len();
+                for b in bufs {
+                    if loans.iter().all(|l: &Loan| l.buffer.contents() != b.contents()) {
+                        loans.push(Loan { buffer: b, scrub: true });
+                    }
+                }
+                let slots: usize =
+                    loans[n..].iter().map(|l| l.buffer.length() as usize / self.experts.expert_size()).sum();
+                eprintln!("[hot-tier] lending prefill scratch: {slots} slots");
+            }
+            loans
+        });
+    }
+
+    /// Every buffer of the batched-prefill scratch
+    /// ([`budget::Account::PrefillScratch`]) except the RoPE `inv_freq`
+    /// table, which keeps its contents across prefills.
+    fn prefill_scratch_buffers(&self) -> Vec<metal::Buffer> {
+        let Some(backend) = self.backend.as_ref() else {
+            return Vec::new();
+        };
+        let pool = backend.pool();
+        let mut out = Vec::new();
+        let mut add = |b: &metal::Buffer| out.push(b.clone());
+        if let Some(s) = &self.linear_attn_graph_scratch {
+            for b in [
+                pool.handle(s.normed),
+                pool.handle(s.qkv_stack),
+                pool.handle(s.z_stack),
+                pool.handle(s.beta_stack),
+                pool.handle(s.alpha_stack),
+                pool.handle(s.conv_out_stack),
+                pool.handle(s.g_decay_stack),
+                pool.handle(s.beta_gate_stack),
+                pool.handle(s.delta_out_stack),
+                pool.handle(s.value_out_stack),
+                pool.handle(s.o_proj_stack),
+                pool.handle(s.gate_logits),
+            ] {
+                add(b);
+            }
         }
+        if let Some(s) = &self.full_attn_graph_scratch {
+            for b in [
+                pool.handle(s.normed),
+                pool.handle(s.q_proj_stack),
+                pool.handle(s.k_proj_stack),
+                pool.handle(s.v_proj_stack),
+                pool.handle(s.q_stack),
+                pool.handle(s.q_gate_stack),
+                pool.handle(s.attn_out_stack),
+                pool.handle(s.o_proj_stack),
+                pool.handle(s.gate_logits),
+            ] {
+                add(b);
+            }
+            if let Some(id) = s.k_raw_stack {
+                add(pool.handle(id));
+            }
+            if let Some(id) = s.positions {
+                add(pool.handle(id));
+            }
+        }
+        if let Some(s) = &self.moe_graph_scratch {
+            for b in [
+                pool.handle(s.h_mid),
+                pool.handle(s.h_post),
+                pool.handle(s.shared_gate),
+                pool.handle(s.routing_indices),
+                pool.handle(s.routing_weights),
+                pool.handle(s.shared_ffn_gate),
+                pool.handle(s.shared_up),
+                pool.handle(s.shared_act),
+                pool.handle(s.shared_down),
+                pool.handle(s.bucket_input),
+                pool.handle(s.bucket_gate),
+                pool.handle(s.bucket_up),
+                pool.handle(s.bucket_act),
+                pool.handle(s.bucket_out),
+                pool.handle(s.bucket_token_idx),
+                pool.handle(s.bucket_weights),
+                pool.handle(s.out_sum),
+                pool.handle(s.expert_indices),
+                pool.handle(s.htpe),
+                pool.handle(s.hids),
+            ] {
+                add(b);
+            }
+        }
+        if let Some(s) = &self.hidden_double_buffer {
+            add(pool.handle(s.hidden_a));
+            add(pool.handle(s.hidden_b));
+        }
+        if let Some(s) = &self.head_tail_scratch {
+            add(pool.handle(s.token_ids));
+            add(pool.handle(s.logits));
+        }
+        out
     }
 
     fn ensure_linear_resources(&mut self) -> Result<(), RsError> {
@@ -2355,8 +2470,8 @@ impl RsCtx<MetalBackend> {
             return Ok(());
         }
 
-        // The prefill staging buffer was lent to the hot tier for
-        // decode: take it back before staging writes it.
+        // The prefill staging buffer and scratch were lent to the hot
+        // tier for decode: take them back before this pass writes them.
         if let Some(hot) = self.experts.hot_tier() {
             hot.reclaim();
         }
@@ -3231,7 +3346,7 @@ impl RsCtx<MetalBackend> {
         }
 
         self.ensure_linear_resources()?;
-        self.lend_staging_to_hot_tier();
+        self.lend_idle_to_hot_tier();
         let k_active = self.k_active;
         let expert_io_mode = self.expert_io_mode;
         let range = self.layer_range.clone();

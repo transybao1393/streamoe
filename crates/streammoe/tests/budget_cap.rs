@@ -188,6 +188,140 @@ mod model {
         assert!(growth < 8 << 20, "footprint grew {growth} bytes over 112 warm decode tokens");
     }
 
+    /// Decode lends the prefill staging and scratch to the hot tier; the
+    /// next prefill takes them back. A prefill after a decode that
+    /// filled the lent slots must give the same logits as the first
+    /// one, and so must the decode after it (`STREAMMOE_HOT_LEND=0` /
+    /// `STREAMMOE_HOT_LEND_SCRATCH=0` turn the lending off).
+    #[test]
+    #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+    fn a3b_prefill_after_lent_decode_matches_first_prefill() {
+        let cap = 4 * GIB;
+        let p = diff_helpers::default_a3b_paths();
+        let root = std::env::var_os("STREAMMOE_TEST_ROOT").map_or(p.root.clone(), PathBuf::from);
+        let cfg = OpenConfig { n_ctx: 4096, mem_cap: Some(cap), max_checkpoints: 0, ..OpenConfig::default() };
+        let mut ctx = Ctx::open_with(&p.weights, &p.manifest, &p.vocab, &root, false, &cfg).expect("open");
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as i32).unwrap();
+        let prompt: Vec<i32> = (0..40).map(|i| 2000 + 13 * i).collect();
+        let n = prompt.len();
+        let mut first = vec![0f32; ctx.n_vocab()];
+        ctx.eval_prompt(&prompt, 0, 0, &mut first).expect("prefill");
+        let own = ctx.expert_io_stats().hot.expect("hot tier").capacity;
+        let mut first_decode = vec![0f32; ctx.n_vocab()];
+        ctx.eval_token(argmax(&first), n, 0, &mut first_decode).expect("decode");
+        let mut logits = first_decode.clone();
+        for pos in n + 1..n + 48 {
+            ctx.eval_token(argmax(&logits), pos, 0, &mut logits).expect("decode");
+        }
+        let hot = ctx.expert_io_stats().hot.expect("hot tier");
+        eprintln!("[budget_cap] hot tier {own} own slots; while lent {} slots, {} resident", hot.capacity, hot.resident);
+        if std::env::var("STREAMMOE_HOT_LEND").map_or(true, |v| v != "0") {
+            assert!(hot.capacity > own && hot.resident == hot.capacity, "lent slots unused: {hot:?}");
+        }
+        ctx.memory_clear();
+        let mut again = vec![0f32; ctx.n_vocab()];
+        ctx.eval_prompt(&prompt, 0, 0, &mut again).expect("prefill again");
+        assert_eq!(ctx.expert_io_stats().hot.unwrap().capacity, own, "prefill reclaims the lent slots");
+        assert!(first == again, "prefill after a lent decode differs");
+        let mut again_decode = vec![0f32; ctx.n_vocab()];
+        ctx.eval_token(argmax(&again), n, 0, &mut again_decode).expect("decode again");
+        assert!(first_decode == again_decode, "decode after reclaim differs");
+    }
+
+    /// What `runtime_overhead` has to cover, over a mixed workload under
+    /// a 4 GiB cap: a three-chunk prompt, a long decode, multi-token
+    /// passes with rewinds, two requests decoded together, checkpoints
+    /// saved and restored. Logs the footprint beyond the itemized plan
+    /// (the plan fills the cap, so that is `peak - (cap - overhead)`,
+    /// within one hot-tier slot) after each phase; every eval re-checks
+    /// the cap.
+    #[test]
+    #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+    fn a3b_mixed_workload_unplanned_footprint() {
+        use streammoe::ReqId;
+        let cap = 4 * GIB;
+        let p = diff_helpers::default_a3b_paths();
+        let root = std::env::var_os("STREAMMOE_TEST_ROOT").map_or(p.root.clone(), PathBuf::from);
+        let cfg = OpenConfig {
+            n_ctx: 4096,
+            mem_cap: Some(cap),
+            max_checkpoints: 2,
+            max_decode_tokens: 4,
+            max_requests: 2,
+            ..OpenConfig::default()
+        };
+        let overhead = cfg.runtime_overhead;
+        let mut ctx = Ctx::open_with(&p.weights, &p.manifest, &p.vocab, &root, false, &cfg).expect("open");
+        let vocab = ctx.n_vocab();
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as i32).unwrap();
+        let report = |ctx: &Ctx, phase: &str| {
+            let fp = ctx.footprint().expect("footprint");
+            let mib = |b: u64| b as f64 / (1 << 20) as f64;
+            eprintln!(
+                "[reserve] {phase:<28} current {:.3} GiB, peak {:.3} GiB, unplanned at peak {:+.0} MiB of {:.0}",
+                fp.current as f64 / GIB as f64,
+                fp.peak as f64 / GIB as f64,
+                mib(fp.peak) - mib(cap - overhead),
+                mib(overhead),
+            );
+        };
+        report(&ctx, "open");
+        let mut logits = vec![0f32; vocab];
+        let prompt: Vec<i32> = (0..1500).map(|i| 1000 + (i * 37) % 20000).collect();
+        ctx.eval_prompt(&prompt, 0, 0, &mut logits).expect("prefill");
+        report(&ctx, "prefill 1500 (3 chunks)");
+        let mut pos = prompt.len();
+        for _ in 0..160 {
+            ctx.eval_token(argmax(&logits), pos, 0, &mut logits).expect("decode");
+            pos += 1;
+        }
+        report(&ctx, "decode 160");
+        let mut multi = vec![0f32; 4 * vocab];
+        for i in 0..16 {
+            let t = argmax(&logits);
+            let toks = [t, t + 1, t + 2, t + 3];
+            ctx.eval_tokens(&toks, pos, &mut multi).expect("eval_tokens");
+            let keep = if i % 2 == 0 { 2 } else { 4 };
+            ctx.rewind_tokens(keep).expect("rewind");
+            pos += keep;
+            logits.copy_from_slice(&multi[(keep - 1) * vocab..keep * vocab]);
+        }
+        report(&ctx, "eval_tokens x16 + rewind");
+        ctx.checkpoint_pos(pos as i32).expect("checkpoint");
+        let mark = pos;
+        for _ in 0..16 {
+            ctx.eval_token(argmax(&logits), pos, 0, &mut logits).expect("decode");
+            pos += 1;
+        }
+        ctx.checkpoint_pos(pos as i32).expect("checkpoint 2");
+        ctx.restore_to(mark as i32).expect("restore");
+        pos = mark;
+        for _ in 0..16 {
+            ctx.eval_token(argmax(&logits), pos, 0, &mut logits).expect("decode");
+            pos += 1;
+        }
+        report(&ctx, "checkpoint / restore");
+        let other = ReqId(1);
+        ctx.admit_request(other).expect("admit");
+        let mut one = vec![0f32; vocab];
+        let short: Vec<i32> = (0..200).map(|i| 3000 + i).collect();
+        ctx.eval_request(other, streammoe::StageInput::Tokens(&short), 0, streammoe::StageOutput::Logits(&mut one))
+            .expect("prefill request 1");
+        let mut pos1 = short.len();
+        let mut two = vec![0f32; 2 * vocab];
+        for _ in 0..32 {
+            let batch = [(ReqId::DEFAULT, argmax(&logits), pos), (other, argmax(&one), pos1)];
+            ctx.eval_requests(&batch, &mut two).expect("eval_requests");
+            logits.copy_from_slice(&two[..vocab]);
+            one.copy_from_slice(&two[vocab..]);
+            pos += 1;
+            pos1 += 1;
+        }
+        report(&ctx, "eval_requests x32");
+        let fp = ctx.footprint().expect("footprint");
+        assert!(fp.peak <= cap, "peak footprint {} over cap {cap}", fp.peak);
+    }
+
     #[test]
     #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
     fn a3b_tiny_cap_fails_at_open() {

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Decode lends the batched-prefill scratch to the hot tier as well as
+  the staging buffer, and the next batched prefill takes it back. a3b
+  chat at a 4 GiB cap, greedy output identical, peak unchanged:
+  packed 3-bit 8.47 / 7.47 / 8.27 → 8.98 / 7.70 / 8.49 tok/s on the
+  three standard prompts (hot-tier hits 64 / 38 / 54% → 67 / 44 /
+  59%); 4-bit flat within noise (hits 59 / 34 / 54% → 61 / 38 / 58%).
+  Hot tier while lent: 637 → 1012 slots at 4-bit, 893 → 1317 at packed
+  3-bit (staging + scratch). `STREAMMOE_HOT_LEND_SCRATCH=0` lends only
+  the staging buffer; `STREAMMOE_HOT_LEND=0` still turns all lending
+  off.
+
+### Added
+
+- `budget_cap::a3b_prefill_after_lent_decode_matches_first_prefill`:
+  prefill and decode after the lent slots filled match the first ones
+  bit for bit.
+- `budget_cap::a3b_mixed_workload_unplanned_footprint`: logs what
+  `runtime_overhead` covers over a mixed workload at a 4 GiB cap
+  (+104 MiB 4-bit, +76 MiB packed 3-bit at peak, of 512 MiB).
+
 ## 0.2.0-beta.2 — 2026-10-28
 
 Second beta: long runs now stay inside the memory cap (a leak of

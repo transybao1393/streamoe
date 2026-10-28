@@ -132,6 +132,27 @@ history of `.claude/memory/`, which is no longer tracked.
   a3b chat at a 4 GiB cap, greedy output identical, peak unchanged
   (3.67–3.72 GiB): hot-tier hits 51 / 22 / 42% → 58 / 34 / 54%,
   forward 124.3 → 111.8, 150.2 → 149.5, 135.2 → 119.1 ms/token.
+- **The batched-prefill scratch sat idle during decode** too
+  (`prefill_scratch`, 0.23 GiB at chunk 512 on a3b). a3b chat at a
+  4 GiB cap, scratch lending off → on, mean of 2 alternating runs,
+  greedy output identical, peak unchanged (3.62 GiB 4-bit, 3.61 GiB
+  packed 3-bit): packed 3-bit 8.47 / 7.47 / 8.27 → 8.98 / 7.70 /
+  8.49 tok/s (forward 117.8 → 111.1, 133.6 → 129.6, 120.6 →
+  117.5 ms/token), hot-tier hits 64 / 38 / 54% → 67 / 44 / 59%;
+  4-bit flat within noise (8.07 / 6.53 / 7.67 → 7.73 / 6.75 /
+  7.68 tok/s, one slow run in the first; hits 59 / 34 / 54% → 61 /
+  38 / 58%). It is lent with the staging buffer: 637 + 256 + 119 =
+  1012 slots at 4-bit, 893 + 256 + 168 = 1317 at packed 3-bit (each
+  buffer gives `length / expert_size` slots, so ~85% of the ideal).
+  Only `step_internal` (batched prefill, `eval_stage` with n > 1)
+  touches the scratch; it reclaims first. Lent only once the pool
+  layout is frozen (any capped open) and never the RoPE `inv_freq`
+  table, which is uploaded once. Slots the tier wrote are zeroed on
+  reclaim (`Loan::scrub`): expert bytes read as f32 can be NaN, stale
+  activations can't. `STREAMMOE_HOT_LEND_SCRATCH=0` lends only the
+  staging buffer. `budget_cap::a3b_prefill_after_lent_decode_matches_first_prefill`
+  checks that the prefill and decode after a decode that filled every
+  lent slot are bit-identical to the first ones.
 - **Single-token 4-bit matvecs use `dequant_matvec_4bit_qmv`**
   (1.3–1.5× v3's bandwidth in isolation; `STREAMMOE_MATVEC_QMV=0`
   restores v3). LM head 8.2 → 5.9 ms, full-attention projections

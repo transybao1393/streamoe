@@ -256,7 +256,7 @@ impl RsCtx<MetalBackend> {
             *multi_decode = Some(MultiDecodeBuffers::new(pool, main, expert_size, tokens, layer_range));
         }
         self.multi_decode.as_mut().expect("just built").last_pass = None;
-        self.lend_staging_to_hot_tier();
+        self.lend_idle_to_hot_tier();
         let k_active = self.k_active;
         let expert_io_mode = self.expert_io_mode;
         let range = self.layer_range.clone();
