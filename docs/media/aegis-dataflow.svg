@@ -9,19 +9,21 @@
     .box-s { fill: #ffffff; font-size: 11.5px; opacity: .92; }
     .step circle { fill: #ffffff; stroke-width: 2; }
     .step text { font-size: 11px; font-weight: 700; text-anchor: middle; }
-    .flow { fill: none; stroke-width: 2.2; stroke-dasharray: 8 6; animation: dash 0.9s linear infinite; }
+    .flow { fill: none; stroke-width: 2.2; stroke-dasharray: 8 6; animation: dash 0.8s linear infinite; }
     .flow.slow { animation-duration: 1.6s; }
-    .flow.thick { stroke-width: 4.5; stroke-dasharray: 12 7; animation-duration: 0.7s; }
+    .flow.thick { stroke-width: 4.5; stroke-dasharray: 12 7; animation-name: dash-thick; animation-duration: 0.8s; }
     .tok { stroke: #4f46e5; } .img { stroke: #0f766e; } .mem { stroke: #b45309; }
     .ada { stroke: #7c3aed; } .ssd { stroke: #475569; }
     @keyframes dash { to { stroke-dashoffset: -14; } }
+    /* thick dashes repeat every 19 px */
+    @keyframes dash-thick { to { stroke-dashoffset: -19; } }
     @keyframes rim { 0%, 100% { stroke-opacity: .35; } 50% { stroke-opacity: 1; } }
-    .rim { animation: rim 3s ease-in-out infinite; }
+    .rim { animation: rim 3.2s ease-in-out infinite; }
     /* each box lights up as the token packet reaches it (3.2 s loop) */
     @keyframes hit { 0% { stroke-opacity: .95; } 12%, 100% { stroke-opacity: 0; } }
     .node { stroke: #ffffff; stroke-width: 3; stroke-opacity: 0; animation: hit 3.2s linear infinite; }
     @keyframes blink { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
-    .led { animation: blink 0.5s ease-in-out infinite; }
+    .led { animation: blink 0.4s ease-in-out infinite; }
     @keyframes breathe { 0%, 100% { opacity: .85; } 50% { opacity: 1; } }
     .breathe { animation: breathe 1.6s ease-in-out infinite; }
     @media (prefers-color-scheme: dark) {
@@ -81,46 +83,46 @@
       <animateMotion dur="3.2s" repeatCount="indefinite" path="M150,240 H965 V16 H85 V192"/>
     </circle>
     <circle r="4" fill="#a5b4fc" stroke="#4f46e5" stroke-width="2">
-      <animateMotion dur="2s" repeatCount="indefinite" path="M795,200 V172 H490 V197"/>
+      <animateMotion dur="1.6s" repeatCount="indefinite" path="M795,200 V172 H490 V197"/>
     </circle>
     <circle r="4.5" fill="#99f6e4" stroke="#0f766e" stroke-width="2">
-      <animateMotion dur="2.6s" repeatCount="indefinite" path="M120,195 V105 H387"/>
+      <animateMotion dur="3.2s" repeatCount="indefinite" path="M120,195 V105 H387"/>
     </circle>
     <circle r="4" fill="#99f6e4" stroke="#0f766e" stroke-width="2">
-      <animateMotion dur="1.3s" repeatCount="indefinite" path="M455,140 V197"/>
+      <animateMotion dur="1.6s" repeatCount="indefinite" path="M455,140 V197"/>
     </circle>
     <circle r="4" fill="#e2e8f0" stroke="#475569" stroke-width="2">
-      <animateMotion dur="3s" repeatCount="indefinite" path="M1180,422 V125 H523"/>
+      <animateMotion dur="3.2s" repeatCount="indefinite" path="M1180,422 V125 H523"/>
     </circle>
     <circle r="5.5" fill="#e2e8f0" stroke="#475569" stroke-width="2">
-      <animateMotion dur="2.2s" repeatCount="indefinite" path="M1180,540 V552 H620 V525"/>
+      <animateMotion dur="1.6s" repeatCount="indefinite" path="M1180,540 V552 H620 V525"/>
     </circle>
     <circle r="5.5" fill="#e2e8f0" stroke="#475569" stroke-width="2">
-      <animateMotion dur="2.2s" begin="1.1s" repeatCount="indefinite" path="M1180,540 V552 H620 V525"/>
+      <animateMotion dur="1.6s" begin="-0.8s" repeatCount="indefinite" path="M1180,540 V552 H620 V525"/>
     </circle>
     <circle r="4" fill="#ddd6fe" stroke="#7c3aed" stroke-width="2">
-      <animateMotion dur="1.2s" repeatCount="indefinite" path="M625,280 V327"/>
+      <animateMotion dur="1.6s" repeatCount="indefinite" path="M625,280 V327"/>
     </circle>
     <circle r="4" fill="#ddd6fe" stroke="#7c3aed" stroke-width="2">
-      <animateMotion dur="1.2s" begin="0.6s" repeatCount="indefinite" path="M610,410 V437"/>
+      <animateMotion dur="1.6s" begin="-0.8s" repeatCount="indefinite" path="M610,410 V437"/>
     </circle>
     <circle r="4" fill="#fde68a" stroke="#b45309" stroke-width="2">
-      <animateMotion dur="1.8s" repeatCount="indefinite" path="M700,470 H745 V283"/>
+      <animateMotion dur="1.6s" repeatCount="indefinite" path="M700,470 H745 V283"/>
     </circle>
     <circle r="4" fill="#fde68a" stroke="#b45309" stroke-width="2">
-      <animateMotion dur="1.8s" begin="0.9s" repeatCount="indefinite" path="M845,440 V283"/>
+      <animateMotion dur="1.6s" begin="-0.8s" repeatCount="indefinite" path="M845,440 V283"/>
     </circle>
     <circle r="4" fill="#fde68a" stroke="#b45309" stroke-width="2">
       <animateMotion dur="1.6s" repeatCount="indefinite" path="M700,500 H757"/>
     </circle>
     <circle r="4" fill="#fde68a" stroke="#b45309" stroke-width="2">
-      <animateMotion dur="2.4s" repeatCount="indefinite" path="M300,440 V380 H430 V283"/>
+      <animateMotion dur="3.2s" repeatCount="indefinite" path="M300,440 V380 H430 V283"/>
     </circle>
   </g>
 
   <!-- outside the cap -->
   <g filter="url(#sh)">
-    <rect class="node" x="20" y="195" width="130" height="90" rx="12" fill="#4f46e5" style="animation-delay: 2.95s"/>
+    <rect class="node" x="20" y="195" width="130" height="90" rx="12" fill="#4f46e5" style="animation-delay: -0.25s"/>
     <text class="box-t" x="85" y="228" text-anchor="middle">Application</text>
     <text class="box-s" x="85" y="248" text-anchor="middle">drama_llama</text>
     <text class="box-s" x="85" y="264" text-anchor="middle">tools/chat</text>
@@ -135,7 +137,7 @@
 
   <!-- compute row: E -->
   <g filter="url(#sh)">
-    <rect class="node" x="210" y="200" width="130" height="80" rx="12" fill="#b91c1c" style="animation-delay: 0.1s"/>
+    <rect class="node" x="210" y="200" width="130" height="80" rx="12" fill="#b91c1c" style="animation-delay: -3.10s"/>
     <text class="box-t" x="275" y="228" text-anchor="middle">Ctx + plan</text>
     <text class="box-s" x="275" y="247" text-anchor="middle">every account sized</text>
     <text class="box-s" x="275" y="263" text-anchor="middle">OverBudget at open</text>
@@ -144,22 +146,22 @@
     <text class="box-t" x="455" y="98" text-anchor="middle">Vision encoder</text>
     <text class="box-s" x="455" y="118" text-anchor="middle">CPU · image → tokens</text>
 
-    <rect class="node" x="390" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: 0.37s"/>
+    <rect class="node" x="390" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: -2.83s"/>
     <text class="box-t" x="455" y="228" text-anchor="middle">Attention</text>
     <text class="box-s" x="455" y="247" text-anchor="middle">linear · full · MLA</text>
     <text class="box-s" x="455" y="263" text-anchor="middle">GPU + CPU heads</text>
 
-    <rect class="node" x="560" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: 0.64s"/>
+    <rect class="node" x="560" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: -2.56s"/>
     <text class="box-t" x="625" y="228" text-anchor="middle">Router</text>
     <text class="box-s" x="625" y="247" text-anchor="middle">top-8 of 256 on the</text>
     <text class="box-s" x="625" y="263" text-anchor="middle">model's own logits</text>
 
-    <rect class="node" x="730" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: 0.9s"/>
+    <rect class="node" x="730" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: -2.30s"/>
     <text class="box-t" x="795" y="228" text-anchor="middle">Expert kernels</text>
     <text class="box-s" x="795" y="247" text-anchor="middle">4-bit · packed 3-bit</text>
     <text class="box-s" x="795" y="263" text-anchor="middle">hot experts first</text>
 
-    <rect class="node" x="900" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: 1.17s"/>
+    <rect class="node" x="900" y="200" width="130" height="80" rx="12" fill="#0f766e" style="animation-delay: -2.03s"/>
     <text class="box-t" x="965" y="228" text-anchor="middle">LM head</text>
     <text class="box-s" x="965" y="247" text-anchor="middle">logits →</text>
     <text class="box-s" x="965" y="263" text-anchor="middle">next token</text>
