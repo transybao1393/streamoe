@@ -11,7 +11,7 @@ Guarded · In-memory · Streaming; see [Architecture](#architecture--aegis).
 
 Today that means a 35-billion-parameter vision-language model —
 Qwen3.6-35B-A3B, 19 GiB at 4-bit — answering questions about images
-in **4 GiB of RAM** on a shared laptop, at 6–9 tokens per second
+in **4 GiB of RAM** on a shared laptop, at 10–11 tokens per second (8–14 from a 3 to a 6 GiB cap)
 ([Speed](#speed-at-a-glance)), making the same greedy choices as the MLX reference.
 
 <p align="center">
@@ -55,7 +55,7 @@ in the design follows from that inversion.
 - **Disk is a tier, not a fallback.** A Mac's internal SSD is rated
   ~6.7 GB/s (~4.4 GB/s at decode's read sizes). With `F_NOCACHE`
   streaming, a fixed hot tier and speculative prefetch, a model 4–6×
-  larger than its budget decodes at 6–9 tokens per second.
+  larger than its budget decodes at 8–14 tokens per second.
 - **Speculation never changes the math.** Prefetch guesses, cross-layer
   predictions and hot-tier admission only decide *what to read early*.
   Routing always uses the model's own logits; output is identical
@@ -146,7 +146,7 @@ pie showData
 
 With packed 3-bit experts the prefill staging shrinks to 0.33 GiB and
 the hot tier grows to 1.14 GiB. In the [speed runs](docs/benchmarks.md#speed) the peak
-stayed 0.26–0.31 GiB under every cap (2.7 / 3.7 / 4.7 / 5.7 GiB at
+stayed 0.35–0.39 GiB under every cap (2.6 / 3.6 / 4.6 / 5.6 GiB at
 3 / 4 / 5 / 6 GiB). Long runs hold too: a 130-token prompt plus a
 128-token answer under a 4 GiB cap grows by 1 MiB between the 16th and
 the 128th token, at the default 0.5 GiB runtime allowance (it grew
@@ -156,12 +156,14 @@ shrinks the KV slice to 0.02 GiB and the hot tier grows by the
 difference; on models with large KV caches (OLMoE-1B-7B at n_ctx 4096)
 that trade alone made decode 44% faster.
 
-### I · In-memory: prefill staging serves decode
+### I · In-memory: idle prefill memory serves decode
 
-The prefill staging buffer (0.42 GiB, one slot per expert) is only
-written while a prompt is read. During decode it would sit idle, so the
-hot tier borrows it: 256 more expert slots without a byte over the
-plan. The next prompt takes it back before its first chunk.
+The prefill staging buffer (0.42 GiB, one slot per expert) and the
+batched-prefill scratch (0.23 GiB) are only written while a prompt is
+read. During decode they would sit idle, so the hot tier borrows them:
+375 more expert slots (4-bit) without a byte over the plan. The next
+prompt takes them back before its first chunk, zeroing what the tier
+wrote into the scratch.
 
 ```mermaid
 stateDiagram-v2
@@ -170,7 +172,7 @@ stateDiagram-v2
     classDef decode fill:#b45309,stroke:#78350f,color:#ffffff
 
     state "Prefill<br/>staging holds one layer's experts<br/>hot tier: 637 slots" as P
-    state "Decode<br/>staging lent to the hot tier<br/>hot tier: 637 + 256 slots" as D
+    state "Decode<br/>staging + scratch lent to the hot tier<br/>hot tier: 637 + 256 + 119 slots" as D
 
     [*] --> P: prompt arrives
     P --> D: first decode token · lend()
@@ -180,10 +182,17 @@ stateDiagram-v2
     class D decode
 ```
 
-In the [standard setup](docs/benchmarks.md#test-setup) (4-bit experts, 4 GiB cap) this
-lifts hot-tier hits from 51 / 22 / 42% to 59 / 34 / 54% on the three
-test prompts and decode from 6.9 to 7.4 tok/s (+7%).
-`STREAMMOE_HOT_LEND=0` turns it off.
+The tier also forgets fast: popularity counters halve every 4096 picks
+(~13 tokens), so when the topic changes the last topic's experts give
+up their slots within a sentence instead of holding them for ~200
+tokens.
+
+In the [standard setup](docs/benchmarks.md#test-setup) (4-bit experts, 4 GiB cap), lending
+lifts hot-tier hits from 57 / 47 / 60% to 67 / 56 / 70% on the three
+test prompts and decode from 8.8 to 10.2 tok/s (+16%); fast forgetting
+alone is worth 8.5 → 10.2 tok/s (+20%,
+[Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse)). `STREAMMOE_HOT_LEND=0` turns
+lending off; `STREAMMOE_HOT_DECAY=<picks>` sets the forgetting period.
 
 ### E · Expert: packed 3-bit
 
@@ -203,7 +212,7 @@ flowchart LR
     Q3["<b>Packed 3-bit expert</b> · 1.31 MiB (−22%)<br/>gate | up | down<br/>8 codes → 3 bytes (24-bit pack)<br/>bf16 scale + bias per 64"]:::s
     OPEN["<b>At open</b><br/>layout read from the<br/>layer file size"]:::e
     K["<b>Kernels</b><br/>dequant_matvec_3bit (decode)<br/>gather_mm_id bits=3 (prefill)"]:::e
-    RAM["<b>4 GiB cap</b><br/>hot tier 637 → 893 experts<br/>7.4 → 8.1 tok/s"]:::i
+    RAM["<b>4 GiB cap</b><br/>hot tier 637 → 893 experts<br/>10.2 → 11.4 tok/s"]:::i
 
     Q4 -- "requant_experts.py<br/>pack_experts.py" --> Q3 --> OPEN --> K --> RAM
 ```
@@ -247,17 +256,18 @@ sequenceDiagram
 ```
 
 On Qwen3.6-35B-A3B (40 layers, 256 experts, 8 picked per token) the
-cross-layer guess with 6 experts prefetched uses 78–121 prefetched
-experts per token instead of 13–35 with the previous-token guess, and
-decodes 14% faster (6.5 → 7.4 tok/s, 4-bit, 4 GiB) — with identical
+cross-layer guess with 6 experts prefetched uses 50–71 prefetched
+experts per token instead of 5–8 with the previous-token guess, and
+decodes 12% faster (9.1 → 10.2 tok/s, 4-bit, 4 GiB) — with identical
 output; see [Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse). Guesses only decide *what to
 read early*; routing always uses the model's own logits.
 
-A decode token at a 4 GiB cap (4-bit experts, 138 ms) spends ~44% of
-its time in GPU kernels, ~36% waiting on the SSD and ~20% on CPU work
-and GPU wake-up gaps; the CPU uses ~0.7 of 11 cores. So the levers are
-fewer bytes from disk and fewer, longer GPU bursts — not more threads
-([breakdown](docs/benchmarks.md#where-a-decode-token-goes)).
+A decode token at a 4 GiB cap (4-bit experts, ~99 ms) spends ~37% of
+its time waiting on the SSD; the rest is GPU kernels, CPU work and GPU
+wake-up gaps (split in the
+[breakdown](docs/benchmarks.md#where-a-decode-token-goes), measured on
+an earlier build); the CPU uses ~0.6 of 11 cores. So the levers are
+fewer bytes from disk and fewer, longer GPU bursts — not more threads.
 
 ### S · Streaming: measured, not assumed
 
@@ -418,9 +428,9 @@ variables are spelled `streammoe` / `STREAMMOE_*`.
 | KV cache formats (`kv_format`: F32, F16, TurboQuant 4/3-bit; snapshot v4) | Implemented — F32 default; on OLMoE-1B-7B at a 3 GiB cap and n_ctx 4096, F16 / Turbo4 shrink KV 1.00 → 0.56 / 0.19 GiB (incl. prefill scratch) and decode +29% / +44% faster (the freed memory goes to the hot tier); answers correct in every format. MLA (Cogito) stays F32 |
 | Decode attention threads (`attn_threads`, default 4) | Implemented — bit-identical output; on OLMoE at 2.7k context decode +55–58% tok/s (F32 and Turbo4) |
 | Vision for Qwen3.5 / 3.6 (`riir::vision` CPU encoder, `eval_stage_mrope`, `tools/export_vision.py`) | Implemented — encoder matches transformers exactly and mlx_vlm to 0.997; whole pipeline checked layer by layer against MLX on a3b under a 4 GiB cap (encoder 137 MiB, ~1–3 s per image). Small printed text reads poorly, as it does in MLX |
-| Decode I/O: per-slot prefetch waits, prefill staging lent to the hot tier (`STREAMMOE_HOT_LEND`), single-token `qmv` matvec kernel (`STREAMMOE_MATVEC_QMV`), hot experts dispatched before disk reads (`STREAMMOE_EARLY_EXPERTS`) | Implemented — output unchanged; effect of each in [Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse) |
-| Packed 3-bit experts (`tools/requant_experts.py` → `tools/pack_experts.py`, `root-3bit/`; layout detected from the files), quality harness (`tools/chat` `quality` bin: KL, top-1, perplexity, scored tasks), `--precision 4\|3` in the chat page | Implemented — 1.31 MiB per expert vs 1.69 (−22%); vs 4-bit: KL 0.048, top-1 agreement 93%, 10/10 tasks; 9–15% more tok/s at every cap from 3 to 6 GiB ([Speed](#speed-at-a-glance)). 2-bit fails 4 of 10 tasks |
-| Several tokens per pass: `eval_tokens` + `rewind_tokens` (one sequence, speculative checks), `eval_requests` (one token from each of up to 4 requests), `OpenConfig::max_decode_tokens` (buffers in the plan) | Implemented — logits bit-identical to one token per pass; parallel decoding 1.3× total throughput, speculative decoding not yet a win ([Several tokens per pass](docs/benchmarks.md#several-tokens-per-pass)) |
+| Decode I/O: per-slot prefetch waits, prefill staging and scratch lent to the hot tier (`STREAMMOE_HOT_LEND`, `STREAMMOE_HOT_LEND_SCRATCH`), hot-tier popularity that fades in ~13 tokens (`STREAMMOE_HOT_DECAY`), single-token `qmv` matvec kernel (`STREAMMOE_MATVEC_QMV`), hot experts dispatched before disk reads (`STREAMMOE_EARLY_EXPERTS`) | Implemented — output unchanged; effect of each in [Prefetch and reuse](docs/benchmarks.md#prefetch-and-reuse) |
+| Packed 3-bit experts (`tools/requant_experts.py` → `tools/pack_experts.py`, `root-3bit/`; layout detected from the files), quality harness (`tools/chat` `quality` bin: KL, top-1, perplexity, scored tasks), `--precision 4\|3` in the chat page | Implemented — 1.31 MiB per expert vs 1.69 (−22%); vs 4-bit: KL 0.048, top-1 agreement 93%, 10/10 tasks; 11–14% more tok/s at every cap from 3 to 6 GiB ([Speed](#speed-at-a-glance)). 2-bit fails 4 of 10 tasks |
+| Several tokens per pass: `eval_tokens` + `rewind_tokens` (one sequence, speculative checks), `eval_requests` (one token from each of up to 4 requests), `OpenConfig::max_decode_tokens` (buffers in the plan) | Implemented — logits bit-identical to one token per pass; parallel decoding 1.3× total throughput, speculative decoding 1.08–1.12× in `spec_bench` with the match-length guard ([Several tokens per pass](docs/benchmarks.md#several-tokens-per-pass)) |
 | Router policy, per-expert precision | Planned — Phases 7–8 |
 
 Build with exactly one model feature (`model-qwen3-6-35b-a3b`,
@@ -470,6 +480,7 @@ with 7 GiB free, release build):
 | `checkpoint_restore` (23), `consecutive_eval_prompt` (3), `mrope` (3) | pass |
 | `layer_range` (4), `requests` (1), `streaming` (7), `expert_source_equivalence` (2) | pass |
 | `expert_source_equivalence::mmap_matches_pread`, `budget_cap` (2, with the long decode under a 4 GiB cap) — 2026-10-28 | pass |
+| Re-run 2026-10-28 with the prefill scratch lent to the hot tier: `streaming` (7), `requests` (7), `checkpoint_restore` (23), `expert_source_equivalence` (3), `mrope` (3), `mlx_regression`, `vision`; then with the ~13-token hot-tier decay as well: `budget_cap` (10, incl. prefill after a fully lent decode bit-identical to the first), `streaming` (7), the unit tier (151) | pass |
 | `vision` (3 images vs reference embeddings, cosine 1.000000), `engine_op_diff` (with `STREAMMOE_EXPERT_IO=mmap`) — 2026-10-28 | pass |
 | `graph_diff_oracle` (22, CPU vs Metal), `batched_diff_oracle` (33, batched vs per-token kernels) | pass |
 | The default tier (169 unit and kernel tests, no model files) | pass |
@@ -489,9 +500,9 @@ Fixed bugs, open issues and traps are listed in
   routing, a policy outside the engine decides per expert whether to
   run it at 4-bit, at 3-bit or skip it — trading quality for I/O one
   expert at a time instead of quantizing the whole model.
-- **Fewer, longer GPU bursts.** ~87 ms of every token is GPU and CPU
-  work that does not shrink with the cap (constant from 3 to 6 GiB,
-  [Speed](docs/benchmarks.md#speed)). GPU timestamps (`STREAMMOE_GPU_TIMING`) show decode
+- **Fewer, longer GPU bursts.** 51–72 ms of every token is GPU and CPU
+  work rather than disk wait, more than half the token at every cap
+  ([Speed](docs/benchmarks.md#speed)). GPU timestamps (`STREAMMOE_GPU_TIMING`) show decode
   kernels running 3–4× slower than in isolation: the CPU must see each
   layer's routing before it can fetch that layer's experts, and the
   resulting short bursts leave the GPU in a slow state. Dispatching hot
@@ -515,10 +526,10 @@ hottest experts in RAM and streams the rest from the SSD, so it runs in
 | Resource | Cost |
 | --- | --- |
 | Disk | 19.0 GiB download (`mlx-community/Qwen3.6-35B-A3B-4bit`) + 19.0 GiB converted (1.29 GiB non-expert weights, 16.9 GiB 4-bit experts, 0.84 GiB vision weights) ≈ 38 GiB; packed 3-bit experts add 13.1 GiB. The MLX download can be deleted after conversion if you don't need `engine_op_diff` |
-| RAM | Whatever you cap it at: peaks of 2.7 / 3.7 / 4.7 / 5.7 GiB at 3 / 4 / 5 / 6 GiB caps. Below ~3 GiB the fixed parts don't fit and `open_with` fails with `OverBudget` |
+| RAM | Whatever you cap it at: peaks of 2.6 / 3.6 / 4.6 / 5.6 GiB at 3 / 4 / 5 / 6 GiB caps. Below ~3 GiB the fixed parts don't fit and `open_with` fails with `OverBudget` |
 | Page cache | None from expert reads: under a cap they use `F_NOCACHE`, so the file cache other processes rely on is not evicted |
-| CPU | ~0.7 cores while decoding: 4 threads for decode attention (`attn_threads`) plus the I/O threads; the GPU does the rest |
-| SSD | 87–477 MiB read per token, depending on cap, expert format and prompt ([per prompt](docs/benchmarks.md#speed)) |
+| CPU | ~0.6 cores while decoding: 4 threads for decode attention (`attn_threads`) plus the I/O threads; the GPU does the rest |
+| SSD | 60–382 MiB read per token, depending on cap, expert format and prompt ([per prompt](docs/benchmarks.md#speed)) |
 
 Fixed parts of the plan (n_ctx 4096): weights 1.29 GiB, runtime
 overhead 0.50, prefill staging 0.42 (0.33 packed 3-bit), prefill scratch
@@ -535,20 +546,22 @@ Decode tok/s over all three prompts:
 
 | Cap | 4-bit experts | Packed 3-bit experts | Peak footprint |
 | --- | --- | --- | --- |
-| 3 GiB | 6.5 | 7.5 | 2.7 GiB |
-| 4 GiB | 7.4 | 8.1 | 3.7 GiB |
-| 5 GiB | 7.9 | 8.6 | 4.7 GiB |
-| 6 GiB | 8.3 | 9.2 | 5.7 GiB |
+| 3 GiB | 8.3 | 9.4 | 2.6 GiB |
+| 4 GiB | 10.2 | 11.4 | 3.6 GiB |
+| 5 GiB | 11.5 | 13.1 | 4.6 GiB |
+| 6 GiB | 12.8 | 14.2 | 5.6 GiB |
 
-- Packed 3-bit is 9–15% faster at every cap. Against 4-bit: KL 0.048,
+- Packed 3-bit is 11–14% faster at every cap. Against 4-bit: KL 0.048,
   the same top token 93% of the time, all 10 scored tasks right.
 - Output is identical across caps; with 4-bit experts it matches the
   MLX reference (argmax equal, top-20 overlap 20/20).
-- ~87 ms of each token is GPU and CPU work that a bigger cap does not
-  remove, so with every expert in RAM decode would reach about
-  11.5 tok/s (*estimated*; this host can't spare 16–20 GiB).
+- The part of a token that is not disk wait is 51–72 ms, and it shrinks
+  as the cap grows (fewer misses to handle). With every expert in RAM
+  decode would reach roughly 18 tok/s (*estimated*; this host can't
+  spare 16–20 GiB).
 - Several requests at once (`eval_requests`, batch 4) give 1.30–1.33×
-  the total throughput; speculative decoding is not a win yet.
+  the total throughput; speculative decoding with the match-length
+  guard (`spec_bench`) gives 1.08–1.12×, 1.17–1.26× on copy-heavy text.
 
 Per-prompt numbers, hot-tier hits, disk reads, prefetch and reuse
 comparisons, multi-token passes, the per-token breakdown and vision
@@ -567,7 +580,7 @@ python3 -I scripts/export_vocab.py $M/mlx-4bit/tokenizer.json $M/artifacts/vocab
 python3 -I tools/gen_expert_index.py --mlx-path $M/mlx-4bit --out $M/expert_index.json
 python3 -I scripts/repack_experts.py --index $M/expert_index.json --output-dir $M/root/packed_experts
 python3 -I tools/export_vision.py --model $M/mlx-4bit --out $M/artifacts   # optional: images
-# optional: packed 3-bit experts (13.1 GiB more disk; 9–15% faster, slightly lower quality)
+# optional: packed 3-bit experts (13.1 GiB more disk; 11–14% faster, slightly lower quality)
 python3 -I tools/requant_experts.py $M/root --out 3=$M/root-3bit-nibble
 python3 -I tools/pack_experts.py $M/root-3bit-nibble $M/root-3bit && rm -r $M/root-3bit-nibble
 ```
@@ -613,14 +626,14 @@ toggled. An **Experts** selector in the header switches between
 4-bit and packed 3-bit experts (the server restarts itself in ~2 s
 and frees the old model first, so memory stays under the cap). Its
 defaults are the [standard setup](docs/benchmarks.md#test-setup) with 4-bit experts:
-7.4 tok/s over the three test prompts at a 4 GiB cap. Stop the server
+10.2 tok/s over the three test prompts at a 4 GiB cap. Stop the server
 (Ctrl-C) to give the memory back.
 
 #### What it looks like
 
 *Setup: standard, 4-bit experts, 4 GiB cap; recorded with headless
-Chrome on 2026-10-26, a few engine changes before the [Speed](docs/benchmarks.md#speed)
-runs, with other prompts.* Real time — the GIFs are not sped up.
+Chrome on 2026-10-26, on a build before the 2026-10-28 [Speed](docs/benchmarks.md#speed)
+runs (slower than today's), with other prompts.* Real time — the GIFs are not sped up.
 
 **Text** — 6.7 tok/s, 3.66 GiB of the 4 GiB cap:
 

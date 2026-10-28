@@ -12,9 +12,9 @@ Every number here and in the README comes from this setup unless its
 
 | | Standard setup |
 | --- | --- |
-| Host | MacBook Pro, M3 Pro (11-core CPU), 18 GB RAM, internal SSD; shared with other services, 7–8 GiB reclaimable during the runs |
+| Host | MacBook Pro, M3 Pro (11-core CPU), 18 GB RAM, internal SSD; shared with other services, 7–10 GiB reclaimable during the runs |
 | Model | Qwen3.6-35B-A3B from `mlx-community/Qwen3.6-35B-A3B-4bit`, converted as in [Setup](../README.md#setup); experts 4-bit (`root/`) or packed 3-bit (`root-3bit/`) |
-| Engine | `tools/chat` release build, 2026-10-26; a fresh server per run, the KV cache reset between prompts |
+| Engine | `tools/chat` release build, 2026-10-28 (prefill staging and scratch lent to the hot tier, hot-tier decay every 4096 picks); a fresh server per run, the KV cache reset between prompts |
 | Settings | n_ctx 4096, F32 KV, cross-layer guess with 6 experts prefetched, `attn_threads` 4, vision on (its 0.13 GiB is in the plan), thinking off, greedy (temperature 0) |
 | Prompts | *Photosynthesis* — "Explain photosynthesis to a ten-year-old in one paragraph." (120 tokens decoded) · *JavaScript* — "Write a JavaScript function that checks whether a string is a palindrome." (74) · *Hiking* — "Give me a short packing list for a weekend hiking trip." (120) |
 | Reported | tok/s = decoded tokens ÷ decode time (the chat page's figure); hot-tier hits and disk MiB per decode token; first word = request to first streamed token; peak = process footprint. Each value is the mean of 2 runs (the runs agree within ±6%) |
@@ -27,36 +27,46 @@ JavaScript / Hiking) and over all three:
 
 | Cap | Experts | Hot tier | tok/s per prompt | tok/s, all | Hot-tier hits | Disk MiB / token | First word | Peak |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 3 GiB | 4-bit | 0.05 GiB | 6.9 / 5.8 / 6.5 | **6.5** | 38 / 22 / 35% | 372 / 477 / 392 | 1.6–1.8 s | 2.73 GiB |
-| 3 GiB | packed 3-bit | 0.14 GiB | 7.7 / 6.9 / 7.6 | **7.5** | 42 / 23 / 35% | 278 / 368 / 310 | 1.3–1.5 s | 2.69 GiB |
-| 4 GiB | 4-bit | 1.05 GiB | 8.0 / 6.4 / 7.6 | **7.4** | 59 / 34 / 54% | 258 / 413 / 289 | 1.6–1.8 s | 3.74 GiB |
-| 4 GiB | packed 3-bit | 1.14 GiB | 8.8 / 7.2 / 8.2 | **8.1** | 64 / 38 / 54% | 180 / 305 / 225 | 1.3–1.5 s | 3.73 GiB |
-| 5 GiB | 4-bit | 2.05 GiB | 8.7 / 6.9 / 8.0 | **7.9** | 70 / 45 / 64% | 190 / 350 / 230 | 1.4–2.0 s | 4.74 GiB |
-| 5 GiB | packed 3-bit | 2.14 GiB | 9.2 / 7.7 / 8.7 | **8.6** | 76 / 51 / 66% | 124 / 248 / 174 | 1.2–1.7 s | 4.73 GiB |
-| 6 GiB | 4-bit | 3.05 GiB | 9.0 / 7.0 / 8.6 | **8.3** | 78 / 54 / 72% | 141 / 296 / 187 | 1.3–2.5 s | 5.74 GiB |
-| 6 GiB | packed 3-bit | 3.14 GiB | 9.9 / 8.3 / 9.1 | **9.2** | 84 / 62 / 74% | 87 / 198 / 135 | 1.1–1.6 s | 5.72 GiB |
+| 3 GiB | 4-bit | 0.05 GiB | 8.8 / 7.5 / 8.5 | **8.3** | 48 / 39 / 51% | 317 / 382 / 305 | 1.0–1.5 s | 2.64 GiB |
+| 3 GiB | packed 3-bit | 0.14 GiB | 9.9 / 8.6 / 9.4 | **9.4** | 53 / 43 / 53% | 226 / 279 / 231 | 1.2–1.8 s | 2.61 GiB |
+| 4 GiB | 4-bit | 1.05 GiB | 10.7 / 9.2 / 10.5 | **10.2** | 67 / 56 / 70% | 207 / 281 / 191 | 1.1–1.5 s | 3.65 GiB |
+| 4 GiB | packed 3-bit | 1.14 GiB | 11.7 / 10.0 / 12.1 | **11.4** | 73 / 60 / 72% | 135 / 199 / 139 | 1.2–1.3 s | 3.61 GiB |
+| 5 GiB | 4-bit | 2.05 GiB | 12.1 / 9.7 / 12.3 | **11.5** | 78 / 65 / 80% | 141 / 225 / 131 | 1.2–1.6 s | 4.64 GiB |
+| 5 GiB | packed 3-bit | 2.14 GiB | 14.3 / 11.4 / 13.3 | **13.1** | 83 / 71 / 83% | 85 / 149 / 91 | 1.1–1.4 s | 4.62 GiB |
+| 6 GiB | 4-bit | 3.05 GiB | 13.7 / 10.5 / 13.7 | **12.8** | 85 / 73 / 86% | 98 / 176 / 94 | 1.2–2.0 s | 5.65 GiB |
+| 6 GiB | packed 3-bit | 3.14 GiB | 15.4 / 12.2 / 14.4 | **14.2** | 88 / 78 / 87% | 60 / 115 / 69 | 1.0–1.4 s | 5.62 GiB |
+
+Hot tier is the planned size; during decode the lent prefill staging
+and scratch add 375 slots (4-bit) or 424 (packed 3-bit).
 
 How to read it:
 
-- **Packed 3-bit is 9–15% faster at every cap**, and packed 3-bit at
+- **Packed 3-bit is 11–14% faster at every cap**, and packed 3-bit at
   4 GiB is about as fast as 4-bit at 5 GiB. Quality against 4-bit: KL
   0.048, the same top token 93% of the time, perplexity 1.15 → 1.21,
   all 10 scored tasks right (JSON, tool calls, arithmetic, code).
-- **Each extra GiB adds 5–14%**, most going from 3 to 4 GiB with 4-bit
-  experts. The JavaScript prompt spreads over
-  the most experts, so it reads the most from disk at every cap.
-- **The hot tier at 3 GiB is nearly empty**, yet hits are 22–42%: the
-  256 prefill-staging slots lent to the hot tier during decode carry it.
-- **The part of a token that is not disk wait is ~87 ms at every cap**
-  (forward time minus disk wait: 84–92 ms in every cell of the table). That is the
-  ceiling: with every expert in RAM — a ~16 GiB cap for packed 3-bit
-  (13.1 GiB of experts), ~20 GiB for 4-bit — decode would reach about
-  **11.5 tok/s** (*estimated, not measured*: this 18 GB host can't spare
-  that much). A cap above what other programs leave free makes the
-  machine swap and is slower than a small cap.
+- **Each extra GiB adds 8–23%**, most going from 3 to 4 GiB. The
+  JavaScript prompt spreads over the most experts, so it reads the
+  most from disk at every cap.
+- **The hot tier at 3 GiB is nearly empty**, yet hits are 39–53%: the
+  slots lent from the prefill staging and scratch during decode carry
+  it.
+- **The part of a token that is not disk wait is 51–72 ms** (forward
+  time minus disk wait), and it falls as the cap grows: 62–72 ms at
+  3 GiB, 51–58 ms at 6 GiB with packed 3-bit, since fewer misses
+  means less CPU and GPU work around each read. With every expert in
+  RAM — a ~16 GiB cap for packed 3-bit (13.1 GiB of experts), ~20 GiB
+  for 4-bit — decode would reach roughly **18 tok/s** (*estimated, not
+  measured*: this 18 GB host can't spare that much). A cap above what
+  other programs leave free makes the machine swap and is slower than
+  a small cap.
+- These runs are 25–54% faster than the 2026-10-26 build's at the same
+  caps (more at bigger caps). Most of that is the hot-tier changes (each measured on its own
+  in [`known-issues.md`](known-issues.md)); the host also ran faster on
+  2026-10-28, so only compare numbers taken in one batch.
 - First word is time to the first streamed token for a ~25-token
-  prompt; the chat template plus a short question prefills at 14–22
-  tok/s because each token picks new experts. Long prompts prefill far
+  prompt; the chat template plus a short question prefills slowly
+  because each token picks new experts. Long prompts prefill far
   faster (135+ tok/s for a 3.3k-token prompt, measured on an earlier
   build).
 - **Answers match MLX.** Output is identical across caps; with 4-bit
@@ -73,22 +83,28 @@ row.*
 
 | Setting | tok/s per prompt | tok/s, all | Hot-tier hits | Disk wait, ms / token | Prefetched experts used / token |
 | --- | --- | --- | --- | --- | --- |
-| **standard** (cross-layer guess, 6 prefetched) | 8.0 / 6.4 / 7.6 | **7.4** | 59 / 34 / 54% | 39 / 67 / 45 | 78 / 121 / 86 |
-| previous-token guess, 4 prefetched (library default) | 6.9 / 5.7 / 6.7 | 6.5 | 59 / 34 / 54% | 63 / 85 / 68 | 13 / 35 / 20 |
-| cross-layer guess, 4 prefetched | 7.7 / 5.8 / 7.2 | 7.0 | 59 / 34 / 54% | 43 / 83 / 49 | 54 / 81 / 57 |
-| cross-layer guess, 8 prefetched | 7.5 / 5.9 / 7.4 | 7.0 | 59 / 34 / 54% | 46 / 78 / 46 | 98 / 151 / 108 |
-| no lending (`STREAMMOE_HOT_LEND=0`) | 7.4 / 6.0 / 7.1 | 6.9 | 51 / 22 / 42% | 48 / 74 / 54 | 95 / 150 / 113 |
-| no early hot experts (`STREAMMOE_EARLY_EXPERTS=0`) | 7.9 / 6.2 / 7.6 | 7.3 | 59 / 34 / 54% | 37 / 67 / 42 | 78 / 121 / 85 |
+| **standard** (cross-layer guess, 6 prefetched) | 10.7 / 9.2 / 10.5 | **10.2** | 67 / 56 / 70% | 33 / 44 / 35 | 61 / 71 / 50 |
+| previous-token guess, 4 prefetched (library default) | 9.6 / 7.7 / 9.7 | 9.1 | 67 / 56 / 70% | 50 / 64 / 49 | 7 / 8 / 5 |
+| cross-layer guess, 4 prefetched | 10.2 / 8.4 / 10.4 | 9.8 | 67 / 56 / 70% | 37 / 51 / 36 | 43 / 46 / 32 |
+| cross-layer guess, 8 prefetched | 10.0 / 8.5 / 10.5 | 9.8 | 67 / 56 / 70% | 39 / 51 / 35 | 76 / 91 / 65 |
+| no lending at all (`STREAMMOE_HOT_LEND=0`) | 9.2 / 7.6 / 9.1 | 8.8 | 57 / 47 / 60% | 44 / 61 / 46 | 83 / 91 / 71 |
+| staging lent, scratch not (`STREAMMOE_HOT_LEND_SCRATCH=0`) | 9.8 / 8.5 / 10.4 | 9.7 | 64 / 54 / 68% | 41 / 50 / 36 | 67 / 76 / 56 |
+| old hot-tier decay, every 65536 picks (`STREAMMOE_HOT_DECAY=65536`) | 9.7 / 6.7 / 8.9 | 8.5 | 61 / 38 / 57% | 40 / 75 / 48 | 73 / 111 / 78 |
+| no early hot experts (`STREAMMOE_EARLY_EXPERTS=0`) | 9.5 / 8.1 / 10.1 | 9.3 | 67 / 56 / 70% | 34 / 45 / 33 | 60 / 72 / 50 |
 
 The standard row is the 2-run mean from [Speed](#speed); the others
-are single runs. The cross-layer guess — the next layer's experts
-guessed from the current hidden state, so their reads start while the
-GPU is still busy — is 14% faster than the library default
-(`PrefetchGuess::PrevToken`, 4 experts), and 6 is the best width: 4
-leaves reads for later, 8 reads more than it saves. Lending the prefill
-staging to the hot tier is worth 7%; dispatching hot experts before the
-disk reads land is worth 1–2%, within run-to-run noise here. Output is
-identical in every row. More CPU threads did not help on an earlier build: `io_threads` 16
+are single runs (runs agree within ±6%). The cross-layer guess — the
+next layer's experts guessed from the current hidden state, so their
+reads start while the GPU is still busy — is 12% faster than the
+library default (`PrefetchGuess::PrevToken`, 4 experts), and 6 is the
+best width: 4 leaves reads for later, 8 reads more than it saves.
+Lending the idle prefill buffers to the hot tier is worth 16% (5% of
+it from the scratch). Forgetting old popularity within ~13 tokens
+instead of ~205 is worth 20%, most on the JavaScript prompt (6.7 →
+9.2 tok/s), whose experts differ most from the previous prompt's.
+Dispatching hot experts before the disk reads land read 9% here with
+the same disk wait, so most of that gap is run-to-run noise (it
+measured 1–2% before). Output is identical in every row. More CPU threads did not help on an earlier build: `io_threads` 16
 and `attn_threads` 8 match the defaults. On OLMoE-1B-7B the cross-layer
 guess did not help.
 
@@ -102,7 +118,8 @@ tokens costs ~3× one token here: disk reads are the union of the
 tokens' experts, and every kernel still runs once per token.
 
 *Setup: `batch_bench` — packed 3-bit experts, 6 GiB cap, n_ctx 2048,
-otherwise standard settings; 4 requests from 4 short prompts (25–30
+otherwise standard settings, on the 2026-10-26 build (before the
+2026-10-28 hot-tier changes); 4 requests from 4 short prompts (25–30
 tokens), 64 tokens each; 3 runs.*
 
 | Mode | Total tok/s | Per stream | vs one request at a time |
@@ -113,16 +130,35 @@ tokens), 64 tokens each; 3 runs.*
 | batch 4 | **11.6–11.9** | 2.9–3.0 | **1.30–1.33×** |
 
 Parallel decoding pays when several requests are waiting; each one gets
-its tokens more slowly. Speculative decoding with prompt-lookup drafts
-(`spec_bench`, packed 3-bit, 4 GiB cap) is not a win yet: 0.79–1.02× of
-plain decode, outputs identical. Details in
+its tokens more slowly.
+
+Speculative decoding with prompt-lookup drafts pays only on long
+matches, so `spec_bench` drafts only when the match runs back at least
+8 tokens. *Setup: `spec_bench`, 4 GiB cap, 128 tokens, 5 prompts (2
+copy-heavy), 2 alternating rounds, 2026-10-28 build.* Speedup over plain
+decode, guarded / unguarded:
+
+| Prompt | Packed 3-bit | 4-bit |
+| --- | --- | --- |
+| Grammar fix | 0.95 / 0.85× | 1.00 / 0.91× |
+| Docstrings | 1.02 / 0.92× | 1.00 / 0.88× |
+| Photosynthesis (no drafts) | 1.12 / 1.10× | 1.12 / 1.00× |
+| Repeat a paragraph, one word replaced | 1.17 / 1.24× | 1.24 / 1.26× |
+| Rename a function in code | 1.19 / 1.12× | 1.26 / 1.14× |
+| **All five** | **1.08 / 1.03×** | **1.12 / 1.02×** |
+
+Outputs are token-identical to plain decode. The plain baseline mixes a
+cold and a warm run, so a prompt with no drafts reads above 1.0×:
+compare the two columns with each other. Details in
 [`docs/known-issues.md`](known-issues.md).
 
 ## Where a decode token goes
 
 *Setup: standard, 4-bit experts,
-4 GiB cap, mean over the three test prompts (138 ms), GPU timestamps
-(`STREAMMOE_GPU_TIMING`) and I/O counters:*
+4 GiB cap, on the 2026-10-26 build (a token took 138 ms then, ~99 ms
+on the 2026-10-28 build, mostly from less disk wait), mean over the
+three test prompts, GPU timestamps (`STREAMMOE_GPU_TIMING`) and I/O
+counters:*
 
 ```mermaid
 pie showData
@@ -144,8 +180,8 @@ decode's short bursts leave the GPU in a slow state.
 `STREAMMOE_IO_TRACE=<file>` records every expert read and the phase of
 each layer; `tools/io_trace_report.py` turns it into disk busy / idle
 time. *Setup: standard, packed 3-bit experts, 4 GiB cap, the
-photosynthesis prompt, a build from earlier the same day (before early
-expert dispatch); tracing adds ~15%, so read it for proportions, not
+photosynthesis prompt, a 2026-10-26 build (before early expert
+dispatch and the 2026-10-28 hot-tier changes); tracing adds ~15%, so read it for proportions, not
 speed:*
 
 ```text
@@ -163,7 +199,7 @@ more prefetch.
 
 ## Vision
 
-*Setup: standard, 4-bit experts, 4 GiB cap, one image per turn; measured when vision landed, a few engine changes before the speed runs:*
+*Setup: standard, 4-bit experts, 4 GiB cap, one image per turn; measured when vision landed, on a 2026-10-26 build:*
 
 | Image | Image tokens | Encode | Prefill (whole turn) | Process memory | CPU (peak, whole run) |
 | --- | ---: | ---: | ---: | ---: | ---: |
