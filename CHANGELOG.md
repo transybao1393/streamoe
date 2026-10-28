@@ -15,6 +15,21 @@
   the staging buffer; `STREAMMOE_HOT_LEND=0` still turns all lending
   off.
 
+- `spec_bench` drafts only when the prompt-lookup match is at least
+  8 tokens long (`--min-match`) and takes a plain step otherwise, so
+  speculative decoding loses at most ~5% where drafts miss (was up to
+  ~15%) and still wins on copy-heavy text. a3b at a
+  4 GiB cap, 128 tokens, mean of 2 alternating rounds, guarded vs
+  unguarded speedup over plain: all five prompts 1.08 / 1.03×
+  (packed 3-bit) and 1.12 / 1.02× (4-bit); grammar fix 0.95 / 0.85×
+  and 1.00 / 0.91×; docstrings 1.02 / 0.92× and 1.00 / 0.88×;
+  copy-heavy prompts (repeat a paragraph with one word replaced,
+  rename a function) 1.17–1.26×. Output token-identical to plain
+  decode in every run; peak unchanged (3.82 GiB). `--arms old` or
+  `STREAMMOE_SPEC_GUARD=0` restores drafting on every lookup hit;
+  `--arms old,guard` runs both; `--backoff`, `--after-full` and
+  `--trace` (per-pass match length, accept, ms) are for tuning.
+
 - The hot tier's popularity counters halve every 4096 recorded picks
   (~13 tokens on a3b) instead of every 65536 (~205 tokens), so the
   previous topic's experts stop holding slots within a sentence. a3b

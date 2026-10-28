@@ -10,7 +10,7 @@ history of `.claude/memory/`, which is no longer tracked.
 
 | Issue | Impact | Plan |
 | --- | --- | --- |
-| Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) is slower than plain decode: 0.79× / 0.92× on rewrite / code prompts, 1.02× on free text (packed 3-bit, 4 GiB cap, `spec_bench`). Output is token-identical. | A verify pass of ~4 tokens costs ~425 ms in real use (310 ms in `verify_bench`, where every draft is right) and yields 2.4–2.9 tokens; break-even is ~310–370 ms. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; draft only on long matches. |
+| Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) only pays on copy-heavy text. With the match-length guard (`spec_bench` default: draft only when the lookup match is ≥ 8 tokens), a3b at a 4 GiB cap, mean of 2 alternating rounds: 1.08× (packed 3-bit) / 1.12× (4-bit) over plain on five prompts, vs 1.03× / 1.02× unguarded; copy-heavy prompts 1.17–1.26×, grammar fix 0.95× / 1.00× (unguarded 0.85× / 0.91×). Output is token-identical. | A verify pass of ~4 tokens costs ~340–400 ms packed 3-bit and yields 3.8–4.0 tokens on long matches, 2.4–3.0 on short ones; break-even is ~3.3. The guard's residual loss on the grammar prompt is real (~3%): two passes on matches of exactly 8 tokens accept nothing. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; try `--backoff`. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
 | `diff_oracle`, the 10 GiB-cap tests and all a17b / Cogito model tests have not run on this host (~7 GiB reclaimable, no a17b / Cogito weights). `diff_oracle` cannot run under a cap at all: the cap check measures the whole process, and the tests hold two contexts in one process, so the second open sees the first's ~2.5 GiB (`OverBudget: footprint 5.09 GiB exceeds cap 3.00 GiB` at a 3 GiB cap with no checkpoints). | Every other a3b model suite passes: on 2026-10-26 `mlx_regression`, `smoke`, `checkpoint_restore`, `consecutive_eval_prompt`, `mrope`, `layer_range`, `requests`, `streaming`, `expert_source_equivalence`, `budget_cap`, `graph_diff_oracle`, `batched_diff_oracle`; on 2026-10-28 `vision` (cosine 1.000000 on 3 images), `engine_op_diff` (with `STREAMMOE_EXPERT_IO=mmap`) and `mmap_matches_pread` (after the fix below). Suites that open uncapped ran under `STREAMMOE_TEST_CAP_GIB=4`. | `diff_oracle` uncapped with ~8 GiB free; the 10 GiB-cap tests with 10 GiB free; a17b / Cogito where their weights are. |
 | Vision reads small or short printed text unreliably ("STOP" → "SOM" / "Form", "HELLO 2026" → "HILLCO" at 128–160 image tokens); scenes, colors, layout and counting are right. | Not an engine bug: on the same image embeddings, MLX (mlx_vlm, 4-bit) has the same top tokens ("F", "S", "T" for "STOP"); the engine follows MLX layer by layer (cosine ≥ 0.99 at layer 32, 0.96 on the last token at layer 40, bf16 vs f32); positions equal mlx_vlm's `get_rope_index`; the encoder matches transformers exactly and mlx_vlm to 0.997; all 92 160 packed expert tensors are byte-identical to the safetensors. | Use larger images. Re-check against a bf16 / 8-bit checkpoint if text reading matters. |
@@ -306,6 +306,30 @@ history of `.claude/memory/`, which is no longer tracked.
   pass's distinct experts hit RAM more. What a 4-token pass adds over
   one token (`verify_bench --profile`): disk wait 20 → 81 ms, expert
   GPU 31 → 94, attention GPU 33 → 96, LM head 6 → 21.
+- **Speculative decoding guard** (`spec_bench`, default; arm `old`
+  or `STREAMMOE_SPEC_GUARD=0` drafts on every lookup hit). a3b, 4 GiB
+  cap, 128 tokens, mean of 2 rounds with the arm order swapped,
+  speedup over plain, guarded / unguarded:
+
+  | Prompt | packed 3-bit | 4-bit |
+  | --- | --- | --- |
+  | grammar fix | 0.95 / 0.85 | 1.00 / 0.91 |
+  | docstrings | 1.02 / 0.92 | 1.00 / 0.88 |
+  | photosynthesis (no drafts) | 1.12 / 1.10 | 1.12 / 1.00 |
+  | repeat paragraph, one word replaced | 1.17 / 1.24 | 1.24 / 1.26 |
+  | rename a function in code | 1.19 / 1.12 | 1.26 / 1.14 |
+  | all five | 1.08 / 1.03 | 1.12 / 1.02 |
+
+  Guarded runs skip 33–72 of the lookup hits per prompt and accept
+  61–100% of what they draft (unguarded 44–88%); peak 3.79–3.82 GiB
+  either way. Threshold from unguarded per-pass traces (`--trace`,
+  packed 3-bit): matches of 2–7 tokens accept 20–67% and gain
+  0.51–0.93× over plain steps, 8–11 tokens 86% / 1.20×, 16+ tokens
+  93–96% / 1.24×. Drafting right after a fully accepted pass on a
+  short match loses too (52%, 0.80×), so `--after-full` is off by
+  default. The bench's plain baseline averages a cold first run and a
+  warm last one, so a run with no drafts reads 1.07–1.16×; compare
+  arms with each other rather than with 1.0.
 - **Early expert dispatch** (resident experts' FFN sent before the
   disk reads of the rest; `STREAMMOE_EARLY_EXPERTS`): alternating
   `verify_bench` runs, packed 3-bit, 4 GiB cap — warm decode 107.1 /
