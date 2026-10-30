@@ -8,10 +8,17 @@ license = "MIT AND LicenseRef-PolyForm-Noncommercial-1.0.0"
 description = "Local chat page for trying a streammoe model under a memory cap"
 
 [dependencies]
-streammoe = { path = "../../crates/streammoe", features = ["model-qwen3-6-35b-a3b"] }
+streammoe = { path = "../../crates/streammoe" }
 serde_json = "1"
 libc = "0.2"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+
+# One model at a time, like the engine. Qwen3.5-397B-A17B:
+# `cargo build --release --no-default-features --features a17b`.
+[features]
+default = ["a3b"]
+a3b = ["streammoe/model-qwen3-6-35b-a3b"]
+a17b = ["streammoe/model-qwen3-5-a17b"]
 
 # Standalone: not a workspace member, so the engine crate gains no
 # dependencies from this tool.
