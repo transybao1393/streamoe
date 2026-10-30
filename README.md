@@ -150,6 +150,28 @@ the 2026-10-26 build's figure for comparison:
 - Per-prompt numbers, what each feature is worth, multi-token passes
   and where a token's time goes: [`docs/benchmarks.md`](docs/benchmarks.md).
 
+#### From an external SSD
+
+*Setup: standard, except: model on a Kingston NV3 500 GB (QLC) in a
+USB4 enclosure (2.3–2.6 GB/s uncached reads), 4-bit experts, caps 7
+and 9 GiB run alternately back to back (7, 9, 7, 9), 2026-10-30, same
+engine build.* Decode tok/s over all three prompts, with each run in
+brackets:
+
+| Cap | tok/s, all | Hot-tier hits | Expert reads from disk / token | Disk wait / token | Peak memory |
+| --- | --- | --- | --- | --- | --- |
+| 7 GiB | **10.2** (10.6, 9.9) | 85% | 24 | 40 ms | 6.6 GiB |
+| 9 GiB | **11.2** (11.7, 10.7) | 90% | 18 | 31 ms | 8.7 GiB |
+
+- The 2 GiB larger cap is worth ~10%. The GPU's work per token is the
+  same at both caps (~39 ms in the Metal timeline); the larger hot tier
+  saves ~6 expert reads per token, so the GPU waits less for the drive.
+- Compare caps within this table, not with the one above. On the same
+  day a 7 GiB run from the internal SSD gave 9.5 tok/s with half the
+  disk wait (20 ms per token for about as many reads, 25), so that day's
+  differences outside the disk were larger than the external drive's
+  cost.
+
 ### What it costs
 
 | Resource | Cost |
