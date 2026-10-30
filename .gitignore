@@ -29,6 +29,8 @@ tokenizer.bin
 packed_experts/
 packed_experts_*/
 *.safetensors
+# GGUF files for the llama.cpp baseline (docs/benchmarks.md)
+*.gguf
 models/
 
 # Python
