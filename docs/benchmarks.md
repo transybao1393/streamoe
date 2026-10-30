@@ -79,6 +79,43 @@ How to read it:
   full-attention layers, 2 KV heads), so F32 KV costs little and Turbo4
   gains nothing measurable.
 
+### From an external SSD
+
+*Setup: standard, except: model on a Kingston NV3 500 GB (QLC,
+DRAM-less) in a USB4 enclosure, 4-bit experts, caps 7 and 9 GiB run
+alternately back to back (7, 9, 7, 9 within three minutes),
+2026-10-30, same engine build (no engine change since the 2026-10-28
+build).* The drive reads 2.3 GB/s sequential and 2.6 GB/s for random
+expert-sized (6.75 MiB) reads at queue depth 8, uncached (`fio`).
+
+| Cap | Hot tier | tok/s per prompt | tok/s, all | Hot-tier hits | Disk MiB / token | Disk wait / token | First word | Peak |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 7 GiB | 4.05 GiB | 11.8 / 8.1 / 10.8 | **10.2** | 89 / 78 / 89% | 70 / 143 / 72 | 27 / 60 / 32 ms | 2.0–2.6 s | 6.63 GiB |
+| 9 GiB | 6.05 GiB | 12.3 / 9.2 / 12.2 | **11.2** | 93 / 85 / 93% | 46 / 104 / 50 | 23 / 45 / 24 ms | 1.6–3.0 s | 8.65 GiB |
+
+Runs in order of time, tok/s over all three prompts: 7 GiB 10.6,
+9 GiB 11.7, 7 GiB 9.9, 9 GiB 10.7. The host's 1-minute load rose from
+2.4 to 3.5 over the four runs, and each cap's second run was slower
+than its first.
+
+- **The 2 GiB larger cap is worth ~10%**: +4% on Photosynthesis,
+  +13% on JavaScript, +12% on Hiking. With
+  `STREAMMOE_GPU_TIMING` on, the GPU was busy 38–40 ms per token in
+  every run; the difference is GPU idle time (43–53 ms per token at
+  9 GiB, 53–61 ms at 7 GiB), almost all of it waiting at the expert
+  step for reads the smaller hot tier misses.
+- **Compare caps within this table, not with the one above.** A 7 GiB
+  4-bit run from the internal SSD the same afternoon gave 9.5 tok/s
+  (mean of 2) with about half the disk wait (20 ms per token for 25
+  expert reads, against 40 ms for 24 here), but its forward time
+  outside disk wait was ~86 ms against ~61 ms here (means over the
+  three prompts). That day's
+  differences outside the disk were larger than the external drive's
+  cost.
+- An earlier 7 GiB run from this drive (8.6 tok/s), started right
+  after 32 GiB was copied onto it, is left out: a QLC drive keeps
+  folding its write cache for minutes after a large write.
+
 ## Compared with MLX
 
 *Setup: the standard host (M3 Pro, 18 GB, shared with other apps, 6.4 GiB
