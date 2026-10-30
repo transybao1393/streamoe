@@ -147,6 +147,10 @@ the 2026-10-26 build's figure for comparison:
   3 tokens in 10 minutes before it was stopped; streamoe decodes the
   same prompt at 10.7 tok/s in 3.6 GiB
   ([details](docs/benchmarks.md#compared-with-mlx)).
+- **Against llama.cpp** with mmap, same Mac: streammoe is 11–44%
+  faster from a 4 GiB cap up and llama.cpp 10% faster at 3 GiB, while
+  llama.cpp takes 7.3–11.1 GiB once its page cache is counted
+  ([below](#against-llamacpp-mmap)).
 - Per-prompt numbers, what each feature is worth, multi-token passes
   and where a token's time goes: [`docs/benchmarks.md`](docs/benchmarks.md).
 
@@ -172,6 +176,56 @@ brackets:
   differences outside the disk were larger than the external drive's
   cost.
 - Per-prompt numbers: [`docs/benchmarks.md`](docs/benchmarks.md#from-an-external-ssd).
+
+#### Against llama.cpp (mmap)
+
+*Setup: standard, internal SSD, 4-bit experts, 2026-10-30, same engine
+build. llama.cpp b11988 (official macOS release) with
+`unsloth/Qwen3.6-35B-A3B-GGUF` `UD-Q4_K_S` (19.46 GiB):
+`llama-server -c 4096 -np 1 --reasoning off --no-warmup --no-repack
+-ngl 99`, mmap on (its default), F16 KV, 5 threads. Same three prompts,
+greedy, thinking off, a fresh server per run. Each llama.cpp setting
+runs back to back with the streammoe cap that pins about the same
+memory; two rounds, mean of 2 runs.* tok/s per prompt
+(Photosynthesis / JavaScript / Hiking):
+
+| Engine, setting | tok/s per prompt | tok/s, all (run 1, run 2) | First word | Pinned memory | Page cache taken | CPU cores | Disk read per run |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| llama.cpp `--cpu-moe` | 10.3 / 6.1 / 9.4 | **8.6** (9.1, 8.1) | 3.1–5.0 s | 2.8 GiB | 6.4 GiB | 1.9 | 22 GB |
+| streammoe, 3 GiB cap | 7.9 / 7.0 / 8.1 | **7.7** (7.7, 7.7) | 1.4–1.7 s | 2.65 GiB | 0 | 0.4 | 116 GB |
+| llama.cpp `--n-cpu-moe 36` | 11.1 / 6.2 / 9.3 | **8.9** (9.0, 8.8) | 4.2–5.1 s | 4.7 GiB | 2.6 GiB | 1.7 | 23 GB |
+| streammoe, 4 GiB cap | 10.3 / 8.7 / 10.5 | **9.8** (9.7, 10.0) | 1.4–1.8 s | 3.65 GiB | 0 | 0.5 | 82 GB |
+| llama.cpp `--n-cpu-moe 34` | 10.9 / 6.1 / 9.1 | **8.7** (8.9, 8.5) | 4.5–6.1 s | 5.5 GiB | 4.1 GiB | 1.6 | 25 GB |
+| streammoe, 5 GiB cap | 11.8 / 9.7 / 12.1 | **11.2** (11.3, 11.2) | 1.3–1.6 s | 4.63 GiB | 0 | 0.6 | 62 GB |
+| llama.cpp `--n-cpu-moe 32` | 10.5 / 6.1 / 9.5 | **8.7** (8.6, 8.8) | 4.8–6.7 s | 6.2 GiB | 4.9 GiB | 1.5 | 27 GB |
+| streammoe, 6 GiB cap | 13.5 / 10.7 / 13.5 | **12.5** (12.6, 12.5) | 1.2–1.6 s | 5.64 GiB | 0 | 0.6 | 49 GB |
+| llama.cpp, all on GPU (no expert override) | — | **no answer** after ~16 min | — | 6.2–8.6 GiB, fluctuating | — | — | ~890 GB in 16 min |
+
+- **From a 4 GiB cap up streammoe is faster** (+11%, +29%, +44%), with
+  no page cache, a third of the CPU and a first word 2–4× sooner. At
+  3 GiB llama.cpp is 10% faster, but holds ~9 GiB (2.8 pinned + 6.4
+  page cache) to streammoe's 2.65.
+- **llama.cpp's speed barely moves with the setting** (8.6–8.9 tok/s):
+  putting more expert layers on the GPU pins more memory without making
+  it faster here. Its page cache is not bounded; it takes whatever the
+  machine has free, so its total ran from 7.3 to 11.1 GiB.
+- **llama.cpp reads 2–5× less from disk**: the page cache keeps experts
+  that streammoe, with `F_NOCACHE` and a small hot tier, reads again
+  (up to ~2.6 GB/s at a 3 GiB cap).
+- **All on the GPU, llama.cpp never answered**: 19.5 GiB of weights
+  don't fit, so macOS kept evicting and re-reading the mapped file
+  (~890 GB in 16 minutes, free memory down to 0.86 GiB); it was stopped
+  by hand.
+- `--no-warmup` and `--no-repack` keep llama.cpp a true mmap run: its
+  warm-up activates every expert and pulls most of the file into
+  memory, and repacking copies the CPU-side experts into private
+  memory. Without them both first attempts pushed this host into swap.
+- How it was measured: pinned memory is the rise in wired memory for
+  llama.cpp and the engine's own peak for streammoe; page cache taken
+  is the rise in file-backed memory (a lower bound for llama.cpp, since
+  part of the file was still cached from its previous run); both
+  sampled every second. Answers are not compared token by token: the
+  quantizations differ.
 
 ### What it costs
 
