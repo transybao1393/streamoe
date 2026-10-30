@@ -171,6 +171,7 @@ brackets:
   disk wait (20 ms per token for about as many reads, 25), so that day's
   differences outside the disk were larger than the external drive's
   cost.
+- Per-prompt numbers: [`docs/benchmarks.md`](docs/benchmarks.md#from-an-external-ssd).
 
 ### What it costs
 
