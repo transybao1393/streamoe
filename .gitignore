@@ -121,3 +121,7 @@ owner-review.md
 # Internal working docs (plans, proposals, exploration notes) — kept
 # locally, not published
 docs/dev/
+
+# Drive benchmarks (fio job output, write-probe and fold-probe files)
+fio_*.json
+*_probe.bin
