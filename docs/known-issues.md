@@ -194,6 +194,28 @@ history of `.claude/memory/`, which is no longer tracked.
   is a little behind 4096 everywhere (it is still LFU, just a short
   memory — cf. the LRU dead end). `STREAMMOE_HOT_DECAY=<picks>` sets
   the period, read once at open and printed in the `[hot_tier]` line.
+- **The GPU idled between each layer's experts and the next layer's
+  attention** while the CPU ran that layer's prefetch: the cross-layer
+  guess (a 256 × 2048 gate matvec on the CPU) and `drain_set` (waits
+  out reads still in flight into the set) took 0.51 ms (median) after
+  the expert commit and before the attention commit, longer than the
+  ~0.3 ms expert buffer — ~7.4 ms of GPU idle per token in ~40 gaps
+  (a3b, 4-bit, 4 GiB cap, `tools/gpu_timing_report.py`; a token then
+  had 126 command buffers, 91 of them waited on). `STREAMMOE_ATTN_FIRST=1`
+  (read at open, default off) runs the prefetch in the commit-to-wait
+  slot of the layer's first command buffer instead, where the CPU
+  waits on the GPU anyway: that gap falls to 0.04 ms per token, and
+  the kernels run 4–9% faster in the longer bursts. Same GPU work in
+  the same order, so output is bit-identical
+  (`budget_cap::a3b_attn_first_decode_is_bit_identical`; the oracles
+  pass with it on). a3b chat, 4-bit, off → on, 2 runs each,
+  2026-11-05, greedy output identical in every run, peak unchanged
+  (3.62 / 5.62 GiB): 4 GiB 9.68, 9.87 → 10.19, 10.37 tok/s over the
+  three prompts (+5%; per prompt 10.3 / 8.0 / 10.6 → 10.8 / 8.4 /
+  11.3); 6 GiB 12.27, 12.37 → 13.38, 14.26 (+12%; 12.9 / 10.5 / 13.2
+  → 14.5 / 11.3 / 15.2). The `io` wait counter grows 2–7 ms per token
+  (the routing now arrives sooner after the prefetch starts, so more of
+  its reads are still in flight) while forward time falls 4–12 ms.
 
 ## Precautions
 
@@ -269,7 +291,14 @@ history of `.claude/memory/`, which is no longer tracked.
   clock) for every waited command buffer; `CmdbufStat::gpu_ns` now
   holds GPU time too (it was always 0 — metal-rs has no binding for
   `GPUStartTime` / `GPUEndTime`, so `gpu_timing.rs` calls them through
-  `msg_send!`).
+  `msg_send!`). The early expert buffers (never waited on) are logged
+  once complete, and host events as `@<label> <time>` (each labeled
+  commit, `commit:moe.experts[_early]`, `io_start` / `io_end` around a
+  layer's expert reads, `layer_prefetched`).
+  `python3 tools/gpu_timing_report.py <file>` prints, per decode token,
+  command buffers and CPU waits, GPU busy / idle, the idle gaps by the
+  buffers on either side, and the host time between consecutive marks.
+  Tracing adds ~5–10 ms per token.
 - **Disk timeline**: set `STREAMMOE_IO_TRACE=<file>` to log every
   expert read (start, end, kind, layer, bytes) and per-layer phase
   markers, then `python3 tools/io_trace_report.py <file>` prints disk
