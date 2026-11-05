@@ -272,6 +272,39 @@ history of `.claude/memory/`, which is no longer tracked.
   6 GiB 1.170 → 0.989 s (−15%) and 15.19 → 12.84 s (−15%, 109.4 →
   129.4 tok/s). n = 2 and 4 gained less (one sweep run at 4 GiB). The
   397B (bounded, 64-slot groups) has not been measured with it.
+- **A long prompt read each layer's experts once per prefill chunk.**
+  Under a cap prompts prefill in chunks of 512, each through every
+  layer before the next, so a 4-chunk prompt staged most experts of
+  every layer four times. Layer-major prefill
+  (`OpenConfig::layer_major`, env `STREAMMOE_LAYER_MAJOR=1`; off by
+  default until measured more widely) runs a window of up to
+  `layer_major_chunks` chunks (default 4, env
+  `STREAMMOE_LAYER_MAJOR_CHUNKS`) layer by layer: each layer runs all
+  of the window's chunks in order (KV rows and linear-attn recurrence
+  still advance chunk by chunk) before the next layer, and the chunks'
+  hidden rows wait in a window buffer. Full staging keeps the layer's
+  staged experts across its chunks and stages only new ones
+  (`MoeGraphScratch::keep_staged`); bounded staging runs the chunks'
+  attention first, then stages the union of their experts once in
+  groups and runs each group for every chunk (`moe_window_forward`),
+  each chunk keeping its own boundary rows and `down_mid` until its
+  combine. Same rows, same combine order: logits, state and decode are
+  bit-identical (`tests/layer_major.rs`: full staging, staging first
+  and overlap 8; bounded 64 and 16 slots, staging first and double
+  buffered; windows of 4, 2 + 2 and 3 + 1 chunks). Memory
+  (`Account::LayerMajor`, lent to the hot tier during decode like the
+  prefill scratch), at chunk 512 and 4 chunks: the window's hidden
+  rows, a3b 16 MiB / a17b 32 MiB; bounded staging adds 3 chunk sets of
+  40 / 96 MiB (a17b total 320 MiB). A capped open that cannot fit the
+  window lowers it, then turns it off, and logs it. a3b 4-bit, 4 GiB
+  cap, n_ctx 4096, F32 KV, internal SSD, a 2062-token prompt, fresh
+  server per run, 2 runs each, 2026-11-05: prefill 14.0 / 14.0 →
+  7.7 / 7.7 s (147 → 269 tok/s, −45%), staging I/O 10.6 → 3.5 s, prefill
+  disk reads 55,890 → 18,887 MiB; output text and peak (3.63 GiB)
+  identical. Hot-tier popularity is recorded per chunk as before, but
+  in layer-major order, so its decay can land between other picks than
+  chunk-major (decode speed only). The 397B (bounded) has not been
+  measured with it.
 
 ## Precautions
 

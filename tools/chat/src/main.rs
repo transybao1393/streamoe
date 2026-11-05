@@ -608,6 +608,8 @@ impl Chat {
             // cores busy (process CPU time / wall) in each phase.
             "prefill_ms": (st0.prefill_ns - st_pre.prefill_ns) as f64 / 1e6,
             "prefill_io_ms": (st0.prefill_io_ns - st_pre.prefill_io_ns) as f64 / 1e6,
+            // Expert bytes prefill staging read from disk this turn.
+            "prefill_disk_mib": (st0.prefill.bytes - st_pre.prefill.bytes) as f64 / (1u64 << 20) as f64,
             "prefill_cpu_cores": t.cpu_pre_cores,
             "decode_cpu_cores": (cpu_secs() - t.cpu_dec0) / decode_s.max(1e-9),
         });

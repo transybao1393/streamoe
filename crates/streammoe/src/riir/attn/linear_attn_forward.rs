@@ -513,6 +513,164 @@ pub struct MoeGraphScratch {
     /// topology is identical regardless of which attention kind
     /// produced its inputs, so one pass holds for the whole run.
     pub commit_planned: std::cell::Cell<bool>,
+    /// Layer-major prefill with full staging: while set,
+    /// `moe_block_forward` keeps track of which of the layer's experts
+    /// already sit in `expert_base` (`staged`) and stages only the
+    /// others, so a layer's later chunks reuse what its earlier chunks
+    /// read. Off (the default), every call stages its routed experts.
+    pub keep_staged: std::cell::Cell<bool>,
+    /// Experts of one layer resident in `expert_base` (full staging,
+    /// `keep_staged` only). Cleared by [`Self::forget_staged`] — at the
+    /// start of every layer-major window, since the staging buffer is
+    /// lent to the hot tier between prefills.
+    pub staged: std::cell::RefCell<StagedExperts>,
+}
+
+/// Which experts of which layer sit in the full staging buffer
+/// ([`MoeGraphScratch::staged`]).
+#[derive(Debug, Default)]
+pub struct StagedExperts {
+    /// The layer the flags describe; `None` = nothing known.
+    pub layer: Option<usize>,
+    /// `have[e]`: expert `e` of `layer` is in its slot.
+    pub have: Vec<bool>,
+}
+
+impl MoeGraphScratch {
+    /// Forget which experts are staged (the buffer may have been
+    /// overwritten since).
+    pub fn forget_staged(&self) {
+        let mut st = self.staged.borrow_mut();
+        st.layer = None;
+        st.have.clear();
+    }
+
+    /// One more chunk's MoE boundary set for a bounded layer-major
+    /// window: its own `h_mid`, `h_post`, shared gate, router ids /
+    /// weights and `[chunk, k]` expert rows (`bucket_input`, the
+    /// grouped path's `down_mid`), all persistent; every other buffer
+    /// (shared-FFN and gather working set, staging, index tables) is
+    /// `self`'s. The attention `graph1` of that chunk writes the
+    /// boundary buffers, and its rows survive until the chunk's
+    /// combine, after every expert group of the layer has run.
+    /// [`crate::riir::budget::layer_major_chunk_bytes`] plans it.
+    /// Its `commit_planned` latch is never consulted (the window path
+    /// latches on the first chunk's scratch).
+    pub fn chunk_view(&self, pool: &mut MetalBufferPool, chunk: usize, k_active: usize) -> Self {
+        let v = VARIANT;
+        let f32_sz = std::mem::size_of::<f32>();
+        let chk = |elems: usize| chunk * elems * f32_sz;
+        let max_k = crate::riir::moe::expert_forward::MAX_K;
+        let e = "MoeGraphScratch::chunk_view pool alloc";
+        Self {
+            h_mid: pool.alloc(chk(v.hidden_dim), "lm.h_mid", true).expect(e),
+            h_post: pool.alloc(chk(v.hidden_dim), "lm.h_post", true).expect(e),
+            shared_gate: pool.alloc(chk(1), "lm.shared_gate", true).expect(e),
+            routing_indices: pool.alloc(chk(max_k), "lm.routing_indices", true).expect(e),
+            routing_weights: pool.alloc(chk(max_k), "lm.routing_weights", true).expect(e),
+            bucket_input: pool.alloc(chk(k_active * v.hidden_dim), "lm.down_mid", true).expect(e),
+            shared_ffn_gate: self.shared_ffn_gate,
+            shared_up: self.shared_up,
+            shared_act: self.shared_act,
+            shared_down: self.shared_down,
+            bucket_gate: self.bucket_gate,
+            bucket_up: self.bucket_up,
+            bucket_act: self.bucket_act,
+            bucket_out: self.bucket_out,
+            bucket_token_idx: self.bucket_token_idx,
+            bucket_weights: self.bucket_weights,
+            out_sum: self.out_sum,
+            expert_base: self.expert_base,
+            staging_experts: self.staging_experts,
+            expert_stride: self.expert_stride,
+            expert_indices: self.expert_indices,
+            overlap_groups: self.overlap_groups,
+            htpe: self.htpe,
+            hids: self.hids,
+            commit_planned: std::cell::Cell::new(true),
+            keep_staged: std::cell::Cell::new(false),
+            staged: Default::default(),
+        }
+    }
+
+    /// Split a layer's routed experts `ids` into those still to stage
+    /// and those already in `expert_base` from an earlier chunk of the
+    /// same layer ([`Self::keep_staged`]; without it, nothing is
+    /// staged yet).
+    fn split_staged(&self, layer_idx: usize, ids: &[i32]) -> (Vec<i32>, Vec<usize>) {
+        if !self.keep_staged.get() {
+            return (ids.to_vec(), Vec::new());
+        }
+        let mut st = self.staged.borrow_mut();
+        if st.layer != Some(layer_idx) {
+            st.layer = Some(layer_idx);
+            st.have.clear();
+            st.have.resize(VARIANT.num_experts, false);
+        }
+        let (mut todo, mut done) = (Vec::with_capacity(ids.len()), Vec::new());
+        for &e in ids {
+            if st.have[e as usize] {
+                done.push(e as usize);
+            } else {
+                todo.push(e);
+            }
+        }
+        (todo, done)
+    }
+
+    /// Record that `ids` of the layer [`Self::split_staged`] named are
+    /// now staged (`ok`), or forget everything (a failed staging may
+    /// have left slots half written).
+    fn mark_staged(&self, ids: &[i32], ok: bool) {
+        if !self.keep_staged.get() {
+            return;
+        }
+        if !ok {
+            self.forget_staged();
+            return;
+        }
+        let mut st = self.staged.borrow_mut();
+        for &e in ids {
+            st.have[e as usize] = true;
+        }
+    }
+
+    /// Bounded staging: fewer slots than a layer has experts.
+    pub fn bounded(&self) -> bool {
+        self.expert_base.is_some() && self.staging_experts < VARIANT.num_experts
+    }
+}
+
+/// Layer-major prefill buffers ([`crate::riir::OpenConfig::layer_major`]):
+/// the hidden rows of a window of `chunks` prefill chunks, which
+/// carry each chunk from one layer to the next, and with bounded
+/// staging a [`MoeGraphScratch::chunk_view`] for every chunk past the
+/// first. All persistent. [`crate::riir::budget::layer_major_bytes`]
+/// plans them.
+pub struct LayerMajorScratch {
+    /// `[chunks * chunk, hidden]` f32.
+    pub window: BufId<HiddenBuf>,
+    /// Chunks per window.
+    pub chunks: usize,
+    /// Chunks `1..chunks`' MoE boundary sets (bounded staging only;
+    /// chunk 0 uses the prefill scratch's own).
+    pub moe_chunks: Vec<MoeGraphScratch>,
+}
+
+impl LayerMajorScratch {
+    /// Allocate for `chunks` chunks of `chunk` tokens next to `moe`.
+    pub fn new(pool: &mut MetalBufferPool, moe: &MoeGraphScratch, chunk: usize, chunks: usize) -> Self {
+        let v = VARIANT;
+        let window = pool
+            .alloc(chunks * chunk * v.hidden_dim * std::mem::size_of::<f32>(), "lm.window", true)
+            .expect("LayerMajorScratch::new pool alloc");
+        let moe_chunks = if moe.bounded() {
+            (1..chunks).map(|_| moe.chunk_view(pool, chunk, v.num_experts_per_tok)).collect()
+        } else {
+            Vec::new()
+        };
+        Self { window, chunks, moe_chunks }
+    }
 }
 
 impl MoeGraphScratch {
@@ -683,6 +841,8 @@ impl MoeGraphScratch {
             htpe,
             hids,
             commit_planned: std::cell::Cell::new(false),
+            keep_staged: std::cell::Cell::new(false),
+            staged: Default::default(),
         }
     }
 }
@@ -2666,6 +2826,10 @@ pub(in crate::riir) fn batched_linear_attn_layer_forward<B>(
     // scratch (boundary buffers + `graph2` working set).
     scratch: &LinearAttnGraphScratch,
     moe: &MoeGraphScratch,
+    // False: stop after `graph1` (its outputs wait in `moe`'s
+    // boundary buffers for a bounded layer-major window's
+    // `moe_window_forward`).
+    run_moe: bool,
 ) -> Result<(), LayerForwardError>
 where
     B: Backend,
@@ -3048,6 +3212,9 @@ where
     // Prefill-arc Phase 3b: host readback → CPU bucket build → expert
     // staging → graph2 are the shared `moe_block_forward`, driven
     // identically by the full-attn producer.
+    if !run_moe {
+        return Ok(());
+    }
     moe_block_forward(
         backend,
         moe,
@@ -3095,16 +3262,14 @@ where
     LayerForwardError: From<B::Error>,
     LayerForwardError: From<<B::Pool as BufferPool>::Error>,
 {
-    use crate::riir::backend::{Graph, Op, WeightRef};
+    use crate::riir::backend::Graph;
     use crate::riir::moe::moe_router::build_expert_buckets;
 
     let v = VARIANT;
     let hidden_dim = v.hidden_dim;
     let f32_sz_u = std::mem::size_of::<f32>();
     // Boundary BufIds produced by the attention `graph1`.
-    let h_mid_id = moe.h_mid;
     let h_post_id = moe.h_post;
-    let shared_gate_id = moe.shared_gate;
     let routing_indices_id = moe.routing_indices;
     let routing_weights_id = moe.routing_weights;
 
@@ -3137,20 +3302,8 @@ where
     }
 
     // ── Phases 1f-1h as graph2: shared FFN + MoE permute-fuse +
-    //    combine. The shared-expert weight-file bit widths feed the
-    //    matvec WeightRefs.
-    let s_gate_bits = bits_of(
-        wf,
-        &format!("model.layers.{layer_idx}.mlp.shared_expert.gate_proj.weight"),
-    );
-    let s_up_bits = bits_of(
-        wf,
-        &format!("model.layers.{layer_idx}.mlp.shared_expert.up_proj.weight"),
-    );
-    let s_down_bits = bits_of(
-        wf,
-        &format!("model.layers.{layer_idx}.mlp.shared_expert.down_proj.weight"),
-    );
+    //    combine.
+    let g2w = Graph2Weights::new(wf, layer_cache, layer_idx);
 
     // CPU bucket prep — needs the routing readback above.
     let buckets = build_expert_buckets(
@@ -3212,105 +3365,8 @@ where
         expert_files.record_pick(layer_idx, expert_id as usize, picks as u32);
     }
 
-    // graph2: shared FFN (gate/up matvec → swiglu → down matvec),
-    // zero the out_sum accumulator, MoE permute-fuse, combine into
-    // hidden_out. Without a shared expert (OLMoE) the shared FFN is
-    // not dispatched and the combine adds no shared term — the
-    // transient (colored) `shared_down` is never read.
-    let shared = layer_cache.shared.as_ref();
     let build_graph2 = |experts: MoeExperts, last: bool| -> Graph {
-        let mut g = Graph::new();
-        if !last {
-            // A grouped layer's earlier groups: only their rows of
-            // `down_mid`.
-            experts.push(&mut g, moe, h_post_id, n_tokens, k_active, false);
-            return g;
-        }
-        if let Some(sh) = shared {
-            g.push(Op::MatvecNTokens {
-                label: "moe.shared_gate_proj",
-                weight: WeightRef {
-                    w_off: sh.gate_w,
-                    s_off: sh.gate_s,
-                    b_off: sh.gate_b,
-                    bits: s_gate_bits,
-                },
-                input: h_post_id.into(),
-                input_off: 0,
-                output: moe.shared_ffn_gate.into(),
-                output_off: 0,
-                in_dim: hidden_dim as u32,
-                out_dim: v.shared_intermediate as u32,
-                n_tokens: n_tokens as u32,
-            });
-            g.push(Op::MatvecNTokens {
-                label: "moe.shared_up_proj",
-                weight: WeightRef {
-                    w_off: sh.up_w,
-                    s_off: sh.up_s,
-                    b_off: sh.up_b,
-                    bits: s_up_bits,
-                },
-                input: h_post_id.into(),
-                input_off: 0,
-                output: moe.shared_up.into(),
-                output_off: 0,
-                in_dim: hidden_dim as u32,
-                out_dim: v.shared_intermediate as u32,
-                n_tokens: n_tokens as u32,
-            });
-            g.push(Op::SwigluFusedBatched {
-                label: "moe.shared_swiglu",
-                gate: moe.shared_ffn_gate,
-                up: moe.shared_up,
-                out: moe.shared_act,
-                total: (n_tokens * v.shared_intermediate) as u32,
-            });
-            g.push(Op::MatvecNTokens {
-                label: "moe.shared_down_proj",
-                weight: WeightRef {
-                    w_off: sh.down_w,
-                    s_off: sh.down_s,
-                    b_off: sh.down_b,
-                    bits: s_down_bits,
-                },
-                input: moe.shared_act.into(),
-                input_off: 0,
-                output: moe.shared_down.into(),
-                output_off: 0,
-                in_dim: v.shared_intermediate as u32,
-                out_dim: hidden_dim as u32,
-                n_tokens: n_tokens as u32,
-            });
-        }
-        g.push(Op::ZeroBuffer {
-            label: "moe.out_sum_zero",
-            buf: moe.out_sum,
-            n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
-        });
-        experts.push(&mut g, moe, h_post_id, n_tokens, k_active, true);
-        if shared.is_some() {
-            g.push(Op::MoeCombineResidualNTokens {
-                label: "moe.combine",
-                h_mid: h_mid_id,
-                moe_sum: moe.out_sum,
-                shared_out: moe.shared_down,
-                shared_gate: shared_gate_id,
-                hidden_out: hidden_out_id,
-                n_tokens: n_tokens as u32,
-                dim: hidden_dim as u32,
-            });
-        } else {
-            g.push(Op::MoeCombineResidualNoSharedNTokens {
-                label: "moe.combine",
-                h_mid: h_mid_id,
-                moe_sum: moe.out_sum,
-                hidden_out: hidden_out_id,
-                n_tokens: n_tokens as u32,
-                dim: hidden_dim as u32,
-            });
-        }
-        g
+        build_graph2(&g2w, moe, n_tokens, k_active, experts, last, hidden_out_id)
     };
 
     // Bounded staging (fewer slots than experts): stage the layer's
@@ -3389,11 +3445,23 @@ where
         // the view moves to, inside the scope below.
         unsafe impl Send for StagingView {}
         let view = backend.pool_mut().with_bytes_mut(base_id, |b| StagingView(b.as_mut_ptr(), b.len()))?;
-        let ids = &buckets.expert_ids;
+        // Layer-major: what an earlier chunk of this layer staged is
+        // in place already — it lands first, and only the rest is read.
+        let (to_stage, pre_staged) = moe.split_staged(layer_idx, &buckets.expert_ids);
+        let ids = &to_stage;
         let t0 = std::time::Instant::now();
         crate::riir::io::io_trace::mark('S', layer_idx);
         let mut landed: Vec<usize> = Vec::with_capacity(num_buckets);
+        landed.extend(pre_staged);
         let mut sets_used = 0;
+        if landed.len() >= min_group && !ids.is_empty() {
+            if let Err(e) = commit(backend, &landed, sets_used, false) {
+                moe.mark_staged(&[], false);
+                return Err(e);
+            }
+            sets_used += 1;
+            landed.clear();
+        }
         let staged = std::thread::scope(|sc| -> Result<_, LayerForwardError> {
             let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
             let io = sc.spawn(move || {
@@ -3434,14 +3502,17 @@ where
         let staged = match staged {
             Ok(r) => r,
             Err(e) => {
+                moe.mark_staged(&[], false);
                 backend.wait_pending(0)?;
                 return Err(e);
             }
         };
         if let Err(e) = staged {
+            moe.mark_staged(&[], false);
             backend.wait_pending(0)?;
             return Err(e.into());
         }
+        moe.mark_staged(ids, true);
         // The rest, with the shared FFN and the combine. Done with it,
         // done with every earlier group (this only records stats).
         commit(backend, &landed, sets_used, true)?;
@@ -3527,9 +3598,14 @@ where
             // layer chunk.
             let t0 = std::time::Instant::now();
             crate::riir::io::io_trace::mark('S', layer_idx);
-            backend.pool_mut().with_bytes_mut(base_id, |staging| {
-                expert_files.stage_layer(io_pool, layer_idx, &buckets.expert_ids, staging)
-            })??;
+            // Layer-major: skip what an earlier chunk of this layer
+            // staged.
+            let (to_stage, _) = moe.split_staged(layer_idx, &buckets.expert_ids);
+            let r = backend.pool_mut().with_bytes_mut(base_id, |staging| {
+                expert_files.stage_layer(io_pool, layer_idx, &to_stage, staging)
+            });
+            moe.mark_staged(&to_stage, matches!(r, Ok(Ok(()))));
+            r??;
             crate::riir::io::io_trace::mark('s', layer_idx);
             expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
             base_id
@@ -3632,6 +3708,308 @@ where
     record_routing_actual(prefetch.as_mut(), layer_idx, k_active, &all_routing_indices);
 
     Ok(())
+}
+
+/// The MoE blocks of one layer for every chunk of a bounded
+/// layer-major window ([`crate::riir::OpenConfig::layer_major`]), after
+/// each chunk's attention `graph1` has written its boundary buffers
+/// (`moes[c]`, `ns[c]` tokens). Reads each routed expert of the layer
+/// once for the whole window: the union of the chunks' experts is
+/// staged in groups of the bounded slots (group-outer), and each group
+/// runs the gather-id matmul for every chunk that routes to it
+/// (chunk-inner), filling that chunk's rows of its own `down_mid`
+/// (`moes[c].bucket_input`). The last group's graph per chunk is the
+/// whole graph2 — shared FFN, `combine_topk` over every row, residual
+/// combine into `hidden_out_id` — after which `after_chunk(backend, c)`
+/// takes the chunk's output rows. Every row comes from the same
+/// activation row and expert weights as in [`moe_block_forward`]'s
+/// grouped path, and combine sums the k slots in the same order, so the
+/// output is bit-identical to running the chunks one at a time. With
+/// `overlap_groups > 0` the slot halves alternate as there (a half is
+/// restaged once the group two back has finished), each dispatch in
+/// flight with its own index table. `record_pick` gets each chunk's
+/// counts, as chunk-major prefill gives them.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::riir) fn moe_window_forward<B>(
+    backend: &mut B,
+    moes: &[&MoeGraphScratch],
+    ns: &[usize],
+    wf: &WeightFile,
+    layer_cache: &LayerWeightCache,
+    layer_idx: usize,
+    k_active: usize,
+    expert_files: &ExpertFiles,
+    io_pool: &rayon::ThreadPool,
+    hidden_out_id: BufId<HiddenBuf>,
+    after_chunk: &mut dyn FnMut(&mut B, usize) -> Result<(), LayerForwardError>,
+) -> Result<(), LayerForwardError>
+where
+    B: Backend,
+    LayerForwardError: From<B::Error>,
+    LayerForwardError: From<<B::Pool as BufferPool>::Error>,
+{
+    const GROUP_SKIP: u32 = 0xFFFF;
+    let v = VARIANT;
+    let moe0 = moes[0];
+    let base_id = moe0.expert_base.expect("bounded staging has a staging buffer");
+    debug_assert!(moe0.bounded() && moes.len() == ns.len());
+    let g2w = Graph2Weights::new(wf, layer_cache, layer_idx);
+
+    // Each chunk's routing, and the window's union of experts.
+    let mut routing: Vec<Vec<i32>> = Vec::with_capacity(moes.len());
+    let mut in_union = vec![false; v.num_experts];
+    for (moe, &n) in moes.iter().zip(ns) {
+        let mut idx = vec![0i32; n * k_active];
+        backend.pool().download(moe.routing_indices, unsafe {
+            std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, idx.len() * std::mem::size_of::<i32>())
+        })?;
+        let mut picks = vec![0u32; v.num_experts];
+        for &e in &idx {
+            assert!(e >= 0 && (e as usize) < v.num_experts, "router expert {e} out of range");
+            picks[e as usize] += 1;
+            in_union[e as usize] = true;
+        }
+        // Routing popularity, per chunk as the chunk-major path records it.
+        for (e, &p) in picks.iter().enumerate() {
+            if p > 0 {
+                expert_files.record_pick(layer_idx, e, p);
+            }
+        }
+        routing.push(idx);
+    }
+    // Ascending, as `stage_layer_compact` wants.
+    let union: Vec<i32> = (0..v.num_experts as i32).filter(|&e| in_union[e as usize]).collect();
+    let mut pos_of = vec![u32::MAX; v.num_experts];
+    for (i, &e) in union.iter().enumerate() {
+        pos_of[e as usize] = i as u32;
+    }
+
+    let slots = moe0.staging_experts;
+    let es = moe0.expert_stride as usize;
+    let overlap = moe0.overlap_groups > 0;
+    let group = if overlap { (slots / 2).max(1) } else { slots };
+    let n_groups = union.len().div_ceil(group).max(1);
+    // Index tables at a fixed stride (the chunks differ in length).
+    let set_stride = ns.iter().copied().max().unwrap_or(0) * k_active * std::mem::size_of::<u32>();
+    let mut dispatches = 0usize;
+    // Dispatches the previous group committed without a wait.
+    let mut prev_group_pending = 0usize;
+    for gi in 0..n_groups {
+        let ids = &union[(gi * group).min(union.len())..((gi + 1) * group).min(union.len())];
+        let base_slot = if overlap { (gi % 2) * group } else { 0 };
+        if overlap {
+            // The group two back used these slots: let it finish.
+            backend.wait_pending(prev_group_pending)?;
+        }
+        let t0 = std::time::Instant::now();
+        crate::riir::io::io_trace::mark('S', layer_idx);
+        // The group before may still be running on the GPU; it reads
+        // the other half of the slots.
+        backend.pool_mut().with_bytes_mut(base_id, |staging| {
+            expert_files.stage_layer_compact(io_pool, layer_idx, ids, &mut staging[base_slot * es..])
+        })??;
+        crate::riir::io::io_trace::mark('s', layer_idx);
+        expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
+        let last = gi + 1 == n_groups;
+        let mut pending_here = 0usize;
+        for (c, (moe, &n)) in moes.iter().zip(ns).enumerate() {
+            let set_bytes = n * k_active * std::mem::size_of::<u32>();
+            let mut rows = 0usize;
+            let group_indices: Vec<u32> = routing[c]
+                .iter()
+                .map(|&e| {
+                    let b = pos_of[e as usize] as usize;
+                    if b / group == gi {
+                        rows += 1;
+                        (base_slot + b % group) as u32
+                    } else {
+                        GROUP_SKIP
+                    }
+                })
+                .collect();
+            // The last group always runs: it holds the combine.
+            if rows == 0 && !last {
+                continue;
+            }
+            // Each dispatch in flight reads its own index table; the
+            // one that used this table last is `MOE_INDEX_SETS` back.
+            let set = dispatches % MOE_INDEX_SETS;
+            backend.wait_pending(MOE_INDEX_SETS - 1)?;
+            backend.pool_mut().upload_at(moe0.expert_indices, set * set_stride, unsafe {
+                std::slice::from_raw_parts(group_indices.as_ptr() as *const u8, set_bytes)
+            })?;
+            let graph = build_graph2(
+                &g2w,
+                moe,
+                n,
+                k_active,
+                MoeExperts::GatherId {
+                    expert_base: base_id,
+                    indices: moe0.expert_indices.into(),
+                    indices_off: (set * set_stride) as u64,
+                    n_experts: slots as u32,
+                    down_mid: moe.bucket_input.into(),
+                },
+                last,
+                hidden_out_id,
+            );
+            // One latch for the window: the first chunk's scratch.
+            if !moe0.commit_planned.get() {
+                backend.pool_mut().commit_plan(&graph)?;
+                moe0.commit_planned.set(true);
+            }
+            dispatches += 1;
+            if overlap && !last {
+                backend.execute_nowait(&graph, "graph_moe_group")?;
+                pending_here += 1;
+            } else {
+                backend.execute(&graph, "graph_moe")?;
+            }
+            if last {
+                after_chunk(backend, c)?;
+            }
+        }
+        prev_group_pending = pending_here;
+    }
+    // Done with the last group, so with every earlier one too; this
+    // only records their stats.
+    backend.wait_pending(0)?;
+    Ok(())
+}
+
+/// The layer's shared-expert weights and their bit widths, for
+/// [`build_graph2`].
+struct Graph2Weights<'a> {
+    shared: Option<&'a crate::riir::io::layer_weight_cache::SharedExpertW>,
+    /// gate / up / down projection bits.
+    bits: [u32; 3],
+}
+
+impl<'a> Graph2Weights<'a> {
+    fn new(wf: &WeightFile, layer_cache: &'a LayerWeightCache, layer_idx: usize) -> Self {
+        let bits = |p: &str| bits_of(wf, &format!("model.layers.{layer_idx}.mlp.shared_expert.{p}.weight"));
+        Self {
+            shared: layer_cache.shared.as_ref(),
+            bits: [bits("gate_proj"), bits("up_proj"), bits("down_proj")],
+        }
+    }
+}
+
+/// A batched MoE layer's graph2: shared FFN (gate/up matvec → swiglu
+/// → down matvec), zero the out_sum accumulator, MoE permute-fuse,
+/// combine into hidden_out. Without a shared expert (OLMoE) the shared
+/// FFN is not dispatched and the combine adds no shared term — the
+/// transient (colored) `shared_down` is never read. `last == false`
+/// (a grouped layer's earlier groups) pushes only the expert op, which
+/// fills its rows of `down_mid`.
+fn build_graph2(
+    w: &Graph2Weights<'_>,
+    moe: &MoeGraphScratch,
+    n_tokens: usize,
+    k_active: usize,
+    experts: MoeExperts,
+    last: bool,
+    hidden_out_id: BufId<HiddenBuf>,
+) -> crate::riir::backend::Graph {
+    use crate::riir::backend::{Graph, Op, WeightRef};
+    let v = VARIANT;
+    let hidden_dim = v.hidden_dim;
+    let f32_sz_u = std::mem::size_of::<f32>();
+    let (h_post_id, h_mid_id, shared_gate_id) = (moe.h_post, moe.h_mid, moe.shared_gate);
+    let [s_gate_bits, s_up_bits, s_down_bits] = w.bits;
+    let shared = w.shared;
+    let mut g = Graph::new();
+    if !last {
+        // A grouped layer's earlier groups: only their rows of
+        // `down_mid`.
+        experts.push(&mut g, moe, h_post_id, n_tokens, k_active, false);
+        return g;
+    }
+    if let Some(sh) = shared {
+        g.push(Op::MatvecNTokens {
+            label: "moe.shared_gate_proj",
+            weight: WeightRef {
+                w_off: sh.gate_w,
+                s_off: sh.gate_s,
+                b_off: sh.gate_b,
+                bits: s_gate_bits,
+            },
+            input: h_post_id.into(),
+            input_off: 0,
+            output: moe.shared_ffn_gate.into(),
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: v.shared_intermediate as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "moe.shared_up_proj",
+            weight: WeightRef {
+                w_off: sh.up_w,
+                s_off: sh.up_s,
+                b_off: sh.up_b,
+                bits: s_up_bits,
+            },
+            input: h_post_id.into(),
+            input_off: 0,
+            output: moe.shared_up.into(),
+            output_off: 0,
+            in_dim: hidden_dim as u32,
+            out_dim: v.shared_intermediate as u32,
+            n_tokens: n_tokens as u32,
+        });
+        g.push(Op::SwigluFusedBatched {
+            label: "moe.shared_swiglu",
+            gate: moe.shared_ffn_gate,
+            up: moe.shared_up,
+            out: moe.shared_act,
+            total: (n_tokens * v.shared_intermediate) as u32,
+        });
+        g.push(Op::MatvecNTokens {
+            label: "moe.shared_down_proj",
+            weight: WeightRef {
+                w_off: sh.down_w,
+                s_off: sh.down_s,
+                b_off: sh.down_b,
+                bits: s_down_bits,
+            },
+            input: moe.shared_act.into(),
+            input_off: 0,
+            output: moe.shared_down.into(),
+            output_off: 0,
+            in_dim: v.shared_intermediate as u32,
+            out_dim: hidden_dim as u32,
+            n_tokens: n_tokens as u32,
+        });
+    }
+    g.push(Op::ZeroBuffer {
+        label: "moe.out_sum_zero",
+        buf: moe.out_sum,
+        n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
+    });
+    experts.push(&mut g, moe, h_post_id, n_tokens, k_active, true);
+    if shared.is_some() {
+        g.push(Op::MoeCombineResidualNTokens {
+            label: "moe.combine",
+            h_mid: h_mid_id,
+            moe_sum: moe.out_sum,
+            shared_out: moe.shared_down,
+            shared_gate: shared_gate_id,
+            hidden_out: hidden_out_id,
+            n_tokens: n_tokens as u32,
+            dim: hidden_dim as u32,
+        });
+    } else {
+        g.push(Op::MoeCombineResidualNoSharedNTokens {
+            label: "moe.combine",
+            h_mid: h_mid_id,
+            moe_sum: moe.out_sum,
+            hidden_out: hidden_out_id,
+            n_tokens: n_tokens as u32,
+            dim: hidden_dim as u32,
+        });
+    }
+    g
 }
 
 /// Record a layer's routing as the prefetch prediction for the next

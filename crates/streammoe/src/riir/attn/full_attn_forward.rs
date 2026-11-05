@@ -811,6 +811,10 @@ pub(in crate::riir) fn batched_full_attn_layer_forward<B>(
     // (boundary buffers + `graph2` working set).
     scratch: &FullAttnGraphScratch,
     moe: &MoeGraphScratch,
+    // False: stop after `graph1` (its outputs wait in `moe`'s
+    // boundary buffers for a bounded layer-major window's
+    // `moe_window_forward`).
+    run_moe: bool,
 ) -> Result<(), LayerForwardError>
 where
     B: Backend,
@@ -1198,6 +1202,9 @@ where
     // Prefill-arc Phase 3b: the MoE block — host readback, CPU
     // bucket build, expert staging, graph2 — is the shared
     // `moe_block_forward`, identical to the linear-attn path.
+    if !run_moe {
+        return Ok(());
+    }
     moe_block_forward(
         backend,
         moe,
