@@ -102,6 +102,10 @@ pub enum Account {
     /// Fixed buffers the application holds next to the context
     /// ([`crate::riir::OpenConfig::host_buffers`], e.g. network frames).
     HostBuffers,
+    /// Streamed embedding ([`crate::riir::OpenConfig::embed_stream`]):
+    /// the row cache plus one prefill chunk of row staging. The table
+    /// itself leaves [`Account::Weights`].
+    EmbedCache,
 }
 
 impl Account {
@@ -120,6 +124,7 @@ impl Account {
             Account::RuntimeOverhead => "runtime_overhead",
             Account::HotTier => "hot_tier",
             Account::HostBuffers => "host_buffers",
+            Account::EmbedCache => "embed_cache",
         }
     }
 }

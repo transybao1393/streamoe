@@ -87,6 +87,9 @@ pub struct WeightFile {
     /// Shape facts from the whole manifest, before any filter — what
     /// the variant guard checks.
     probe: ManifestProbe,
+    /// Row-on-demand embedding when the table was left out of the
+    /// resident copy ([`super::embed_stream`]).
+    embed: Option<super::embed_stream::EmbedStream>,
 }
 
 /// Shape facts read from the whole manifest at open, before a tensor
@@ -328,7 +331,7 @@ impl WeightFile {
                 (Backing::Owned(read_spans_nocache(&file, &spans, len)?), len)
             }
         };
-        let wf = WeightFile { backing, len, tensors, probe };
+        let wf = WeightFile { backing, len, tensors, probe, embed: None };
         wf.bounds_check_all()?;
         eprintln!(
             "[weights] {} {:.2} GB from {}{}",
@@ -357,6 +360,17 @@ impl WeightFile {
     /// Shape facts from the whole manifest, before any filter.
     pub fn probe(&self) -> ManifestProbe {
         self.probe
+    }
+
+    /// Serve embedding lookups from `stream` (the table's tensors must
+    /// have been filtered out of this load).
+    pub fn set_embed_stream(&mut self, stream: super::embed_stream::EmbedStream) {
+        self.embed = Some(stream);
+    }
+
+    /// The streamed embedding, if this context streams it.
+    pub fn embed_stream(&self) -> Option<&super::embed_stream::EmbedStream> {
+        self.embed.as_ref()
     }
 
     /// Number of tensors in the manifest.
@@ -464,7 +478,7 @@ struct RawTensor {
     bits: Option<i32>,
 }
 
-fn parse_manifest(path: &Path) -> Result<HashMap<String, TensorInfo>, WeightFileError> {
+pub(crate) fn parse_manifest(path: &Path) -> Result<HashMap<String, TensorInfo>, WeightFileError> {
     let bytes = std::fs::read(path)?;
     let raw: RawManifest = serde_json::from_slice(&bytes)?;
     let mut out = HashMap::with_capacity(raw.tensors.len());

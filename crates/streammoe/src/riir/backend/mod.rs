@@ -788,10 +788,16 @@ pub enum Op {
     /// the offsets of `model.embed_tokens.{weight,scales,biases}`; the
     /// Metal arm indexes the shared weight buffer by those offsets,
     /// the CPU arm resolves the same bytes via `WeightFile::bytes_at`.
+    ///
+    /// `rows: Some(buf)` (streamed embedding, [`crate::riir::io::embed_stream`]):
+    /// the three tensors' rows live in `buf` instead of the weight
+    /// buffer, and `weight`'s offsets index `buf`. Same kernel, same
+    /// arithmetic — bit-identical to the resident table.
     EmbedGatherNTokens {
         label: &'static str,
         token_ids: BufId<TokenIdsBuf>,
         weight: WeightRef,
+        rows: Option<BufId<EmbedRowsBuf>>,
         hidden_out: BufId<EmbedOutBuf>,
         hidden_dim: u32,
         n_tokens: u32,
@@ -968,7 +974,11 @@ impl Op {
             Op::GatedRmsNormNTokens { values, z, .. } => {
                 vec![values.raw(), z.raw()]
             }
-            Op::EmbedGatherNTokens { token_ids, .. } => vec![token_ids.raw()],
+            Op::EmbedGatherNTokens { token_ids, rows, .. } => {
+                let mut v = vec![token_ids.raw()];
+                v.extend(rows.map(|r| r.raw()));
+                v
+            }
         }
     }
 
@@ -1335,6 +1345,7 @@ mod tests {
                 b_off: 0,
                 bits: 4,
             },
+            rows: None,
             hidden_out: buf::<EmbedOutBuf>(51),
             hidden_dim: 2048,
             n_tokens: 8,

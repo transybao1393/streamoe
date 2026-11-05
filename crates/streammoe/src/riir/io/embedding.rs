@@ -39,6 +39,8 @@ pub enum EmbeddingError {
     },
     #[error("output buffer length {got} does not match HIDDEN_DIM {expected}")]
     OutputLen { got: usize, expected: usize },
+    #[error("streamed embedding row read failed: {0}")]
+    Read(String),
 }
 
 const WEIGHT_NAME: &str = "model.embed_tokens.weight";
@@ -66,6 +68,12 @@ pub fn embed_lookup(wf: &WeightFile, token_id: i32, out: &mut [f32]) -> Result<(
             token_id,
             vocab_size,
         });
+    }
+
+    if let Some(stream) = wf.embed_stream() {
+        return stream
+            .lookup(token_id, out)
+            .map_err(|e| EmbeddingError::Read(e.to_string()));
     }
 
     let num_groups = hidden_dim / GROUP_SIZE;

@@ -209,6 +209,17 @@ pub struct OpenConfig {
     /// logits are bit-identical. Counted in the budget plan as
     /// `prefill_staging`. Must be ≥ 1.
     pub prefill_staging_experts: Option<usize>,
+    /// Stream the token-embedding table: read each token's row from
+    /// `model_weights.bin` on demand (with a small row cache) instead
+    /// of holding the table in the resident weights. Under `mem_cap`
+    /// the weights account drops by the table (0.27 GiB on a3b) and
+    /// the hot tier gets the bytes; the cache and one prefill chunk of
+    /// row staging are planned as `embed_cache`. Outputs are
+    /// bit-identical. Ignored (table kept resident) when the LM head
+    /// ties the embedding or the range has no embedding. Off by
+    /// default; `STREAMMOE_EMBED_STREAM=1` also turns it on, and
+    /// `STREAMMOE_EMBED_CACHE_ROWS` sizes the cache (default 4096).
+    pub embed_stream: bool,
 }
 
 impl Default for OpenConfig {
@@ -236,6 +247,7 @@ impl Default for OpenConfig {
             max_checkpoints: crate::riir::DEFAULT_MAX_CHECKPOINTS,
             max_decode_tokens: 1,
             prefill_staging_experts: None,
+            embed_stream: false,
         }
     }
 }

@@ -2758,6 +2758,7 @@ fn graph_metal_matches_cpu_embed_gather() {
         label: "test_embed_gather",
         token_ids,
         weight,
+        rows: None,
         hidden_out,
         hidden_dim,
         n_tokens,

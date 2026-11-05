@@ -60,7 +60,7 @@ pub use attn::rms_norm::{RmsNormError, rms_norm_cpu, rms_norm_per_head_cpu};
 pub use attn::rope::{RopeError, apply_rotary_emb};
 use backend::BufferPool as _;
 pub use backend::gpu::metal::{CmdbufStat, MetalContext, MetalError, MtlBuffer};
-use backend::{Backend, Graph, MetalBackend, Op, WeightRef};
+use backend::{Backend, BufId, EmbedRowsBuf, Graph, MetalBackend, Op, WeightRef};
 pub use io::layer_weight_cache::LayerWeightCache;
 pub use io::lm_head::{LmHeadError, lm_head_cpu};
 pub use moe::moe_router::{MoeRouterError, moe_router_cpu};
@@ -332,6 +332,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// head (GPU embedding gather) and tail (GPU final norm + lm_head).
     /// Built by [`Self::ensure_linear_resources`].
     head_tail_scratch: Option<attn::linear_attn_forward::HeadTailScratch>,
+    /// Streamed embedding ([`OpenConfig::embed_stream`]): one prefill
+    /// chunk of raw embedding rows the head's gather reads in place of
+    /// the weight buffer. Built by [`Self::ensure_linear_resources`].
+    embed_rows: Option<BufId<EmbedRowsBuf>>,
     /// Slice 4e — pending deferred-experts state. Originally a
     /// single `Option<DeferredState>` (one in-flight K-expert dispatch
     /// at a time); slice 5d-9 widened it to a depth-2
@@ -617,10 +621,40 @@ impl RsCtx<MetalBackend> {
             None => config.hot_tier_bytes.unwrap_or(0).min(range_expert_bytes),
             Some(_) => config.hot_tier_bytes.unwrap_or(u64::MAX),
         };
-        // A partial range loads only its own tensors (plan phase 3).
-        let keep_fn = |name: &str| range::keeps_tensor(&layer_range, name);
+        // Streamed embedding (opt-in): rows are read on demand, so the
+        // table leaves the resident weights. A tied LM head keeps it.
+        let embed_stream = if (config.embed_stream || io::embed_stream::enabled_from_env())
+            && layer_range.start == 0
+        {
+            match io::embed_stream::EmbedStream::open(
+                weights,
+                manifest,
+                VARIANT.hidden_dim,
+                io::embed_stream::cache_rows_from_env(),
+            ) {
+                Ok(Ok(s)) => Some(s),
+                Ok(Err(why)) => {
+                    eprintln!("[embed-stream] keeping the embedding resident: {why:?}");
+                    None
+                }
+                Err(_) => return Err(RsError::InitFailed),
+            }
+        } else {
+            None
+        };
+        let streamed = embed_stream.is_some();
+        // A partial range loads only its own tensors (plan phase 3); a
+        // streamed embedding is left out too.
+        let keep_fn = |name: &str| {
+            range::keeps_tensor(&layer_range, name)
+                && !(streamed && name.starts_with(io::embed_stream::EMBED_PREFIX))
+        };
         let keep: Option<io::weight_file::TensorFilter<'_>> =
-            (!range::is_full(&layer_range)).then_some(&keep_fn);
+            (!range::is_full(&layer_range) || streamed).then_some(&keep_fn);
+        // Row cache + one prefill chunk of row staging.
+        let embed_cache_bytes = embed_stream
+            .as_ref()
+            .map_or(0, |s| s.cache_bytes() + (prefill_chunk * s.geometry().row_bytes()) as u64);
         if hot_tier_bytes > 0 && expert_io_mode.is_mmap() {
             return Err(RsError::InvalidConfig {
                 detail: "a hot tier needs Pread expert IO; mmap mode was selected".into(),
@@ -649,6 +683,9 @@ impl RsCtx<MetalBackend> {
             plan.set_staging_experts(prefill_staging_experts, expert_size);
             if config.host_buffers > 0 {
                 plan.set(budget::Account::HostBuffers, config.host_buffers);
+            }
+            if embed_cache_bytes > 0 {
+                plan.set(budget::Account::EmbedCache, embed_cache_bytes);
             }
             plan.set(
                 budget::Account::Checkpoints,
@@ -710,8 +747,19 @@ impl RsCtx<MetalBackend> {
         } else {
             io::weight_file::WeightLoad::Mmap
         };
-        let wf = WeightFile::open_filtered(weights, manifest, load, keep)
+        let mut wf = WeightFile::open_filtered(weights, manifest, load, keep)
             .map_err(|_| RsError::InitFailed)?;
+        if let Some(s) = embed_stream {
+            let g = s.geometry();
+            eprintln!(
+                "[embed-stream] embedding streamed: {:.3} GiB left out of the resident weights; \
+                 row cache {} MiB, prefill row staging {} KiB",
+                g.table_bytes as f64 / (1u64 << 30) as f64,
+                s.cache_bytes() >> 20,
+                (prefill_chunk * g.row_bytes()) >> 10
+            );
+            wf.set_embed_stream(s);
+        }
         probe_variant_match(&wf)?;
         let mut experts = ExpertFiles::open_range_tiered(
             experts_dir,
@@ -797,6 +845,7 @@ impl RsCtx<MetalBackend> {
             moe_graph_scratch: None,
             hidden_double_buffer: None,
             head_tail_scratch: None,
+            embed_rows: None,
             deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
@@ -2192,6 +2241,15 @@ impl RsCtx<MetalBackend> {
             self.head_tail_scratch =
                 Some(attn::linear_attn_forward::HeadTailScratch::new(pool, chunk));
         }
+        if self.embed_rows.is_none() {
+            if let Some(row_bytes) = self.wf.embed_stream().map(|s| s.geometry().row_bytes()) {
+                let pool = self.backend.as_mut().expect("just-set").pool_mut();
+                self.embed_rows = Some(
+                    pool.alloc(chunk * row_bytes, "embed.rows", true)
+                        .map_err(|_| RsError::InitFailed)?,
+                );
+            }
+        }
         if self.moe_buffers.is_none() {
             let layout = self.experts.layout();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
@@ -2595,6 +2653,7 @@ impl RsCtx<MetalBackend> {
             moe_graph_scratch,
             hidden_double_buffer,
             head_tail_scratch,
+            embed_rows,
             deferred,
             prefetch,
             io_pool,
@@ -2690,15 +2749,55 @@ impl RsCtx<MetalBackend> {
                     .map(|t| t.offset)
                     .ok_or(RsError::EvalFailed)
             };
-            let embed_weight = WeightRef {
-                w_off: embed_off("model.embed_tokens.weight")?,
-                s_off: embed_off("model.embed_tokens.scales")?,
-                b_off: embed_off("model.embed_tokens.biases")?,
-                bits: 4,
-            };
+            // Streamed embedding: read the chunk's raw rows (cache or
+            // disk), upload them as `[weight | scales | biases]` rows,
+            // and gather from them with ids 0..n — the same kernel over
+            // the same bytes, so bit-identical to the resident table.
+            let (embed_weight, rows_id, ids): (WeightRef, Option<BufId<EmbedRowsBuf>>, std::borrow::Cow<'_, [i32]>) =
+                match wf.embed_stream() {
+                    Some(stream) => {
+                        let g = stream.geometry();
+                        let rows_id = embed_rows.ok_or(RsError::EvalFailed)?;
+                        let rb = g.row_bytes();
+                        let mut raw = vec![0u8; n * rb];
+                        stream
+                            .rows(tokens, &mut raw, Some(io_pool))
+                            .map_err(|_| RsError::EvalFailed)?;
+                        // Interleaved rows → three planes.
+                        let mut planes = vec![0u8; n * rb];
+                        let (pw, ps) = planes.split_at_mut(n * g.w_row);
+                        let (ps, pb) = ps.split_at_mut(n * g.sb_row);
+                        for (t, row) in raw.chunks_exact(rb).enumerate() {
+                            pw[t * g.w_row..(t + 1) * g.w_row].copy_from_slice(&row[..g.w_row]);
+                            ps[t * g.sb_row..(t + 1) * g.sb_row]
+                                .copy_from_slice(&row[g.w_row..g.w_row + g.sb_row]);
+                            pb[t * g.sb_row..(t + 1) * g.sb_row].copy_from_slice(&row[g.w_row + g.sb_row..]);
+                        }
+                        backend
+                            .pool_mut()
+                            .upload(rows_id, &planes)
+                            .map_err(|_| RsError::EvalFailed)?;
+                        let weight = WeightRef {
+                            w_off: 0,
+                            s_off: (n * g.w_row) as u64,
+                            b_off: (n * (g.w_row + g.sb_row)) as u64,
+                            bits: 4,
+                        };
+                        (weight, Some(rows_id), (0..n as i32).collect::<Vec<_>>().into())
+                    }
+                    None => {
+                        let weight = WeightRef {
+                            w_off: embed_off("model.embed_tokens.weight")?,
+                            s_off: embed_off("model.embed_tokens.scales")?,
+                            b_off: embed_off("model.embed_tokens.biases")?,
+                            bits: 4,
+                        };
+                        (weight, None, tokens.into())
+                    }
+                };
             backend
                 .pool_mut()
-                .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(tokens))
+                .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(&ids))
                 .expect("pool upload token ids");
             let mut g_head = Graph::new();
             // The head writes the embedding-gather output into the
@@ -2711,6 +2810,7 @@ impl RsCtx<MetalBackend> {
                 label: "embed_gather",
                 token_ids: head_tail_scratch.token_ids,
                 weight: embed_weight,
+                rows: rows_id,
                 hidden_out: hidden_a_id.into(),
                 hidden_dim: hidden_dim as u32,
                 n_tokens: n as u32,

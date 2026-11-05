@@ -287,6 +287,19 @@ history of `.claude/memory/`, which is no longer tracked.
 - Snapshots are not converted between KV formats: loading a snapshot
   into a context with another `kv_format` fails with
   `ShapeMismatch { field: "kv_format" }`. F32 snapshots stay v2 / v3.
+- `embed_stream` (or `STREAMMOE_EMBED_STREAM=1`) reads token-embedding
+  rows from `model_weights.bin` on demand instead of keeping the table
+  resident: under `mem_cap` the weights account drops by the table
+  (a3b 0.27 GiB, a17b 0.53 GiB) and the hot tier gets it; the row
+  cache (`STREAMMOE_EMBED_CACHE_ROWS`, default 4096 rows, 4.5 MiB on
+  a3b) and one prefill chunk of row staging are planned as
+  `embed_cache`. Logits are bit-identical (`tests/embed_stream.rs`).
+  It is ignored for a range that does not start at layer 0 and when
+  the manifest has no `lm_head.weight` (a tied LM head reads the
+  table); no current variant ties it. Off by default until it has been
+  measured more widely: a3b 4-bit chat, 4 GiB cap, 11.2 → 11.7 tok/s,
+  hits 65 → 68%; 6 GiB cap, 14.9 → 14.9 tok/s, hits 82 → 83%; first
+  word unchanged.
 
 ### Expected behavior, not bugs
 
