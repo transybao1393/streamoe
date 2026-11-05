@@ -498,6 +498,12 @@ tag!(
     RopePosBuf
 );
 tag!(
+    /// Streamed embedding rows — `[weight rows | scales rows | biases
+    /// rows]` for one prefill chunk, host-uploaded; read by
+    /// `EmbedGatherNTokens` in place of the weight buffer.
+    EmbedRowsBuf
+);
+tag!(
     /// Token IDs — `[n_tokens]` i32. Host-uploaded; input to
     /// `EmbedGatherNTokens`.
     TokenIdsBuf

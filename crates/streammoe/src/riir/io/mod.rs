@@ -1,3 +1,4 @@
+pub mod embed_stream;
 pub mod embedding;
 pub mod expert_io;
 pub mod expert_io_mode;

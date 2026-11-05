@@ -1168,15 +1168,20 @@ impl Backend for MetalBackend {
             Op::EmbedGatherNTokens {
                 token_ids,
                 weight,
+                rows,
                 hidden_out,
                 hidden_dim,
                 n_tokens,
                 ..
             } => {
+                let src = match rows {
+                    Some(r) => self.pool.handle(*r),
+                    None => self.wf_buf.buffer(),
+                };
                 encode_embed_gather_4bit_into(
                     cmd,
                     &self.embed_gather_4bit_pso,
-                    self.wf_buf.buffer(),
+                    src,
                     weight.w_off,
                     weight.s_off,
                     weight.b_off,
