@@ -228,6 +228,49 @@ mod model {
         assert!(first_decode == again_decode, "decode after reclaim differs");
     }
 
+    /// `STREAMMOE_ATTN_FIRST=1` issues each layer's prefetch after
+    /// committing the layer's first command buffer instead of before
+    /// encoding it. Same GPU work in the same order, so a capped (pread,
+    /// prefetching) greedy decode must give bit-identical logits either
+    /// way. The switch is read at open, so one process opens twice.
+    #[test]
+    #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+    fn a3b_attn_first_decode_is_bit_identical() {
+        let cap = 4 * GIB;
+        let p = diff_helpers::default_a3b_paths();
+        let root = std::env::var_os("STREAMMOE_TEST_ROOT").map_or(p.root.clone(), PathBuf::from);
+        let cfg = OpenConfig { n_ctx: 4096, mem_cap: Some(cap), max_checkpoints: 0, ..OpenConfig::default() };
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as i32).unwrap();
+        // FNV-1a over the logits' bit patterns.
+        let hash = |l: &[f32]| {
+            l.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100_0000_01b3))
+        };
+        let run = |on: bool| {
+            // SAFETY: single-threaded test body; nothing else reads the
+            // environment concurrently.
+            unsafe { std::env::set_var("STREAMMOE_ATTN_FIRST", if on { "1" } else { "0" }) };
+            let mut ctx = Ctx::open_with(&p.weights, &p.manifest, &p.vocab, &root, false, &cfg).expect("open");
+            let prompt: Vec<i32> = (0..40).map(|i| 3000 + 11 * i).collect();
+            let mut logits = vec![0f32; ctx.n_vocab()];
+            ctx.eval_prompt(&prompt, 0, 0, &mut logits).expect("prefill");
+            let mut out = Vec::new();
+            for pos in prompt.len()..prompt.len() + 64 {
+                let tok = argmax(&logits);
+                ctx.eval_token(tok, pos, 0, &mut logits).expect("decode");
+                out.push((tok, hash(&logits)));
+            }
+            let st = ctx.expert_io_stats();
+            eprintln!("[budget_cap] attn_first={on}: prefetch hits {} of {} decode reads", st.prefetch_hits, st.demand.reads + st.prefetch.reads);
+            out
+        };
+        let off = run(false);
+        let on = run(true);
+        unsafe { std::env::remove_var("STREAMMOE_ATTN_FIRST") };
+        for (i, (a, b)) in off.iter().zip(&on).enumerate() {
+            assert_eq!(a, b, "decode token {i}: (token, logits hash) differ with STREAMMOE_ATTN_FIRST");
+        }
+    }
+
     /// What `runtime_overhead` has to cover, over a mixed workload under
     /// a 4 GiB cap: a three-chunk prompt, a long decode, multi-token
     /// passes with rewinds, two requests decoded together, checkpoints

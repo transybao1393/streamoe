@@ -1019,6 +1019,10 @@ pub fn linear_attn_layer_forward(
     // in `buffers.normed`, ready for the next layer's CMD1. `None`
     // disables the chain — used for the last layer and the dump hook.
     chain_next_norm_off: Option<u64>,
+    // Issue this layer's own prefetch ([`layer_prefetch`]) after
+    // committing CMD1+CMD2+3, while the GPU runs it, instead of the
+    // caller issuing it before encoding (`STREAMMOE_ATTN_FIRST`).
+    prefetch_after_commit: bool,
 ) -> Result<(), LayerForwardError> {
     let queue = metal.queue_clone();
     let cmdbuf = queue.new_command_buffer();
@@ -1046,6 +1050,7 @@ pub fn linear_attn_layer_forward(
         gpu_combine,
         /* gpu_attn_args = */ None,
         chain_next_norm_off,
+        prefetch_after_commit,
     )
 }
 
@@ -1412,9 +1417,12 @@ pub(in crate::riir) fn post_attention_tail(
     // Output lands in `buffers.normed`, ready for the next layer's
     // CMD1. `None` (or CPU-combine) disables the chain.
     chain_next_norm_off: Option<u64>,
+    // Issue this layer's own prefetch ([`layer_prefetch`]) between
+    // committing `cmdbuf` and waiting for it.
+    prefetch_after_commit: bool,
 ) -> Result<(), LayerForwardError> {
     let GpuLayerCtx {
-        wf: _,
+        wf,
         wf_buf,
         layer_cache: _,
         buffers,
@@ -1424,17 +1432,22 @@ pub(in crate::riir) fn post_attention_tail(
     // Plan phase 6 overlap: with lookahead on, the next layer's
     // prefetch is issued while this layer's CMD2+3 runs.
     let want_ahead = prefetch.lookahead() && chain_next_norm_off.is_some();
-    let mut ahead = || {
-        lookahead_prefetch(
-            prefetch,
-            moe,
-            buffer_pool,
-            deferred,
-            pool,
-            expert_files,
-            layer_idx + 1,
-            k_active,
-        )
+    let mut between = || {
+        if prefetch_after_commit {
+            layer_prefetch(prefetch, moe, buffer_pool, pool, expert_files, wf, layer_idx, k_active);
+        }
+        if want_ahead {
+            lookahead_prefetch(
+                prefetch,
+                moe,
+                buffer_pool,
+                deferred,
+                pool,
+                expert_files,
+                layer_idx + 1,
+                k_active,
+            )
+        }
     };
     let intermediates = post_attention_pre_moe(
         metal,
@@ -1444,7 +1457,7 @@ pub(in crate::riir) fn post_attention_tail(
         k_active,
         o_proj,
         gpu_attn_args,
-        want_ahead.then_some(&mut ahead as &mut dyn FnMut()),
+        (want_ahead || prefetch_after_commit).then_some(&mut between as &mut dyn FnMut()),
     )?;
     moe_dispatch_per_token(
         metal,
@@ -1462,6 +1475,58 @@ pub(in crate::riir) fn post_attention_tail(
         gpu_combine,
         chain_next_norm_off,
     )
+}
+
+/// Whether decode should commit each layer's first command buffer
+/// before issuing the layer's own prefetch (`STREAMMOE_ATTN_FIRST=1`;
+/// default off). Read once per `RsCtx::open` into
+/// [`PrefetchState::attn_first`](crate::riir::io::prefetch::PrefetchState::attn_first).
+///
+/// The prefetch's CPU work — the cross-layer guess (a 256 × 2048 gate
+/// matvec on the CPU) and waiting out reads still in flight into its
+/// prefetch set — otherwise runs between the previous layer's expert
+/// commit and this layer's attention commit, and the GPU sits idle once
+/// the short expert buffer finishes. The order of GPU work and the data
+/// each kernel reads are unchanged, so output is bit-identical.
+pub(in crate::riir) fn attn_first_from_env() -> bool {
+    std::env::var("STREAMMOE_ATTN_FIRST").is_ok_and(|v| v == "1")
+}
+
+/// Issue `layer_idx`'s own speculative prefetch (pread mode only):
+/// the cross-layer guess from the previous layer's residual when
+/// available, else the previous token's picks, minus experts resident
+/// in the hot tier, into prefetch set `layer_idx % 2`. No-op if a
+/// lookahead already put this layer's prefetch in flight or there is no
+/// prediction (first token).
+///
+/// Must run after layer `layer_idx - 2`'s expert dispatch has drained
+/// (it read the set this overwrites); the decode loop drains it at the
+/// top of the layer.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::riir) fn layer_prefetch(
+    prefetch: &mut crate::riir::io::prefetch::PrefetchState,
+    moe: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
+    pool: &rayon::ThreadPool,
+    expert_files: &ExpertFiles,
+    wf: &WeightFile,
+    layer_idx: usize,
+    k_active: usize,
+) {
+    if !prefetch.mode().is_pread() || prefetch.in_flight_for(layer_idx) {
+        return;
+    }
+    let cross = prefetch
+        .cross_mut()
+        .and_then(|c| c.guess(wf, layer_idx, k_active));
+    let Some(mut predicted) = cross.or_else(|| prefetch.predict_for(layer_idx)) else {
+        return;
+    };
+    // Experts already in the hot tier bind from RAM; don't spend SSD
+    // bandwidth prefetching them.
+    crate::riir::io::prefetch::mask_hot(expert_files.hot_tier(), layer_idx, &mut predicted[..k_active]);
+    let data_prefetch = moe.data_prefetch_slots_mut_array(buffer_pool, layer_idx % 2);
+    prefetch.dispatch(layer_idx, predicted, k_active, data_prefetch, pool, expert_files);
 }
 
 /// Lookahead prefetch (plan phase 6 overlap): issue `next_layer`'s
