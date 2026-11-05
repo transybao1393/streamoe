@@ -778,6 +778,7 @@ impl RsCtx<MetalBackend> {
             prefetch.enable_cross_layer(io::guess::CrossLayerGuesser::new(&wf, layer_range.clone()));
         }
         prefetch.set_lookahead(config.prefetch_lookahead && expert_io_mode.is_pread());
+        prefetch.set_attn_first(attn::linear_attn_forward::attn_first_from_env());
         prefetch.set_max_experts(config.resolved_prefetch_experts());
         let mut ctx = Self {
             wf,
@@ -1699,6 +1700,7 @@ impl RsCtx<MetalBackend> {
                 gpu_combine,
                 /* prev_layer_chained = */ false,
                 /* chain_next_norm_off = */ None,
+                /* prefetch_after_commit = */ false,
             )
             .map_err(|_| RsError::EvalFailed)?;
         } else {
@@ -1732,6 +1734,7 @@ impl RsCtx<MetalBackend> {
                 gpu_combine,
                 /* prev_layer_chained = */ false,
                 /* chain_next_norm_off = */ None,
+                /* prefetch_after_commit = */ false,
             )
             .map_err(|_| RsError::EvalFailed)?;
         }
@@ -3486,29 +3489,22 @@ impl RsCtx<MetalBackend> {
             // capacity) fires it as before.
             // With lookahead (plan phase 6) the previous layer already
             // issued this layer's prefetch during its attention.
-            if prefetch.mode().is_pread() && !prefetch.in_flight_for(layer_idx) {
-                // Cross-layer guess from the previous layer's residual
-                // (plan phase 6) when enabled and available; else the
-                // previous token's picks.
-                let cross = prefetch
-                    .cross_mut()
-                    .and_then(|c| c.guess(wf, layer_idx, k_active));
-                if let Some(mut predicted) = cross.or_else(|| prefetch.predict_for(layer_idx)) {
-                    // Experts already in the hot tier bind from RAM;
-                    // don't spend SSD bandwidth prefetching them.
-                    io::prefetch::mask_hot(experts.hot_tier(), layer_idx, &mut predicted[..k_active]);
-                    let data_prefetch =
-                        moe_buffers.data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
-                    prefetch.dispatch(
-                        layer_idx,
-                        predicted,
-                        k_active,
-                        data_prefetch,
-                        io_pool,
-                        experts,
-                    );
-                }
+            // `STREAMMOE_ATTN_FIRST=1` moves it after the commit of the
+            // layer's first command buffer (see `attn_first_from_env`).
+            let attn_first = prefetch.attn_first();
+            if !attn_first {
+                attn::linear_attn_forward::layer_prefetch(
+                    prefetch,
+                    moe_buffers,
+                    buffer_pool,
+                    io_pool,
+                    experts,
+                    wf,
+                    layer_idx,
+                    k_active,
+                );
             }
+            crate::riir::backend::gpu::gpu_timing::mark("layer_prefetched");
 
             // Slice 5d-8: chain enabled for every non-last layer
             // (gpu_combine is hardcoded true here). Last layer's
@@ -3548,6 +3544,7 @@ impl RsCtx<MetalBackend> {
                     /* gpu_combine = */ true,
                     prev_layer_chained,
                     chain_next_norm_off,
+                    attn_first,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {
@@ -3581,6 +3578,7 @@ impl RsCtx<MetalBackend> {
                     /* gpu_combine = */ true,
                     prev_layer_chained,
                     chain_next_norm_off,
+                    attn_first,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }

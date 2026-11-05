@@ -111,6 +111,10 @@ pub struct PrefetchState {
     /// Issue layer L+1's prefetch during layer L's attention
     /// ([`crate::riir::OpenConfig::prefetch_lookahead`]).
     lookahead: bool,
+    /// Issue each layer's own prefetch after committing the layer's
+    /// first command buffer instead of before encoding it
+    /// (`STREAMMOE_ATTN_FIRST`, read at open).
+    attn_first: bool,
     /// Slot-level hit counter (per-slot prediction matched the
     /// per-token routing). Accumulates across the lifetime of the
     /// state; reset via [`PrefetchState::reset_stats`] for per-request
@@ -279,6 +283,7 @@ impl PrefetchState {
             last_token_indices: vec![None; num_layers],
             in_flight: [None, None],
             lookahead: false,
+            attn_first: false,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             mode,
@@ -312,6 +317,19 @@ impl PrefetchState {
     /// `true` if lookahead prefetch is on.
     pub fn lookahead(&self) -> bool {
         self.lookahead
+    }
+
+    /// Issue each layer's own prefetch after committing the layer's
+    /// first command buffer, while the GPU runs it, instead of before
+    /// encoding it. See
+    /// [`crate::riir::attn::linear_attn_forward::attn_first_from_env`].
+    pub fn set_attn_first(&mut self, on: bool) {
+        self.attn_first = on;
+    }
+
+    /// `true` if each layer's prefetch goes after its first commit.
+    pub fn attn_first(&self) -> bool {
+        self.attn_first
     }
 
     /// `true` if a prefetch targeting `layer_idx` is in flight.

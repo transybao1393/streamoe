@@ -690,9 +690,13 @@ pub(in crate::riir) fn full_attn_layer_forward(
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
     prev_layer_chained: bool,
     chain_next_norm_off: Option<u64>,
+    // Issue this layer's own prefetch after committing CMD1, while the
+    // GPU runs it (`STREAMMOE_ATTN_FIRST`; see
+    // `linear_attn_forward::attn_first_from_env`).
+    prefetch_after_commit: bool,
 ) -> Result<(), LayerForwardError> {
     let GpuLayerCtx {
-        wf: _,
+        wf,
         wf_buf,
         layer_cache: _,
         buffers,
@@ -702,17 +706,31 @@ pub(in crate::riir) fn full_attn_layer_forward(
     // Plan phase 6 overlap: with lookahead on, the next layer's
     // prefetch is issued while this layer's CMD1 runs.
     let want_ahead = prefetch.lookahead() && chain_next_norm_off.is_some();
-    let mut ahead = || {
-        crate::riir::attn::linear_attn_forward::lookahead_prefetch(
-            prefetch,
-            moe,
-            buffer_pool,
-            deferred,
-            pool,
-            expert_files,
-            layer_idx + 1,
-            k_active,
-        )
+    let mut between = || {
+        if prefetch_after_commit {
+            crate::riir::attn::linear_attn_forward::layer_prefetch(
+                prefetch,
+                moe,
+                buffer_pool,
+                pool,
+                expert_files,
+                wf,
+                layer_idx,
+                k_active,
+            );
+        }
+        if want_ahead {
+            crate::riir::attn::linear_attn_forward::lookahead_prefetch(
+                prefetch,
+                moe,
+                buffer_pool,
+                deferred,
+                pool,
+                expert_files,
+                layer_idx + 1,
+                k_active,
+            )
+        }
     };
     let intermediates = full_attn_pre_moe_layer_forward(
         metal,
@@ -722,7 +740,7 @@ pub(in crate::riir) fn full_attn_layer_forward(
         k_active,
         kv_state,
         prev_layer_chained,
-        want_ahead.then_some(&mut ahead as &mut dyn FnMut()),
+        (want_ahead || prefetch_after_commit).then_some(&mut between as &mut dyn FnMut()),
     )?;
     moe_dispatch_per_token(
         metal,
