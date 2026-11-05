@@ -226,8 +226,9 @@ history of `.claude/memory/`, which is no longer tracked.
   the expert commit and before the attention commit, longer than the
   ~0.3 ms expert buffer — ~7.4 ms of GPU idle per token in ~40 gaps
   (a3b, 4-bit, 4 GiB cap, `tools/gpu_timing_report.py`; a token then
-  had 126 command buffers, 91 of them waited on). `STREAMMOE_ATTN_FIRST=1`
-  (read at open, default off) runs the prefetch in the commit-to-wait
+  had 126 command buffers, 91 of them waited on). Attention-first decode
+  (default on since 2026-11-05; `STREAMMOE_ATTN_FIRST=0` turns it off,
+  read at open) runs the prefetch in the commit-to-wait
   slot of the layer's first command buffer instead, where the CPU
   waits on the GPU anyway: that gap falls to 0.04 ms per token, and
   the kernels run 4–9% faster in the longer bursts. Same GPU work in

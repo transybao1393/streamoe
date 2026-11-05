@@ -3489,7 +3489,8 @@ impl RsCtx<MetalBackend> {
             // capacity) fires it as before.
             // With lookahead (plan phase 6) the previous layer already
             // issued this layer's prefetch during its attention.
-            // `STREAMMOE_ATTN_FIRST=1` moves it after the commit of the
+            // Attention-first decode (the default; `STREAMMOE_ATTN_FIRST=0`
+            // turns it off) moves it after the commit of the
             // layer's first command buffer (see `attn_first_from_env`).
             let attn_first = prefetch.attn_first();
             if !attn_first {

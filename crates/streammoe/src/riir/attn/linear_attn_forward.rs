@@ -1503,8 +1503,8 @@ pub(in crate::riir) fn post_attention_tail(
 }
 
 /// Whether decode should commit each layer's first command buffer
-/// before issuing the layer's own prefetch (`STREAMMOE_ATTN_FIRST=1`;
-/// default off). Read once per `RsCtx::open` into
+/// before issuing the layer's own prefetch (default on;
+/// `STREAMMOE_ATTN_FIRST=0` turns it off). Read once per `RsCtx::open` into
 /// [`PrefetchState::attn_first`](crate::riir::io::prefetch::PrefetchState::attn_first).
 ///
 /// The prefetch's CPU work — the cross-layer guess (a 256 × 2048 gate
@@ -1514,7 +1514,7 @@ pub(in crate::riir) fn post_attention_tail(
 /// the short expert buffer finishes. The order of GPU work and the data
 /// each kernel reads are unchanged, so output is bit-identical.
 pub(in crate::riir) fn attn_first_from_env() -> bool {
-    std::env::var("STREAMMOE_ATTN_FIRST").is_ok_and(|v| v == "1")
+    !std::env::var("STREAMMOE_ATTN_FIRST").is_ok_and(|v| v == "0")
 }
 
 /// Issue `layer_idx`'s own speculative prefetch (pread mode only):
