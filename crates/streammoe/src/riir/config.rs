@@ -198,6 +198,17 @@ pub struct OpenConfig {
     /// `mem_cap` (`multi_decode` account, ~0.2 GiB at 4 on a3b) and
     /// built on the first pass; a longer pass is refused.
     pub max_decode_tokens: usize,
+    /// Pread-mode prefill staging slots (experts of one layer held at
+    /// once for the batched MoE layer). `None` (default): one per
+    /// expert of a layer — today's layout — unless that makes a
+    /// capped plan miss `mem_cap`, in which case the open falls back
+    /// to [`crate::riir::budget::BOUNDED_STAGING_EXPERTS`]. `Some(n)`
+    /// forces `n` (clamped to the expert count; below it, rounded down
+    /// to a multiple of 8, at least 8). With fewer slots than experts
+    /// the layer stages and runs its routed experts in groups that fit;
+    /// logits are bit-identical. Counted in the budget plan as
+    /// `prefill_staging`. Must be ≥ 1.
+    pub prefill_staging_experts: Option<usize>,
 }
 
 impl Default for OpenConfig {
@@ -224,6 +235,7 @@ impl Default for OpenConfig {
             attn_threads: DEFAULT_ATTN_THREADS,
             max_checkpoints: crate::riir::DEFAULT_MAX_CHECKPOINTS,
             max_decode_tokens: 1,
+            prefill_staging_experts: None,
         }
     }
 }
@@ -252,6 +264,9 @@ impl OpenConfig {
         }
         if self.prefill_chunk == Some(0) {
             return Err("prefill_chunk must be ≥ 1".into());
+        }
+        if self.prefill_staging_experts == Some(0) {
+            return Err("prefill_staging_experts must be ≥ 1".into());
         }
         if self.io_queue_depth == Some(0) {
             return Err("io_queue_depth must be ≥ 1".into());
@@ -339,6 +354,8 @@ mod tests {
         assert!(no_depth.validate().is_err());
         let no_rate = OpenConfig { io_bytes_per_sec: Some(0), ..OpenConfig::default() };
         assert!(no_rate.validate().is_err());
+        let no_staging = OpenConfig { prefill_staging_experts: Some(0), ..OpenConfig::default() };
+        assert!(no_staging.validate().is_err());
         let bounded = OpenConfig {
             io_queue_depth: Some(4),
             io_bytes_per_sec: Some(1 << 30),

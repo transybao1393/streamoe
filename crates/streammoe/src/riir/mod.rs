@@ -454,6 +454,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// ([`OpenConfig::resolved_prefill_chunk`]). Sizes every prefill
     /// scratch buffer; `step_internal` splits prompts by it.
     prefill_chunk: usize,
+    /// Pread-mode prefill staging slots
+    /// ([`OpenConfig::prefill_staging_experts`], resolved at open):
+    /// `VARIANT.num_experts` for full staging, fewer when bounded.
+    prefill_staging_experts: usize,
     /// Under a cap: the plan total less `runtime_overhead`, i.e. every
     /// byte the plan accounts for exactly. The open-time log reports
     /// the measured footprint above it as `unplanned`.
@@ -626,6 +630,8 @@ impl RsCtx<MetalBackend> {
         // plan can size the checkpoint buffers from them.
         let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone(), config.kv_format);
         let checkpoint_slot_bytes = snapshot::state_snapshot::state_size_full(&layer_states);
+        let mut prefill_staging_experts =
+            budget::staging_experts(config.prefill_staging_experts.unwrap_or(VARIANT.num_experts));
         let mut planned_exact = None;
         if let Some(cap) = config.mem_cap {
             let weights_bytes = io::weight_file::filtered_bytes(weights, manifest, keep)
@@ -640,6 +646,7 @@ impl RsCtx<MetalBackend> {
                 prefill_chunk,
             );
             plan.set_expert_size(expert_size);
+            plan.set_staging_experts(prefill_staging_experts, expert_size);
             if config.host_buffers > 0 {
                 plan.set(budget::Account::HostBuffers, config.host_buffers);
             }
@@ -661,6 +668,20 @@ impl RsCtx<MetalBackend> {
                     budget::Account::KvScratch,
                     budget::kv_scratch_bytes(VARIANT, &layer_range, n_ctx, config.kv_format),
                 );
+            }
+            // Staging every expert of a layer does not fit: bound it,
+            // and let the batched MoE layer run in expert groups.
+            if config.prefill_staging_experts.is_none() && plan.check(cap).is_err() {
+                let bounded = budget::staging_experts(budget::BOUNDED_STAGING_EXPERTS);
+                if bounded < prefill_staging_experts && plan.get(budget::Account::PrefillStaging) > 0 {
+                    prefill_staging_experts = bounded;
+                    plan.set_staging_experts(bounded, expert_size);
+                    eprintln!(
+                        "[budget] staging all {} experts of a layer does not fit the cap; \
+                         prefill stages {bounded} at a time",
+                        VARIANT.num_experts
+                    );
+                }
             }
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
             // `None` → the hot tier takes whatever the plan leaves, up
@@ -801,6 +822,7 @@ impl RsCtx<MetalBackend> {
             n_ctx,
             mem_cap: config.mem_cap,
             prefill_chunk,
+            prefill_staging_experts,
             planned_exact,
             runtime_overhead: config.runtime_overhead,
             baseline_peak,
@@ -2152,8 +2174,9 @@ impl RsCtx<MetalBackend> {
             let mode = self.expert_io_mode;
             let expert_size = self.experts.expert_size();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.moe_graph_scratch = Some(attn::linear_attn_forward::MoeGraphScratch::new(
-                pool, k_active, mode, chunk, expert_size,
+            let staging = self.prefill_staging_experts;
+            self.moe_graph_scratch = Some(attn::linear_attn_forward::MoeGraphScratch::new_with_staging(
+                pool, k_active, mode, chunk, expert_size, staging,
             ));
         }
         if self.hidden_double_buffer.is_none() {

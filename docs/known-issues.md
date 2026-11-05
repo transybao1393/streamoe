@@ -76,6 +76,31 @@ history of `.claude/memory/`, which is no longer tracked.
   before, 114.4 / 117.6 after, alternating runs); outputs unchanged
   (`spec_bench` / `verify_bench` match plain decode, `mlx_regression`
   passes).
+- **Prefill staging held every expert of a layer** (`9cf7d58`). The
+  pread-mode staging buffer (`prefill_staging`) was
+  `num_experts × expert_size`: 3.38 GiB on Qwen3.5-397B-A17B (512 ×
+  6.75 MiB), so its plan was 10.46 GiB and it could not open at 7 or
+  9 GiB. Under a cap where full staging misses the plan, the open now
+  falls back to `BOUNDED_STAGING_EXPERTS` (64) slots, 0.42 GiB on
+  a17b, so its plan drops to ≈ 7.50 GiB: it opens at 9 GiB (1.5 GiB
+  left for the hot tier); 7 GiB still needs a smaller `n_ctx` or
+  fewer checkpoints (derived from the plan code — no a17b weights on
+  this host to run it). `OpenConfig::prefill_staging_experts` forces
+  a size (`None`
+  keeps full staging whenever it fits, so nothing changes for a3b /
+  OLMoE). With fewer slots than experts, each batched MoE layer stages
+  its routed experts in groups (compact slots, `stage_layer_compact`)
+  and runs the gather-id matmul once per group with the router ids
+  remapped to the group's slots (others → `0xFFFF`, dropped by map0);
+  each group fills only its rows of `down_mid` (kept in the
+  persistent `bucket_input`), and the last group's graph is the full
+  graph2 (shared FFN, `combine_topk` over all rows, residual). Every
+  expert is still read once per layer chunk; a group costs one more
+  GPU submit. Logits are bit-identical to full staging
+  (`bounded_staging.rs`, 16 and 40 slots, a3b 4-bit and packed
+  3-bit, through a 3-chunk prefill, decode on the lent buffer and a
+  second prefill); `prefill_staging_matches_pool` keeps the account
+  exact.
 
 ### Correctness
 
@@ -220,6 +245,9 @@ history of `.claude/memory/`, which is no longer tracked.
   `STREAMMOE_MOE_GATHER_ID=0` fallbacks and the per-expert decode
   fallback (hidden > 4096, Cogito) have 4-bit kernels only. Every
   layer file must hold the same layout (`ExpertIoError::MixedLayouts`).
+- Bounded prefill staging (`prefill_staging_experts` below the expert
+  count, or the capped fallback) always uses `MoeGatherIdFuse`;
+  `STREAMMOE_MOE_GATHER_ID=0` is ignored there.
 - **Checkpoints cost cap memory up front.** Under `mem_cap`,
   `max_checkpoints` (default 4) full-context snapshots are planned
   whether or not they are used: on OLMoE at n_ctx 2048 F32 that is

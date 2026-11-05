@@ -42,6 +42,29 @@ const TWO_MIB: u64 = 2 << 20;
 /// prefill chunks and larger variants. Only used under a cap.
 pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB / 2;
 
+/// Prefill staging slots a capped open falls back to when staging
+/// every expert of a layer does not fit the plan (and
+/// [`crate::riir::OpenConfig::prefill_staging_experts`] is `None`).
+/// The batched MoE layer then runs in expert groups of this many
+/// (`moe_block_forward`). Each expert is still read once per layer
+/// chunk; a group only costs a GPU submit and the small map0 /
+/// SwiGLU passes, so the slots go further as hot tier. 64 × 6.75 MiB
+/// = 0.42 GiB on Qwen3.5-397B-A17B (vs 3.38 GiB for all 512).
+pub const BOUNDED_STAGING_EXPERTS: usize = 64;
+
+/// Staging slots for a request of `n`: clamped to `1..=num_experts`;
+/// below `num_experts` it is rounded down to a multiple of 8 (at
+/// least 8), which keeps the map0 kernel's threadgroup memory
+/// (`slots × k × 2` bytes) a multiple of 16 as Metal requires.
+/// `num_experts` means full staging.
+pub fn staging_experts(n: usize) -> usize {
+    let all = VARIANT.num_experts;
+    if n >= all {
+        return all;
+    }
+    (n / 8 * 8).max(8).min(all)
+}
+
 /// One named slice of the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Account {
@@ -62,7 +85,8 @@ pub enum Account {
     LinearState,
     /// Expert slot ring: synced + two prefetch sets, 2 MiB-aligned.
     ExpertSlots,
-    /// Prefill expert staging (pread mode only).
+    /// Prefill expert staging (pread mode only): one block per expert
+    /// of a layer, or [`staging_experts`] blocks when bounded.
     PrefillStaging,
     /// Batched-prefill scratch sized by the context's prefill chunk
     /// ([`prefill_scratch_bytes`]).
@@ -338,6 +362,15 @@ impl BudgetPlan {
         }
     }
 
+    /// Re-size [`Account::PrefillStaging`] for `experts` slots of
+    /// `expert` bytes (see [`staging_experts`]); stays 0 if the mode
+    /// has no staging.
+    pub fn set_staging_experts(&mut self, experts: usize, expert: u64) {
+        if self.get(Account::PrefillStaging) > 0 {
+            self.set(Account::PrefillStaging, experts as u64 * expert);
+        }
+    }
+
     /// Add (or replace) one account.
     pub fn set(&mut self, account: Account, bytes: u64) {
         match self.entries.iter_mut().find(|(a, _)| *a == account) {
@@ -555,6 +588,76 @@ mod tests {
             let phys = pool.total_bytes();
             assert!(phys >= want && phys - want <= TWO_MIB, "chunk {chunk}: phys {phys} want {want}");
         }
+    }
+
+    /// `staging_experts` clamps to the expert count and rounds a
+    /// bounded request down to a multiple of 8 (at least 8).
+    #[test]
+    fn staging_experts_rounds_and_clamps() {
+        let all = VARIANT.num_experts;
+        assert_eq!(staging_experts(all), all);
+        assert_eq!(staging_experts(usize::MAX), all);
+        assert_eq!(staging_experts(1), 8);
+        assert_eq!(staging_experts(17), 16);
+        assert_eq!(staging_experts(BOUNDED_STAGING_EXPERTS), BOUNDED_STAGING_EXPERTS.min(all));
+        for n in 1..all {
+            let s = staging_experts(n);
+            assert!(s % 8 == 0 && s >= 8 && s <= all, "{n} -> {s}");
+        }
+    }
+
+    /// The plan's `prefill_staging` is exactly the `expert_base` a
+    /// real Metal pool allocates, full and bounded, 4-bit and 3-bit.
+    #[test]
+    fn prefill_staging_matches_pool() {
+        use crate::riir::attn::linear_attn_forward::MoeGraphScratch;
+        use crate::riir::backend::MetalBufferPool;
+        use crate::riir::variants::ExpertLayout;
+
+        let v = VARIANT;
+        let device = metal::Device::system_default().expect("Metal device");
+        let chunk = 37;
+        let scratch_bytes = |mode, experts, expert: usize| {
+            let mut pool = MetalBufferPool::new(device.clone());
+            let m = MoeGraphScratch::new_with_staging(&mut pool, v.num_experts_per_tok, mode, chunk, expert, experts);
+            (pool.requested_bytes(), m.staging_experts)
+        };
+        for lay in [ExpertLayout::Q4, ExpertLayout::Q3] {
+            let expert = lay.expert_size();
+            let (mmap, _) = scratch_bytes(ExpertIoMode::Mmap, v.num_experts, expert);
+            for n in [v.num_experts, BOUNDED_STAGING_EXPERTS, 16] {
+                let experts = staging_experts(n);
+                let mut plan = BudgetPlan::for_config(64, ExpertIoMode::Pread, 0, 0, chunk);
+                plan.set_expert_size(expert as u64);
+                plan.set_staging_experts(experts, expert as u64);
+                let (pread, got) = scratch_bytes(ExpertIoMode::Pread, experts, expert);
+                assert_eq!(got, experts);
+                assert_eq!(pread - mmap, plan.get(Account::PrefillStaging), "{n} experts, {expert} B");
+            }
+            let mut mm = BudgetPlan::for_config(64, ExpertIoMode::Mmap, 0, 0, chunk);
+            mm.set_staging_experts(16, expert as u64);
+            assert_eq!(mm.get(Account::PrefillStaging), 0);
+        }
+    }
+
+    /// Qwen3.5-397B-A17B: staging all 512 experts of a layer is
+    /// 3.38 GiB; the bounded fallback is 64 of them, 0.42 GiB.
+    #[cfg(feature = "model-qwen3-5-a17b")]
+    #[test]
+    fn a17b_bounded_staging_is_64_experts() {
+        let expert = VARIANT.expert_size_4bit() as u64;
+        let mut p = BudgetPlan::for_config(4096, ExpertIoMode::Pread, 0, 0, 512);
+        let full = p.get(Account::PrefillStaging);
+        assert_eq!(full, 512 * expert);
+        p.set_staging_experts(staging_experts(BOUNDED_STAGING_EXPERTS), expert);
+        assert_eq!(p.get(Account::PrefillStaging), 64 * expert);
+        eprintln!(
+            "a17b staging: full {} -> bounded {}; plan without weights {} ({})",
+            fmt_gib(full),
+            fmt_gib(64 * expert),
+            fmt_gib(p.total()),
+            p.breakdown()
+        );
     }
 
     /// `multi_decode_bytes` equals what `MultiDecodeBuffers` requests

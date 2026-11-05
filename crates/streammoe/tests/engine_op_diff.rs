@@ -615,6 +615,7 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
                 n_tokens: n_tokens as u32,
                 n_experts: v.num_experts as u32,
                 k: K_ACTIVE as u32,
+                combine: true,
             });
         } else {
             // Path A: env=off, the bucket-permute fallback.

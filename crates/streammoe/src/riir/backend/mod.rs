@@ -668,6 +668,11 @@ pub enum Op {
         /// Top-k. Must be one of `streammoe_metal::MOE_MM_ID_SUPPORTED_TOPK`
         /// (a3b routes 8, a17b routes 10).
         k: u32,
+        /// Run `combine_topk` into `out_sum`. `false` for every expert
+        /// group but the last of a grouped (bounded-staging) prefill
+        /// layer: those only fill their rows of `down_mid`, and
+        /// `out_sum` is neither read nor written.
+        combine: bool,
     },
 
     /// MoE combine + residual:
@@ -1021,15 +1026,21 @@ impl Op {
                 up_mid,
                 down_mid,
                 out_sum,
+                combine,
                 ..
-            } => vec![
-                htpe.raw(),
-                hids.raw(),
-                gate_mid.raw(),
-                up_mid.raw(),
-                down_mid.raw(),
-                out_sum.raw(),
-            ],
+            } => {
+                let mut w = vec![
+                    htpe.raw(),
+                    hids.raw(),
+                    gate_mid.raw(),
+                    up_mid.raw(),
+                    down_mid.raw(),
+                ];
+                if *combine {
+                    w.push(out_sum.raw());
+                }
+                w
+            }
             Op::MoeCombineResidualNTokens { hidden_out, .. } => {
                 vec![hidden_out.raw()]
             }
