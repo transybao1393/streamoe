@@ -107,7 +107,7 @@ still change before 0.2.0; changes are listed in
 | Vision for Qwen3.5 / 3.6 | Implemented; matches transformers (cosine 1.000000) |
 | Packed 3-bit experts | Implemented; KL 0.048 vs 4-bit, 10/10 scored tasks |
 | Several tokens per pass (parallel requests, speculative checks) | Implemented; 1.3× throughput with 4 requests |
-| Models | Qwen3.6-35B-A3B tested; Qwen3.5-A17B, Cogito-V2, OLMoE-1B-7B variants build |
+| Models | Qwen3.6-35B-A3B tested; Qwen3.5-397B-A17B runs in 9 GiB (0.53 tok/s, [below](#running-qwen35-397b-a17b-in-9-gib)); Cogito-V2, OLMoE-1B-7B variants build |
 | Router policy, per-expert precision | Planned |
 
 The full table, how each part was tested, and the last test run are in
@@ -306,6 +306,35 @@ switch, and live CPU and memory against the cap:
 Options, stills of an image turn and what the vision side can and
 can't read: [`docs/chat-page.md`](docs/chat-page.md). Qwen3-30B-A3B
 is not supported yet (it needs its own variant).
+
+## Running Qwen3.5-397B-A17B in 9 GiB
+
+Qwen3.5-397B-A17B has 397 billion parameters (17 billion active per
+token). At 4-bit it is **208 GiB** on disk: 203 GiB of experts (60
+layers × 512 experts, 6.75 MiB each) plus 5.1 GiB of weights that stay
+in RAM. Under a **9 GiB cap** streamoe runs it from an external SSD,
+with a peak of 8.63 GiB, about 1/24 of the model's size. Until prefill
+staged a layer's experts in bounded groups (64 at a time instead of
+all 512), it could not open below 10.5 GiB.
+
+*Setup: standard, except: model on a Kingston NV3 500 GB (QLC) in a
+USB4 enclosure, 4-bit experts, 9 GiB cap, one run, 2026-11-05, build
+`e15b79b`.* Open-time plan: 9.00 GiB, of which the always-resident
+weights are 5.14 GiB and the hot tier 1.49 GiB (226 experts).
+
+| Prompt | tok/s | First word | Prompt speed | Hot-tier hits | Expert reads from disk / token | Peak memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| Photosynthesis | 0.55 | 24.1 s | 1.0 tok/s | 27% | 477 | 8.63 GiB |
+| JavaScript | 0.50 | 22.4 s | 1.1 tok/s | 21% | 526 | 8.63 GiB |
+| Hiking | 0.55 | 22.8 s | 1.1 tok/s | 26% | 479 | 8.63 GiB |
+| **All** | **0.53** | | | | | |
+
+- It works, but slowly: about 1.6 s of each ~1.9 s token is waiting
+  for the drive. Each token reads ~490 experts (~3.3 GiB), counting
+  demand reads and prefetches, because the hot tier holds only 226 of
+  the model's 30,720 experts.
+- Interactive use needs short messages with thinking off: the first
+  word takes ~20 s and a prompt is processed at ~1 token per second.
 
 ## Roadmap
 
