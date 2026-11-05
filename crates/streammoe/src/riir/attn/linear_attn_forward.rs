@@ -466,7 +466,16 @@ pub struct MoeGraphScratch {
     /// `ExpertFiles::mmap_id_for_expert`. The slot is registered as
     /// `BufId<ExpertBaseBuf>` to match the `Op::MoeGatherIdFuse` /
     /// `Op::MoeBatchedPermuteFuse` field type.
+    ///
+    /// Bounded (`staging_experts < num_experts`): `staging_experts`
+    /// slots; `moe_block_forward` stages the layer's routed experts in
+    /// groups that fit, compactly (slot `i` = the group's `i`-th
+    /// expert), and runs the MoE matmul once per group.
     pub expert_base: Option<BufId<ExpertBaseBuf>>,
+    /// Expert slots in `expert_base`: `VARIANT.num_experts` (full
+    /// staging, and always in mmap mode) or fewer (bounded,
+    /// [`crate::riir::OpenConfig::prefill_staging_experts`]).
+    pub staging_experts: usize,
     /// Bytes per expert in `expert_base` / the layer mmap: the
     /// `expert_stride` of the MoE ops (4-bit or packed 3-bit).
     pub expert_stride: u64,
@@ -512,7 +521,22 @@ impl MoeGraphScratch {
         chunk: usize,
         expert_size: usize,
     ) -> Self {
+        Self::new_with_staging(pool, k_active, mode, chunk, expert_size, VARIANT.num_experts)
+    }
+
+    /// [`Self::new`] with `staging_experts` pread staging slots
+    /// (`num_experts` = full staging; see
+    /// [`crate::riir::budget::staging_experts`]).
+    pub fn new_with_staging(
+        pool: &mut MetalBufferPool,
+        k_active: usize,
+        mode: crate::riir::io::expert_io_mode::ExpertIoMode,
+        chunk: usize,
+        expert_size: usize,
+        staging_experts: usize,
+    ) -> Self {
         let v = VARIANT;
+        let staging_experts = if mode.is_pread() { staging_experts.min(v.num_experts) } else { v.num_experts };
         let f32_sz = std::mem::size_of::<f32>();
         let hidden = v.hidden_dim;
         let shared_inter = v.shared_intermediate;
@@ -596,7 +620,7 @@ impl MoeGraphScratch {
         let expert_base: Option<BufId<ExpertBaseBuf>> = if mode.is_pread() {
             Some(
                 pool.alloc(
-                    v.num_experts * expert_size,
+                    staging_experts * expert_size,
                     "mgs.expert_base",
                     true,
                 )
@@ -641,6 +665,7 @@ impl MoeGraphScratch {
             out_sum,
             expert_indices,
             expert_base,
+            staging_experts,
             expert_stride: expert_size as u64,
             htpe,
             hids,
@@ -3104,6 +3129,169 @@ where
         let picks = buckets.offsets[bi + 1] - buckets.offsets[bi];
         expert_files.record_pick(layer_idx, expert_id as usize, picks as u32);
     }
+
+    // graph2: shared FFN (gate/up matvec → swiglu → down matvec),
+    // zero the out_sum accumulator, MoE permute-fuse, combine into
+    // hidden_out. Without a shared expert (OLMoE) the shared FFN is
+    // not dispatched and the combine adds no shared term — the
+    // transient (colored) `shared_down` is never read.
+    let shared = layer_cache.shared.as_ref();
+    let build_graph2 = |experts: MoeExperts, last: bool| -> Graph {
+        let mut g = Graph::new();
+        if !last {
+            // A grouped layer's earlier groups: only their rows of
+            // `down_mid`.
+            experts.push(&mut g, moe, h_post_id, n_tokens, k_active, false);
+            return g;
+        }
+        if let Some(sh) = shared {
+            g.push(Op::MatvecNTokens {
+                label: "moe.shared_gate_proj",
+                weight: WeightRef {
+                    w_off: sh.gate_w,
+                    s_off: sh.gate_s,
+                    b_off: sh.gate_b,
+                    bits: s_gate_bits,
+                },
+                input: h_post_id.into(),
+                input_off: 0,
+                output: moe.shared_ffn_gate.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: v.shared_intermediate as u32,
+                n_tokens: n_tokens as u32,
+            });
+            g.push(Op::MatvecNTokens {
+                label: "moe.shared_up_proj",
+                weight: WeightRef {
+                    w_off: sh.up_w,
+                    s_off: sh.up_s,
+                    b_off: sh.up_b,
+                    bits: s_up_bits,
+                },
+                input: h_post_id.into(),
+                input_off: 0,
+                output: moe.shared_up.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: v.shared_intermediate as u32,
+                n_tokens: n_tokens as u32,
+            });
+            g.push(Op::SwigluFusedBatched {
+                label: "moe.shared_swiglu",
+                gate: moe.shared_ffn_gate,
+                up: moe.shared_up,
+                out: moe.shared_act,
+                total: (n_tokens * v.shared_intermediate) as u32,
+            });
+            g.push(Op::MatvecNTokens {
+                label: "moe.shared_down_proj",
+                weight: WeightRef {
+                    w_off: sh.down_w,
+                    s_off: sh.down_s,
+                    b_off: sh.down_b,
+                    bits: s_down_bits,
+                },
+                input: moe.shared_act.into(),
+                input_off: 0,
+                output: moe.shared_down.into(),
+                output_off: 0,
+                in_dim: v.shared_intermediate as u32,
+                out_dim: hidden_dim as u32,
+                n_tokens: n_tokens as u32,
+            });
+        }
+        g.push(Op::ZeroBuffer {
+            label: "moe.out_sum_zero",
+            buf: moe.out_sum,
+            n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
+        });
+        experts.push(&mut g, moe, h_post_id, n_tokens, k_active, true);
+        if shared.is_some() {
+            g.push(Op::MoeCombineResidualNTokens {
+                label: "moe.combine",
+                h_mid: h_mid_id,
+                moe_sum: moe.out_sum,
+                shared_out: moe.shared_down,
+                shared_gate: shared_gate_id,
+                hidden_out: hidden_out_id,
+                n_tokens: n_tokens as u32,
+                dim: hidden_dim as u32,
+            });
+        } else {
+            g.push(Op::MoeCombineResidualNoSharedNTokens {
+                label: "moe.combine",
+                h_mid: h_mid_id,
+                moe_sum: moe.out_sum,
+                hidden_out: hidden_out_id,
+                n_tokens: n_tokens as u32,
+                dim: hidden_dim as u32,
+            });
+        }
+        g
+    };
+
+    // Bounded staging (fewer slots than experts): stage the layer's
+    // routed experts in groups of `staging_experts`, compactly (slot
+    // `i` = the group's `i`-th expert), and run the gather-id MoE
+    // matmul once per group with the router ids remapped to those
+    // slots — ids of other groups become `GROUP_SKIP`, which map0
+    // drops. Each group fills only its `[token, slot]` rows of
+    // `down_mid`, kept across the per-group graphs in the persistent
+    // `bucket_input` (unused by this path; colorable transients may
+    // share memory between graphs). The last group's graph is the
+    // whole graph2 — shared FFN, `combine_topk` over every row,
+    // residual combine — so the output is bit-identical to one
+    // dispatch: each row is computed from the same activation row and
+    // expert weights, and combine sums the k slots in the same order.
+    // Every expert is still read once per layer chunk. Always the
+    // gather-id kernel (`STREAMMOE_MOE_GATHER_ID=0` is ignored here).
+    if let (Some(base_id), true) = (moe.expert_base, moe.staging_experts < v.num_experts) {
+        const GROUP_SKIP: u32 = 0xFFFF;
+        let slots = moe.staging_experts;
+        let mut bucket_of = vec![u32::MAX; v.num_experts];
+        for (bi, &e) in buckets.expert_ids.iter().enumerate() {
+            bucket_of[e as usize] = bi as u32;
+        }
+        let n_groups = num_buckets.div_ceil(slots).max(1);
+        let mut group_indices = vec![GROUP_SKIP; total_assignments];
+        for gi in 0..n_groups {
+            let ids = &buckets.expert_ids[(gi * slots).min(num_buckets)..((gi + 1) * slots).min(num_buckets)];
+            let t0 = std::time::Instant::now();
+            crate::riir::io::io_trace::mark('S', layer_idx);
+            backend.pool_mut().with_bytes_mut(base_id, |staging| {
+                expert_files.stage_layer_compact(io_pool, layer_idx, ids, staging)
+            })??;
+            crate::riir::io::io_trace::mark('s', layer_idx);
+            expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
+            for (dst, &e) in group_indices.iter_mut().zip(&all_routing_indices) {
+                let b = bucket_of[e as usize] as usize;
+                *dst = if b / slots == gi { (b % slots) as u32 } else { GROUP_SKIP };
+            }
+            backend.pool_mut().upload(moe.expert_indices, unsafe {
+                std::slice::from_raw_parts(
+                    group_indices.as_ptr() as *const u8,
+                    total_assignments * std::mem::size_of::<u32>(),
+                )
+            })?;
+            let graph = build_graph2(
+                MoeExperts::GatherId {
+                    expert_base: base_id,
+                    indices: moe.expert_indices.into(),
+                    n_experts: slots as u32,
+                    down_mid: moe.bucket_input.into(),
+                },
+                gi + 1 == n_groups,
+            );
+            if !moe.commit_planned.get() {
+                backend.pool_mut().commit_plan(&graph)?;
+                moe.commit_planned.set(true);
+            }
+            backend.execute(&graph, "graph_moe")?;
+        }
+        record_routing_actual(prefetch.as_mut(), layer_idx, k_active, &all_routing_indices);
+        return Ok(());
+    }
     let expert_base_id: BufId<ExpertBaseBuf> = match moe.expert_base {
         None => {
             expert_files
@@ -3189,149 +3377,26 @@ where
         })?;
     }
 
-    // graph2: shared FFN (gate/up matvec → swiglu → down matvec),
-    // zero the out_sum accumulator, MoE permute-fuse, combine into
-    // hidden_out. Without a shared expert (OLMoE) the shared FFN is
-    // not dispatched and the combine adds no shared term — the
-    // transient (colored) `shared_down` is never read.
-    let shared = layer_cache.shared.as_ref();
-    let graph2 = {
-        let mut g = Graph::new();
-        if let Some(sh) = shared {
-            g.push(Op::MatvecNTokens {
-                label: "moe.shared_gate_proj",
-                weight: WeightRef {
-                    w_off: sh.gate_w,
-                    s_off: sh.gate_s,
-                    b_off: sh.gate_b,
-                    bits: s_gate_bits,
-                },
-                input: h_post_id.into(),
-                input_off: 0,
-                output: moe.shared_ffn_gate.into(),
-                output_off: 0,
-                in_dim: hidden_dim as u32,
-                out_dim: v.shared_intermediate as u32,
-                n_tokens: n_tokens as u32,
-            });
-            g.push(Op::MatvecNTokens {
-                label: "moe.shared_up_proj",
-                weight: WeightRef {
-                    w_off: sh.up_w,
-                    s_off: sh.up_s,
-                    b_off: sh.up_b,
-                    bits: s_up_bits,
-                },
-                input: h_post_id.into(),
-                input_off: 0,
-                output: moe.shared_up.into(),
-                output_off: 0,
-                in_dim: hidden_dim as u32,
-                out_dim: v.shared_intermediate as u32,
-                n_tokens: n_tokens as u32,
-            });
-            g.push(Op::SwigluFusedBatched {
-                label: "moe.shared_swiglu",
-                gate: moe.shared_ffn_gate,
-                up: moe.shared_up,
-                out: moe.shared_act,
-                total: (n_tokens * v.shared_intermediate) as u32,
-            });
-            g.push(Op::MatvecNTokens {
-                label: "moe.shared_down_proj",
-                weight: WeightRef {
-                    w_off: sh.down_w,
-                    s_off: sh.down_s,
-                    b_off: sh.down_b,
-                    bits: s_down_bits,
-                },
-                input: moe.shared_act.into(),
-                input_off: 0,
-                output: moe.shared_down.into(),
-                output_off: 0,
-                in_dim: v.shared_intermediate as u32,
-                out_dim: hidden_dim as u32,
-                n_tokens: n_tokens as u32,
-            });
+    // Packed 3-bit experts have only the gather_mm_id kernel.
+    let q4 = moe.expert_stride == crate::riir::variants::ExpertLayout::Q4.expert_size() as u64;
+    let experts = if moe_gather_id_enabled() || !q4 {
+        // Reuses the `bucket_out` BufId as `down_mid` scratch via the
+        // unidirectional `From<BucketOutBuf> for BufId<DownMidBuf>`
+        // impl in `buftype.rs` (likewise gate / up in `push`).
+        MoeExperts::GatherId {
+            expert_base: expert_base_id,
+            indices: moe.routing_indices,
+            n_experts: v.num_experts as u32,
+            down_mid: moe.bucket_out.into(),
         }
-        g.push(Op::ZeroBuffer {
-            label: "moe.out_sum_zero",
-            buf: moe.out_sum,
-            n_bytes: (n_tokens * hidden_dim * f32_sz_u) as u32,
-        });
-        // Packed 3-bit experts have only the gather_mm_id kernel.
-        let q4 = moe.expert_stride == crate::riir::variants::ExpertLayout::Q4.expert_size() as u64;
-        if moe_gather_id_enabled() || !q4 {
-            // New path: one-dispatch MoE matmul (`gather_mm_id.metal`).
-            // Reuses the `bucket_gate` / `bucket_up` / `bucket_out`
-            // BufIds as `gate_mid` / `up_mid` / `down_mid` scratch
-            // via the unidirectional `From<BucketGateBuf> for
-            // BufId<GateMidBuf>` (etc.) impls in `buftype.rs`. The
-            // `.into()` at the push site is the documentation of
-            // the path swap.
-            g.push(Op::MoeGatherIdFuse {
-                label: "moe.gather_id_fuse",
-                expert_base: expert_base_id,
-                expert_stride: moe.expert_stride,
-                indices: moe.routing_indices,
-                weights: moe.routing_weights,
-                // h_post_id is BufId<MoeInputBuf>: the post-norm MoE
-                // input. This is the load-bearing bug-of-record check —
-                // session 19 passed `h_mid` (a BufId<ResidualBuf>) here,
-                // and the type system now rejects that swap at compile
-                // time (no From<ResidualBuf> for BufId<MoeInputBuf>).
-                mlp_in: h_post_id,
-                out_sum: moe.out_sum,
-                htpe: moe.htpe,
-                hids: moe.hids,
-                gate_mid: moe.bucket_gate.into(),
-                up_mid: moe.bucket_up.into(),
-                down_mid: moe.bucket_out.into(),
-                n_tokens: n_tokens as u32,
-                n_experts: v.num_experts as u32,
-                k: k_active as u32,
-            });
-        } else {
-            g.push(Op::MoeBatchedPermuteFuse {
-                label: "moe.permute_fuse",
-                expert_base: expert_base_id,
-                expert_stride: moe.expert_stride,
-                expert_indices: moe.expert_indices,
-                expert_slots,
-                bucket_input: moe.bucket_input,
-                bucket_gate: moe.bucket_gate,
-                bucket_up: moe.bucket_up,
-                bucket_act: moe.bucket_act,
-                bucket_out: moe.bucket_out,
-                bucket_token_idx: moe.bucket_token_idx,
-                bucket_weights: moe.bucket_weights,
-                out_sum: moe.out_sum,
-                buckets,
-            });
+    } else {
+        MoeExperts::Permute {
+            expert_base: expert_base_id,
+            expert_slots,
+            buckets,
         }
-        if shared.is_some() {
-            g.push(Op::MoeCombineResidualNTokens {
-                label: "moe.combine",
-                h_mid: h_mid_id,
-                moe_sum: moe.out_sum,
-                shared_out: moe.shared_down,
-                shared_gate: shared_gate_id,
-                hidden_out: hidden_out_id,
-                n_tokens: n_tokens as u32,
-                dim: hidden_dim as u32,
-            });
-        } else {
-            g.push(Op::MoeCombineResidualNoSharedNTokens {
-                label: "moe.combine",
-                h_mid: h_mid_id,
-                moe_sum: moe.out_sum,
-                hidden_out: hidden_out_id,
-                n_tokens: n_tokens as u32,
-                dim: hidden_dim as u32,
-            });
-        }
-        g
     };
+    let graph2 = build_graph2(experts, true);
     // S10b-2 Phase 4: color graph2's transients on the first call,
     // then latch — `commit_plan` runs exactly once per run.
     if !moe.commit_planned.get() {
@@ -3345,13 +3410,110 @@ where
     // (eval_token shape) — at larger N the layer routes many tokens
     // and the per-token prediction semantic is murky. The caller
     // gates the env to `None` for N != 1.
-    if let Some(pe) = prefetch.as_mut() {
+    record_routing_actual(prefetch.as_mut(), layer_idx, k_active, &all_routing_indices);
+
+    Ok(())
+}
+
+/// Record a layer's routing as the prefetch prediction for the next
+/// token's same layer (the Phase 3 note in [`moe_block_forward`]).
+fn record_routing_actual(
+    prefetch: Option<&mut PrefetchEnv<'_>>,
+    layer_idx: usize,
+    k_active: usize,
+    all_routing_indices: &[i32],
+) {
+    if let Some(pe) = prefetch {
         use crate::riir::moe::expert_forward::MAX_K;
         let mut actuals: [i32; MAX_K] = [0; MAX_K];
         let len = k_active.min(MAX_K).min(all_routing_indices.len());
         actuals[..len].copy_from_slice(&all_routing_indices[..len]);
         pe.prefetch.record_actual(layer_idx, actuals);
     }
+}
 
-    Ok(())
+/// The routed-expert op of a batched MoE layer's graph2.
+enum MoeExperts {
+    /// `Op::MoeGatherIdFuse` over `n_experts` blocks at `expert_base`,
+    /// addressed by `indices` (`[n_tokens, k]`).
+    GatherId {
+        expert_base: BufId<ExpertBaseBuf>,
+        indices: BufId<RouterIdxBuf>,
+        n_experts: u32,
+        down_mid: BufId<crate::riir::backend::DownMidBuf>,
+    },
+    /// `Op::MoeBatchedPermuteFuse` (4-bit, `STREAMMOE_MOE_GATHER_ID=0`).
+    Permute {
+        expert_base: BufId<ExpertBaseBuf>,
+        expert_slots: Vec<u32>,
+        buckets: crate::riir::moe::moe_router::ExpertBuckets,
+    },
+}
+
+impl MoeExperts {
+    /// Push the op; `combine` reduces into `moe.out_sum` (always for
+    /// `Permute`, which only runs whole).
+    fn push(
+        self,
+        g: &mut crate::riir::backend::Graph,
+        moe: &MoeGraphScratch,
+        h_post_id: BufId<MoeInputBuf>,
+        n_tokens: usize,
+        k_active: usize,
+        combine: bool,
+    ) {
+        use crate::riir::backend::Op;
+        match self {
+            MoeExperts::GatherId { expert_base, indices, n_experts, down_mid } => {
+                // New path: one-dispatch MoE matmul (`gather_mm_id.metal`).
+                // Reuses the `bucket_gate` / `bucket_up` BufIds as
+                // `gate_mid` / `up_mid` scratch via the unidirectional
+                // `From<BucketGateBuf> for BufId<GateMidBuf>` (etc.)
+                // impls in `buftype.rs`. The `.into()` at the push site
+                // is the documentation of the path swap.
+                g.push(Op::MoeGatherIdFuse {
+                    label: "moe.gather_id_fuse",
+                    expert_base,
+                    expert_stride: moe.expert_stride,
+                    indices,
+                    weights: moe.routing_weights,
+                    // h_post_id is BufId<MoeInputBuf>: the post-norm MoE
+                    // input. This is the load-bearing bug-of-record check —
+                    // session 19 passed `h_mid` (a BufId<ResidualBuf>) here,
+                    // and the type system now rejects that swap at compile
+                    // time (no From<ResidualBuf> for BufId<MoeInputBuf>).
+                    mlp_in: h_post_id,
+                    out_sum: moe.out_sum,
+                    htpe: moe.htpe,
+                    hids: moe.hids,
+                    gate_mid: moe.bucket_gate.into(),
+                    up_mid: moe.bucket_up.into(),
+                    down_mid,
+                    n_tokens: n_tokens as u32,
+                    n_experts,
+                    k: k_active as u32,
+                    combine,
+                });
+            }
+            MoeExperts::Permute { expert_base, expert_slots, buckets } => {
+                debug_assert!(combine);
+                g.push(Op::MoeBatchedPermuteFuse {
+                    label: "moe.permute_fuse",
+                    expert_base,
+                    expert_stride: moe.expert_stride,
+                    expert_indices: moe.expert_indices,
+                    expert_slots,
+                    bucket_input: moe.bucket_input,
+                    bucket_gate: moe.bucket_gate,
+                    bucket_up: moe.bucket_up,
+                    bucket_act: moe.bucket_act,
+                    bucket_out: moe.bucket_out,
+                    bucket_token_idx: moe.bucket_token_idx,
+                    bucket_weights: moe.bucket_weights,
+                    out_sum: moe.out_sum,
+                    buckets,
+                });
+            }
+        }
+    }
 }

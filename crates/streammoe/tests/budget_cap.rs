@@ -102,6 +102,57 @@ fn host_buffers_count_against_the_cap() {
     }
 }
 
+/// When staging every expert of a layer is what pushes the plan past
+/// the cap, the open falls back to bounded staging
+/// (`BOUNDED_STAGING_EXPERTS` slots) and passes the plan; forcing full
+/// staging at the same cap still fails it.
+#[test]
+fn bounded_staging_fallback_fits_the_plan() {
+    use streammoe::riir::budget::{self, Account, BudgetPlan};
+    use streammoe::riir::variants::VARIANT;
+    let w = scratch_file("weights_staging.bin", 1 << 20);
+    let base = OpenConfig {
+        n_ctx: 64,
+        runtime_overhead: 0,
+        hot_tier_bytes: Some(0),
+        max_checkpoints: 0,
+        ..OpenConfig::default()
+    };
+    let full = BudgetPlan::for_config(64, ExpertIoMode::Pread, 1 << 20, 0, 64);
+    let bounded = budget::staging_experts(budget::BOUNDED_STAGING_EXPERTS);
+    if bounded >= VARIANT.num_experts {
+        return;
+    }
+    let expert = VARIANT.expert_size_4bit() as u64;
+    let saved = full.get(Account::PrefillStaging) - bounded as u64 * expert;
+    assert_eq!(full.get(Account::PrefillStaging), VARIANT.num_experts as u64 * expert);
+    let cap = full.total() - saved / 2;
+    // Full staging forced: over the cap, at the plan.
+    let forced = OpenConfig {
+        mem_cap: Some(cap),
+        prefill_staging_experts: Some(VARIANT.num_experts),
+        ..base.clone()
+    };
+    match open_with(&w, &forced).err().expect("must fail") {
+        Error::OverBudget { detail } => assert!(detail.contains("prefill_staging="), "{detail}"),
+        other => panic!("expected OverBudget, got {other:?}"),
+    }
+    // Default: the bounded plan fits, so the open gets past the plan
+    // and fails later, on the missing manifest.
+    let auto = OpenConfig { mem_cap: Some(cap), ..base.clone() };
+    let err = open_with(&w, &auto).err().expect("must fail");
+    assert!(!matches!(err, Error::OverBudget { .. }), "{err:?}");
+    // Below even the bounded plan: OverBudget, naming the bounded size.
+    let tiny = OpenConfig { mem_cap: Some(full.total() - saved - 1), ..base };
+    match open_with(&w, &tiny).err().expect("must fail") {
+        Error::OverBudget { detail } => {
+            let want = format!("prefill_staging={}", budget::fmt_gib(bounded as u64 * expert));
+            assert!(detail.contains(&want), "{detail}");
+        }
+        other => panic!("expected OverBudget, got {other:?}"),
+    }
+}
+
 #[cfg(feature = "model-qwen3-6-35b-a3b")]
 mod model {
     use super::*;

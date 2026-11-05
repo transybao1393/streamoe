@@ -592,6 +592,13 @@ impl_from!(BucketGateBuf -> GateMidBuf);
 impl_from!(BucketUpBuf -> UpMidBuf);
 impl_from!(BucketOutBuf -> DownMidBuf);
 
+// Grouped (bounded-staging) prefill MoE: the gather-id path never
+// reads `bucket_input` or `expert_indices`, so it borrows them — the
+// persistent `bucket_input` holds `down_mid` across the per-group
+// graphs, `expert_indices` the group's remapped `[n_tokens, k]` ids.
+impl_from!(BucketInputBuf -> DownMidBuf);
+impl_from!(ExpertIndicesBuf -> RouterIdxBuf);
+
 // Head/tail plumbing — added by `riir/mod.rs:step_internal_batched_gqa`'s
 // head graph (embed_gather writes the model's input, which lives in
 // the cross-layer hidden double-buffer) and tail graph (final_norm
