@@ -303,7 +303,13 @@ history of `.claude/memory/`, which is no longer tracked.
   1.30–1.33× at 6 GiB (three runs, early experts on), every output identical
   to one-at-a-time decode; each request then gets 3–5.7 tok/s instead
   of ~9. A bigger cap helps batches more than plain decode, since the
-  pass's distinct experts hit RAM more. What a 4-token pass adds over
+  pass's distinct experts hit RAM more. In `tools/chat --max-chats`
+  (2026-11-05, 6 GiB cap, prefills and cold tier included) it did not
+  pay: 0.87–1.03× total tok/s for 2–4 concurrent chats, both
+  precisions. The extra request slots shrink the hot tier (3.05 →
+  2.13 GiB at 4 chats, 4-bit) and concurrent conversations need the
+  union of their experts, so hits fall 85 → 59%
+  ([chat page](chat-page.md#several-chats-at-once)). What a 4-token pass adds over
   one token (`verify_bench --profile`): disk wait 20 → 81 ms, expert
   GPU 31 → 94, attention GPU 33 → 96, LM head 6 → 21.
 - **Speculative decoding guard** (`spec_bench`, default; arm `old`
