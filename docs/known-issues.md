@@ -559,3 +559,22 @@ history of `.claude/memory/`, which is no longer tracked.
   KL 0.048, top-1 93%, perplexity 1.21, all 10 tasks right — now the
   packed 3-bit format (see Fixed > Speed).
 
+- Mixed precision, 4-bit hot tier with 3-bit streamed misses
+  (2026-11-05; not merged — the code, an opt-in
+  `OpenConfig::stream_experts_dir`, is on branch
+  `worktree-agent-a6ebbf4ee6e62a7bd`, commits `bb9c1dc`, `4e6185a`):
+  a decode miss
+  the hot tier would admit is read at 4-bit, any other from
+  `root-3bit` and run with the 3-bit kernel; prefill stays 4-bit.
+  Quality sits between the two (a3b, 4 GiB cap, 353 teacher-forced
+  tokens + 10 tasks vs 4-bit): KL 0.010 / top-1 97.5% / ppl 2.978 vs
+  3-bit's 0.044 / 92.4% / 3.005 (4-bit ppl 2.966), 10/10 tasks for
+  all three. But it is slower than 4-bit: chat (3 prompts × 120
+  tokens, n_ctx 4096, F32 KV, 2 runs) 4 GiB: 4-bit 12.1 tok/s, 3-bit
+  12.5, mixed 11.6; 6 GiB: 15.6 / 16.6 / 14.8. Every admission still
+  costs a 4-bit read (at 6 GiB 34 of 80 reads per token are), so disk
+  bytes per token fall only 216 → 192 MiB at 4 GiB and not at all at
+  6 GiB (117), while the tier admits a little less (hits 66 → 64%,
+  82 → 80%) and mixed reads more experts per token (128 → 138,
+  69 → 80). All-3-bit stays the faster choice; mixed only buys
+  quality back at a speed cost below 4-bit.
