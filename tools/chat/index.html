@@ -131,6 +131,8 @@ const log = $("log"), scroll = $("scroll");
 let busy = false, started = false;
 let vision = null;   // {factor, min_pixels, max_pixels} when the server has an encoder
 let image = null;    // {w, h, rgb, url} of the attached, resized image
+// This page's conversation on a --max-chats > 1 server (a new one per load).
+const session = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2);
 
 function esc(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -169,7 +171,7 @@ function showMemory(m) {
 }
 async function refresh() {
   try {
-    const r = await fetch("/info").then(r => r.json());
+    const r = await fetch("/info?session=" + session).then(r => r.json());
     window.modelName = `${r.info.model} · ${r.info.precision}-bit experts · ${r.info.kv_format} KV`;
     const sel = $("precision");
     for (const o of sel.options) o.disabled = !(r.info.precisions || [4]).includes(+o.value);
@@ -246,6 +248,7 @@ async function send() {
     top_p: think ? 0.95 : 0.8, top_k: 20,
     system: started ? "" : $("system").value.trim(),
     image: img ? { w: img.w, h: img.h, rgb: img.rgb } : null,
+    session, new: !started,
   };
   started = true;
   try {
@@ -272,6 +275,8 @@ async function send() {
         if (ev === "message") { out += d.t; render(a, out, think); }
         else if (ev === "vision") {
           a.querySelector(".stats").textContent = `image ${d.w}×${d.h} → ${d.tokens} tokens in ${d.secs.toFixed(1)} s · reading prompt…`;
+        } else if (ev === "queued") {
+          a.querySelector(".stats").textContent = `all ${d.chats} chats are answering · waiting…`;
         } else if (ev === "prefill") {
           prefill = d;
           a.querySelector(".stats").textContent = `prompt ${d.tokens} tok in ${d.secs.toFixed(1)} s · generating…`;
@@ -280,8 +285,9 @@ async function send() {
           const disk = d.disk_mib_per_tok != null ? ` · ${d.disk_mib_per_tok.toFixed(0)} MiB/tok from disk` : "";
           const imgs = d.image_tokens ? ` (${d.image_tokens} image)` : "";
           const cpu = d.turn_cpu_pct != null ? ` · avg CPU ${d.turn_cpu_pct.toFixed(0)}%` : "";
+          const chats = d.chats > 1.05 ? ` · ${d.chats.toFixed(1)} chats at once` : "";
           a.querySelector(".stats").textContent =
-            `${d.tokens} tok · ${d.tok_s.toFixed(1)} tok/s · prompt ${d.prefill_tokens} tok${imgs} at ${d.prefill_tok_s.toFixed(0)} tok/s${hot}${disk}${cpu}` +
+            `${d.tokens} tok · ${d.tok_s.toFixed(1)} tok/s · prompt ${d.prefill_tokens} tok${imgs} at ${d.prefill_tok_s.toFixed(0)} tok/s${chats}${hot}${disk}${cpu}` +
             (d.stop === "length" ? " · hit max tokens" : "");
           showMemory(d.memory);
           finished = true;
@@ -307,7 +313,7 @@ $("input").addEventListener("keydown", (e) => {
 });
 $("newchat").onclick = async () => {
   if (busy) return;
-  await fetch("/reset", { method: "POST" });
+  await fetch("/reset", { method: "POST", body: JSON.stringify({ session }) });
   log.innerHTML = ""; started = false; refresh(); $("input").focus();
 };
 $("precision").onchange = async (e) => {
