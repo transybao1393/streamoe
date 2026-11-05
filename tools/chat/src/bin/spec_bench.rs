@@ -31,57 +31,19 @@ use std::time::Instant;
 use streammoe::{Ctx, KvFormat, OpenConfig, PrefetchGuess};
 use tokenizers::Tokenizer;
 
+#[path = "../draft.rs"]
+#[allow(dead_code)]
+mod draft;
+use draft::{argmax, Drafter, Guard};
+
 const GIB: f64 = (1u64 << 30) as f64;
 
 fn arg(args: &[String], k: &str) -> Option<String> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned())
 }
 
-fn argmax(v: &[f32]) -> i32 {
-    (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b }) as i32
-}
-
 fn template(prompt: &str) -> String {
     format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
-}
-
-/// Longest match length `lookup` reports; longer matches count as this.
-const MATCH_CAP: usize = 64;
-
-/// Prompt lookup: the tokens that followed the latest earlier match of
-/// `hist`'s last 3 (else 2) tokens, at most `max`, and how many tokens
-/// that match runs back (up to `MATCH_CAP`).
-fn lookup(hist: &[i32], max: usize) -> (Vec<i32>, usize) {
-    for n in [3usize, 2] {
-        if hist.len() <= n {
-            continue;
-        }
-        let suffix = &hist[hist.len() - n..];
-        for i in (0..hist.len() - n).rev() {
-            if &hist[i..i + n] == suffix {
-                let from = i + n;
-                let mut len = n;
-                while len < MATCH_CAP && len < from && hist[from - len - 1] == hist[hist.len() - len - 1] {
-                    len += 1;
-                }
-                return (hist[from..(from + max).min(hist.len())].to_vec(), len);
-            }
-        }
-    }
-    (Vec::new(), 0)
-}
-
-/// When to spend a verify pass on a draft. A pass of ~4 tokens costs
-/// about three plain steps, so a draft pays only when most of it is
-/// accepted. Unguarded passes, packed 3-bit at a 4 GiB cap: matches of
-/// 8+ tokens accept 86–96% and gain 1.16–1.25× over plain steps;
-/// shorter ones accept 20–67% and gain 0.51–0.93×, and so do short
-/// matches right after a fully accepted pass (52%, 0.80×).
-#[derive(Clone, Copy)]
-struct Guard {
-    min_match: usize,
-    after_full: bool,
-    backoff: usize,
 }
 
 #[derive(Default)]
@@ -105,30 +67,18 @@ fn speculate(ctx: &mut Ctx, prompt: &[i32], first: i32, ntok: usize, max_draft: 
     let mut hist = prompt.to_vec();
     hist.push(first);
     let mut s = Spec { out: vec![first], ..Spec::default() };
-    let (mut full, mut cool) = (false, 0usize);
+    let mut d = Drafter::new(max_draft, guard);
     let t0 = Instant::now();
     while s.out.len() < ntok + 1 {
         let pos = np + s.out.len() - 1;
         let last = *s.out.last().unwrap();
         let room = ntok + 1 - s.out.len();
-        let (mut draft, len) = lookup(&hist, max_draft);
-        draft.truncate(room.saturating_sub(1));
-        let skip = match guard {
-            Some(g) if !draft.is_empty() => {
-                let skip = cool > 0 || (len < g.min_match && !(g.after_full && full));
-                cool = cool.saturating_sub(1);
-                skip
-            }
-            _ => false,
-        };
-        if draft.is_empty() || skip {
+        let draft = d.draft(&hist, room.saturating_sub(1));
+        if draft.is_empty() {
             ctx.eval_token(last, pos, 0, logits).expect("decode");
             let next = argmax(logits);
             s.out.push(next);
             hist.push(next);
-            s.singles += 1;
-            s.skipped += skip as usize;
-            full = false;
             continue;
         }
         let tp = Instant::now();
@@ -147,16 +97,12 @@ fn speculate(ctx: &mut Ctx, prompt: &[i32], first: i32, ntok: usize, max_draft: 
             hist.push(t);
         }
         if trace {
-            eprintln!("[trace] match {len} drafted {} accepted {a} ms {:.1}", draft.len(), tp.elapsed().as_secs_f64() * 1e3);
+            eprintln!("[trace] match {} drafted {} accepted {a} ms {:.1}", d.last_match, draft.len(),
+                      tp.elapsed().as_secs_f64() * 1e3);
         }
-        full = a == draft.len();
-        if a == 0 {
-            cool = guard.map_or(0, |g| g.backoff);
-        }
-        s.passes += 1;
-        s.drafted += draft.len();
-        s.accepted += a;
+        d.verified(draft.len(), a);
     }
+    (s.passes, s.singles, s.skipped, s.drafted, s.accepted) = (d.passes, d.singles, d.skipped, d.drafted, d.accepted);
     s.ms = t0.elapsed().as_secs_f64() * 1e3;
     s.out.truncate(ntok + 1);
     s
