@@ -2,7 +2,7 @@
 //! loop (`--max-chats 1`, greedy turns, no image in the conversation).
 //!
 //! Each sampled token is evaluated together with up to three draft
-//! tokens looked up earlier in the conversation (`draft.rs`, shared
+//! tokens looked up earlier in the conversation (`lookup.rs`, shared
 //! with `spec_bench`) in one `Ctx::eval_tokens` pass, when the lookup
 //! match is long enough to be worth it. The drafts the model agrees
 //! with are streamed as they would have been one by one; the rest is

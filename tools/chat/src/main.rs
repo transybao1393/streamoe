@@ -31,6 +31,11 @@
 //! The page can switch: `POST /precision`
 //! re-executes this process with the other value, so the old model's
 //! memory is released before the new one opens and the cap holds.
+//!
+//! `--prefill-while-typing` prefills the message while it is being
+//! typed (the page posts drafts to `/draft`): see `draft.rs`.
+
+mod draft;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -235,6 +240,8 @@ struct Chat {
     info: Value,
     /// `--spec`: speculative decoding for greedy turns (`spec.rs`).
     spec: Option<spec::SpecOpts>,
+    /// Prefill while typing (`draft.rs`).
+    draft: draft::Draft,
 }
 
 /// A user turn from its prefill to its `done` event: what decoding it
@@ -294,6 +301,9 @@ impl Chat {
         c.history.clear();
         c.pending.clear();
         c.rope_delta = 0;
+        if k == 0 {
+            self.draft.clear();
+        }
     }
 
     /// Evaluate `toks` at conversation `k`'s next slots. Plain RoPE
@@ -352,13 +362,16 @@ impl Chat {
     /// the turn ended there (an error event was sent, or the client
     /// went away).
     fn begin(&mut self, k: usize, req: &Value, mut out: TcpStream) -> Option<Turn> {
-        match self.begin_inner(k, req, &mut out) {
+        self.draft_take(k);
+        let t = match self.begin_inner(k, req, &mut out) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[chat] client went away: {e}");
                 None
             }
-        }
+        };
+        self.draft_drop(k);
+        t
     }
 
     fn begin_inner(&mut self, k: usize, req: &Value, out: &mut TcpStream) -> std::io::Result<Option<Turn>> {
@@ -447,10 +460,24 @@ impl Chat {
         let st_pre = self.ctx.expert_io_stats();
         let mut logits = vec![0f32; self.ctx.n_vocab()];
         let t0 = Instant::now();
+        if image.is_some() {
+            // An image turn reads no draft: undo what typing prefilled.
+            if let Err(e) = self.draft_reuse(k, None) {
+                fail(out, e)?;
+                return Ok(None);
+            }
+        }
         let r = match &image {
             None => {
                 first.extend(&last);
-                self.eval(k, &first, StageOutput::Logits(&mut logits))
+                // Typed ahead (`--prefill-while-typing`): only the rest.
+                match self.draft_reuse(k, Some(&first)) {
+                    Ok(skip) => self.eval(k, &first[skip..], StageOutput::Logits(&mut logits)),
+                    Err(e) => {
+                        fail(out, e)?;
+                        return Ok(None);
+                    }
+                }
             }
             Some(v) => self
                 .eval(k, &first, StageOutput::Discard)
@@ -465,7 +492,7 @@ impl Chat {
         let prefill_s = t0.elapsed().as_secs_f64();
         write!(out, "event: prefill\ndata: {}\n\n", json!({
             "tokens": n_new, "image_tokens": n_image, "secs": prefill_s,
-            "tok_s": n_new as f64 / prefill_s,
+            "tok_s": n_new as f64 / prefill_s, "draft_tokens": self.draft.reused,
         }))?;
         out.flush()?;
 
@@ -601,6 +628,9 @@ impl Chat {
             "hot": hot,
             "memory": self.memory(k),
         });
+        if let Some(n) = self.draft.reused {
+            done["draft_tokens"] = json!(n);
+        }
         if self.convs.len() > 1 {
             // Chats decoded per step, on average over this turn.
             done["chats"] = json!(t.batch_sum as f64 / t.steps.max(1) as f64);
@@ -745,13 +775,21 @@ fn main() {
         eprintln!("[chat] --max-chats {max_chats}: expected 1..={MAX_DECODE_TOKENS}");
         std::process::exit(2);
     }
+    // Prefill while typing: one checkpoint buffer, planned under the
+    // cap, to undo an edit of text already prefilled.
+    let mut typing = args.iter().any(|a| a == "--prefill-while-typing");
+    if typing && max_chats > 1 {
+        eprintln!("[chat] --prefill-while-typing needs --max-chats 1: off");
+        typing = false;
+    }
+    let draft_chunk: usize = arg(&args, "--draft-chunk").map_or(16, |v| v.parse().unwrap());
     let mut cfg = OpenConfig {
         n_ctx,
         mem_cap: cap.map(|g| (g * GIB) as u64),
         kv_format: kv,
-        // The chat keeps one conversation in the KV cache and never
-        // calls checkpoint_pos: plan no checkpoint buffers.
-        max_checkpoints: 0,
+        // The chat keeps one conversation in the KV cache; only prefill
+        // while typing calls checkpoint_pos (one per turn).
+        max_checkpoints: typing as usize,
         max_requests: max_chats,
         max_decode_tokens: max_chats,
         ..OpenConfig::default()
@@ -807,14 +845,24 @@ fn main() {
     let tok = Tokenizer::from_file(base.join("mlx-4bit/tokenizer.json")).expect("tokenizer.json");
     eprintln!("[chat] opening {} (cap {:?} GiB, n_ctx {n_ctx}, kv {kv:?})", base.display(), cap);
     let t = Instant::now();
-    let mut ctx = Ctx::open_with(
+    let open = |cfg: &OpenConfig| Ctx::open_with(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
         &art.join("vocab.bin"),
         &root,
         false,
-        &cfg,
-    )
+        cfg,
+    );
+    let mut ctx = match open(&cfg) {
+        Err(e) if typing => {
+            eprintln!("[chat] open with a checkpoint for --prefill-while-typing failed ({e}): \
+                       opening without, prefill while typing off");
+            typing = false;
+            cfg.max_checkpoints = 0;
+            open(&cfg)
+        }
+        r => r,
+    }
     .unwrap_or_else(|e| {
         eprintln!("[chat] open failed: {e}");
         std::process::exit(2)
@@ -835,6 +883,7 @@ fn main() {
         "precisions": precisions,
         "max_chats": max_chats,
         "spec": spec_opts.map(|o| json!({"min_match": o.guard.min_match})),
+        "prefill_while_typing": typing,
         "open_secs": t.elapsed().as_secs_f64(),
         "vision": vision.as_ref().map(|v| json!({
             "max_pixels": v.max_pixels(),
@@ -860,6 +909,7 @@ fn main() {
             .unwrap().as_nanos() as u64 | 1),
         info,
         spec: spec_opts,
+        draft: draft::Draft::new(typing, draft_chunk),
     };
     let _ = chat.im_start;
     eprintln!("[chat] {} — open in {:.1} s, footprint {}", chat.info, chat.info["open_secs"],
@@ -902,7 +952,8 @@ fn main() {
     let sse_head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
                     Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if max_chats == 1 {
-        for (mut stream, method, target, body) in rx {
+        // Between requests, prefill the draft being typed (if any).
+        while let Some((mut stream, method, target, body)) = chat.next_request(&rx) {
             match (method.as_str(), target.split('?').next().unwrap_or("")) {
                 ("GET", "/info") => {
                     let v = json!({"info": chat.info, "memory": chat.memory(0)});
@@ -929,6 +980,11 @@ fn main() {
                     if stream.write_all(sse_head.as_bytes()).is_ok() {
                         chat.turn(&req, stream);
                     }
+                }
+                ("POST", "/draft") => {
+                    let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let v = chat.draft_post(&req);
+                    json_ok(&mut stream, v)
                 }
                 _ => respond(&mut stream, "404 Not Found", "text/plain", "not found"),
             }

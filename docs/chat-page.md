@@ -11,6 +11,7 @@ cargo run --release -- --cap-gib 4 --n-ctx 8192
 #          --precision 4|3 (3 needs $M/root-3bit, see Setup),
 #          --max-chats 1..4 (chats served at once, see below),
 #          --spec (speculative decoding for greedy answers, see below)
+#          --prefill-while-typing [--draft-chunk N] (see below)
 # open http://127.0.0.1:8077
 ```
 
@@ -161,7 +162,7 @@ evaluates the sampled token and up to three tokens that followed the
 match in one `Ctx::eval_tokens` pass, keeps the drafts the model
 agrees with and undoes the rest with `Ctx::rewind_tokens`. The answer
 is token for token the plain greedy one. The drafting code is shared
-with `spec_bench` (`tools/chat/src/draft.rs`). The `[chat]` stats line
+with `spec_bench` (`tools/chat/src/lookup.rs`). The `[chat]` stats line
 and the `done` event gain `spec`: verify passes, plain steps, tokens
 drafted and accepted. It is off for a turn that samples (temperature
 above 0), for a conversation with an image in it, and with
@@ -192,3 +193,66 @@ plain decode (−4% at 4 GiB, −1% at 6 GiB on the means, smaller than
 the spread between runs); on the copy prompt it took 20 verify passes,
 accepted every draft and was 1.13–1.14× faster. Keep it off unless the
 chats are mostly edits of pasted text.
+## Prefill while typing
+
+`--prefill-while-typing` (off by default; `--max-chats 1` only) uses the
+time you spend typing to read the message, so the answer starts sooner
+after Enter. A **Prefill while typing** checkbox appears next to
+*Thinking* (on by default when the server has the flag). About 300 ms
+after each keystroke the page posts the message box to `/draft`. The
+server works out the tokens the turn will start with: the last turn's
+`<|im_end|>`, the user header, and the draft up to the start of its
+last word (a word still being typed can still change its tokens). It
+prefills them on the engine's normal prefill path between requests, at
+most `--draft-chunk` tokens (default 16) per step, so a `/chat` or a
+newer draft waits at most one step. On Enter, if the prefilled tokens
+are a prefix of the turn's real prompt, only the rest is prefilled: the
+last word and the closing template.
+
+Editing text that was already prefilled (backspace, a pasted
+correction, a changed system prompt) needs a rollback. The KV cache can
+be cut back, but the linear-attention recurrence cannot (see
+[`known-issues.md`](known-issues.md)). So the first draft step of a turn
+saves a checkpoint of the conversation (`Ctx::checkpoint_pos`), and an
+edit restores it (`Ctx::restore_to`) and prefills again. In the first
+turn there is nothing to save and a rollback clears the context. The
+server opens with one checkpoint buffer planned under the cap
+(`max_checkpoints: 1`), sized for a snapshot at the full `n_ctx`. The
+hot tier gives up the room: at n_ctx 4096, F32 KV and a 4 GiB cap it
+holds 880 experts instead of 1012 (0.22 GiB less). If the open fails with it, the server logs that and opens
+without the feature. An image turn reads no draft (the page sends none
+while an image is attached, and the server rolls back any).
+
+The answer is the same token for token with the feature on or off:
+the same tokens are evaluated, only in other chunks, and every step
+has at least two tokens so it takes the batched prefill path like the
+turn's own prefill. `python3 tools/chat/typing_check.py out.json --port
+8077` types the three test prompts into a running server as one
+conversation, the way the page does (a keystroke every 0.12–0.26 s, a
+pause after each word, the 300 ms debounce, Enter 0.25 s after the last
+key). Part way through each prompt it deletes the last ~15 characters,
+which were already prefilled, and types them again, so every turn rolls
+back once: to an empty context in the first turn and to the checkpoint
+in the other two. `--compare` checks the answers of several runs
+against each other.
+
+*Setup: Qwen3.6-35B-A3B, 4-bit experts, 4 GiB cap, n_ctx 4096, F32 KV,
+greedy, thinking off, 120 tokens at most, 2026-11-05 build; the three
+test prompts as one conversation, typed by `typing_check.py`; a fresh
+server per run, two runs per setting (run 1 / run 2). First word is
+timed from Enter.*
+
+| Prefill while typing | First word, prompts 1 / 2 / 3 | Prompt tokens read while typing | Decode tok/s | Hot-tier hits |
+| --- | --- | --- | --- | --- |
+| off | 1.19 / 1.07 / 1.08 s · 1.20 / 1.09 / 1.11 s | — | 10.1–12.2 | 57–71% |
+| on | 0.79 / 0.73 / 0.82 s · 0.79 / 0.71 / 0.77 s | 12 of 25 / 15 of 27 / 13 of 26 | 9.9–11.8 | 56–69% |
+
+Every answer was the same in all four runs. The first word comes 0.34 s
+sooner on average (1.12 → 0.77 s, −31%). On this model the rest of the
+prompt still costs most of a prefill pass: the closing template alone
+is 9 tokens, and a short pass costs nearly as much as a long one, since
+each layer's experts are read either way. The smaller hot tier costs
+1–3 points of hits and up to ~4% of decode speed. The gain should be
+larger where prefill is slow per token, such as Qwen3.5-397B-A17B at
+~1 tok/s, where typing keeps up with prefill; that has not been
+measured.

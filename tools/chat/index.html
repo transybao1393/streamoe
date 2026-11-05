@@ -114,6 +114,7 @@ textarea {
       <button id="attach" title="Attach an image" style="display:none">Image…</button>
       <input type="file" id="file" accept="image/*" style="display:none">
       <label><input type="checkbox" id="think"> Thinking</label>
+      <label id="typing-label" style="display:none" title="Read the message while you type it, so the answer starts sooner after Enter. The answer is the same either way."><input type="checkbox" id="typing"> Prefill while typing</label>
       <label>Temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
       <label>Max tokens <input type="number" id="maxtok" value="512" step="64" min="16"></label>
       <a href="#" id="toggle-settings" style="color:var(--muted)">System prompt</a>
@@ -131,6 +132,7 @@ const log = $("log"), scroll = $("scroll");
 let busy = false, started = false;
 let vision = null;   // {factor, min_pixels, max_pixels} when the server has an encoder
 let image = null;    // {w, h, rgb, url} of the attached, resized image
+let typingServer = false, draftTimer = null;  // --prefill-while-typing
 // This page's conversation on a --max-chats > 1 server (a new one per load).
 const session = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2);
 
@@ -177,6 +179,8 @@ async function refresh() {
     for (const o of sel.options) o.disabled = !(r.info.precisions || [4]).includes(+o.value);
     sel.value = String(r.info.precision || 4);
     vision = r.info.vision;
+    $("typing-label").style.display = r.info.prefill_while_typing ? "" : "none";
+    typingServer = !!r.info.prefill_while_typing;
     $("attach").style.display = vision ? "" : "none";
     showMemory(r.memory);
   } catch (e) { $("status").textContent = "server not reachable"; }
@@ -231,6 +235,7 @@ async function send() {
   let text = $("input").value.trim();
   if ((!text && !image) || busy) return;
   if (!text) text = "Describe this image.";
+  clearTimeout(draftTimer);
   $("input").value = "";
   const img = image; clearImage();
   const u = add("user");
@@ -283,7 +288,7 @@ async function send() {
         } else if (ev === "done") {
           const hot = d.hot ? ` · hot-tier hits ${(d.hot.hit_rate * 100).toFixed(0)}%` : "";
           const disk = d.disk_mib_per_tok != null ? ` · ${d.disk_mib_per_tok.toFixed(0)} MiB/tok from disk` : "";
-          const imgs = d.image_tokens ? ` (${d.image_tokens} image)` : "";
+          const imgs = d.image_tokens ? ` (${d.image_tokens} image)` : d.draft_tokens ? ` (${d.draft_tokens} read while typing)` : "";
           const cpu = d.turn_cpu_pct != null ? ` · avg CPU ${d.turn_cpu_pct.toFixed(0)}%` : "";
           const chats = d.chats > 1.05 ? ` · ${d.chats.toFixed(1)} chats at once` : "";
           a.querySelector(".stats").textContent =
@@ -307,6 +312,17 @@ async function send() {
   refresh();
 }
 
+// Prefill while typing: ~300 ms after the last keystroke, send the box
+// to /draft (the server prefills its stable part between requests).
+function postDraft() {
+  draftTimer = null;
+  if (busy || image || !typingServer || !$("typing").checked) return;
+  const body = { message: $("input").value.trim(), system: started ? "" : $("system").value.trim() };
+  fetch("/draft", { method: "POST", body: JSON.stringify(body) }).catch(() => {});
+}
+$("input").addEventListener("input", () => { clearTimeout(draftTimer); draftTimer = setTimeout(postDraft, 300); });
+try { $("typing").checked = localStorage.getItem("typing") !== "0"; } catch (_) { $("typing").checked = true; }
+$("typing").onchange = (e) => { try { localStorage.setItem("typing", e.target.checked ? "1" : "0"); } catch (_) {} };
 $("send").onclick = send;
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
