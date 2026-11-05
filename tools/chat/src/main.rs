@@ -46,6 +46,9 @@ use streammoe::{Ctx, ExpertIoStats, KvFormat, OpenConfig, PrefetchGuess, ReqId, 
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
+mod draft;
+mod spec;
+
 const GIB: f64 = (1u64 << 30) as f64;
 const PAGE: &str = include_str!("../index.html");
 
@@ -230,6 +233,8 @@ struct Chat {
     eos: i32,
     rng: Rng,
     info: Value,
+    /// `--spec`: speculative decoding for greedy turns (`spec.rs`).
+    spec: Option<spec::SpecOpts>,
 }
 
 /// A user turn from its prefill to its `done` event: what decoding it
@@ -261,6 +266,8 @@ struct Turn {
     /// Decode steps, and the chats decoded in them summed.
     steps: usize,
     batch_sum: usize,
+    /// `--spec` and this turn can speculate.
+    spec: Option<spec::TurnSpec>,
 }
 
 fn fail(out: &mut dyn Write, msg: String) -> std::io::Result<()> {
@@ -490,6 +497,7 @@ impl Chat {
             st0,
             steps: 0,
             batch_sum: 0,
+            spec: None,
         }))
     }
 
@@ -598,6 +606,9 @@ impl Chat {
             done["chats"] = json!(t.batch_sum as f64 / t.steps.max(1) as f64);
             done["slot"] = json!(k);
         }
+        if let Some(s) = &t.spec {
+            done["spec"] = spec::stats(s);
+        }
         eprintln!("[chat] {done}");
         if !t.gone {
             let _ = write!(t.out, "event: done\ndata: {done}\n\n").and_then(|_| t.out.flush());
@@ -608,8 +619,14 @@ impl Chat {
     /// `--max-chats 1` server.
     fn turn(&mut self, req: &Value, out: TcpStream) {
         let Some(mut t) = self.begin(0, req, out) else { return };
+        t.spec = self.spec_for_turn(&t);
         while let Some(tok) = self.next_token(&mut t) {
-            if let Err(e) = self.eval(0, &[tok], StageOutput::Logits(&mut t.logits)) {
+            let r = if t.spec.is_some() {
+                self.spec_eval(&mut t, tok)
+            } else {
+                self.eval(0, &[tok], StageOutput::Logits(&mut t.logits))
+            };
+            if let Err(e) = r {
                 return self.abort(t, e.to_string());
             }
             if t.gone {
@@ -739,6 +756,11 @@ fn main() {
         max_decode_tokens: max_chats,
         ..OpenConfig::default()
     };
+    // `--spec`: a verify pass is the sampled token plus three drafts.
+    let spec_opts = spec::opts(&args, max_chats);
+    if spec_opts.is_some() {
+        cfg.max_decode_tokens = spec::DECODE_TOKENS;
+    }
     if let Some(n) = arg(&args, "--attn-threads") {
         cfg.attn_threads = n.parse().unwrap();
     }
@@ -812,6 +834,7 @@ fn main() {
         "precision": precision,
         "precisions": precisions,
         "max_chats": max_chats,
+        "spec": spec_opts.map(|o| json!({"min_match": o.guard.min_match})),
         "open_secs": t.elapsed().as_secs_f64(),
         "vision": vision.as_ref().map(|v| json!({
             "max_pixels": v.max_pixels(),
@@ -836,6 +859,7 @@ fn main() {
         rng: Rng(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap().as_nanos() as u64 | 1),
         info,
+        spec: spec_opts,
     };
     let _ = chat.im_start;
     eprintln!("[chat] {} — open in {:.1} s, footprint {}", chat.info, chat.info["open_secs"],

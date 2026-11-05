@@ -9,7 +9,8 @@ cd tools/chat
 cargo run --release -- --cap-gib 4 --n-ctx 8192
 # options: --kv f32|f16|turbo4, --attn-threads N, --guess cross|prev, --prefetch N,
 #          --precision 4|3 (3 needs $M/root-3bit, see Setup),
-#          --max-chats 1..4 (chats served at once, see below)
+#          --max-chats 1..4 (chats served at once, see below),
+#          --spec (speculative decoding for greedy answers, see below)
 # open http://127.0.0.1:8077
 ```
 
@@ -149,3 +150,45 @@ waiting for the earlier answers to finish. A bigger cap, a smaller
 `batch_bench`, which decodes from saved states with the tier warmed,
 measured 1.14 / 1.00 / 1.02× for 2 / 3 / 4 requests at 6 GiB (4-bit,
 120 tokens, same build).
+
+## Speculative decoding (`--spec`)
+
+`--spec` (off by default) turns on prompt-lookup speculative decoding
+for greedy answers (temperature 0). Before each decode step the server
+looks the last 3 (then 2) tokens up earlier in the conversation; when
+that match runs back at least 8 tokens (`--spec-min-match N`), it
+evaluates the sampled token and up to three tokens that followed the
+match in one `Ctx::eval_tokens` pass, keeps the drafts the model
+agrees with and undoes the rest with `Ctx::rewind_tokens`. The answer
+is token for token the plain greedy one. The drafting code is shared
+with `spec_bench` (`tools/chat/src/draft.rs`). The `[chat]` stats line
+and the `done` event gain `spec`: verify passes, plain steps, tokens
+drafted and accepted. It is off for a turn that samples (temperature
+above 0), for a conversation with an image in it, and with
+`--max-chats` > 1; each case is logged.
+
+It pays only when the answer copies text that is already in the
+conversation (edit this code, fix this text, repeat with a change).
+On ordinary chat the 8-token guard almost never drafts, so speed is
+that of plain decode minus the pass buffers' share of the cap: the
+4-token pass (`OpenConfig::max_decode_tokens` 4) takes 132 experts'
+worth of hot tier (1012 → 880 slots at 4 GiB), so hot-tier hits drop
+~3 points and disk reads per token rise ~6–10%.
+
+*Setup: standard (n_ctx 4096, F32 KV, greedy, thinking off), 4-bit
+experts, 120 tokens at most, 2026-11-05 build; a fresh server per run,
+off and on alternating. "Test prompts" is the three test prompts
+together; the copy prompt asks to repeat a 15-line Python snippet with
+one function renamed.*
+
+| Cap | Test prompts, off | Test prompts, `--spec` | Copy prompt, off | Copy prompt, `--spec` | Copy drafts accepted |
+| --- | --- | --- | --- | --- | --- |
+| 4 GiB | 10.6 / 11.3 tok/s | 11.2 / 9.9 tok/s | 8.3 / 8.0 tok/s | 9.3 / 9.2 tok/s (1.14×) | 60 / 60 |
+| 6 GiB | 15.4 / 14.7 tok/s | 15.1 / 14.9 tok/s | 10.3 / 10.6 tok/s | 11.7 / 11.9 tok/s (1.13×) | 60 / 60 |
+
+Every answer matched the plain answer in every run. On the test
+prompts `--spec` drafted nothing and was within run-to-run noise of
+plain decode (−4% at 4 GiB, −1% at 6 GiB on the means, smaller than
+the spread between runs); on the copy prompt it took 20 verify passes,
+accepted every draft and was 1.13–1.14× faster. Keep it off unless the
+chats are mostly edits of pasted text.
