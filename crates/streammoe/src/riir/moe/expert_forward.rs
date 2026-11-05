@@ -1844,6 +1844,16 @@ fn encode_moe_gather(
 ///
 /// All scratch (htpe, hids, gate_mid, up_mid, down_mid) is provided
 /// by the producer; sized for the chunk width at construction.
+///
+/// `n_experts` is the number of expert blocks at `expert_base` and
+/// `indices` must address them (`0..n_experts`). An index outside
+/// that range (e.g. `0xFFFF`) matches no expert: map0 drops the
+/// assignment and its `[token, slot]` rows of the mid buffers are left
+/// untouched. A grouped prefill relies on this — each expert group
+/// fills only its own rows of `down_mid`, and the last runs step 6
+/// (`combine`) over all of them. Every row is computed exactly as in
+/// one dispatch: an output element depends only on its own
+/// activation row and its expert's weights.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_moe_gather_id_fuse(
     cmdbuf: &CommandBufferRef,
@@ -1863,6 +1873,7 @@ pub fn encode_moe_gather_id_fuse(
     n_tokens: u32,
     n_experts: u32,
     k: u32,
+    combine: bool,
     v: Variant,
 ) {
     if n_tokens == 0 {
@@ -1993,6 +2004,9 @@ pub fn encode_moe_gather_id_fuse(
     );
 
     // --- 6. combine_topk: down_mid × weights → out_sum ---
+    if !combine {
+        return;
+    }
     kernels.encode(
         cmdbuf,
         &streammoe_metal::MoeCombineTopkCall {

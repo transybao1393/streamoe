@@ -1316,6 +1316,7 @@ impl Backend for MetalBackend {
                 n_tokens,
                 n_experts,
                 k,
+                combine,
                 ..
             } => {
                 crate::riir::moe::expert_forward::encode_moe_gather_id_fuse(
@@ -1336,6 +1337,7 @@ impl Backend for MetalBackend {
                     *n_tokens,
                     *n_experts,
                     *k,
+                    *combine,
                     crate::riir::variants::VARIANT,
                 );
             }
