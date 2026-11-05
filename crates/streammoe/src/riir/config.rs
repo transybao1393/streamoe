@@ -216,8 +216,9 @@ pub struct OpenConfig {
     /// the hot tier gets the bytes; the cache and one prefill chunk of
     /// row staging are planned as `embed_cache`. Outputs are
     /// bit-identical. Ignored (table kept resident) when the LM head
-    /// ties the embedding or the range has no embedding. Off by
-    /// default; `STREAMMOE_EMBED_STREAM=1` also turns it on, and
+    /// ties the embedding or the range has no embedding. On by
+    /// default since 2026-11-05 (+5% tok/s on a3b at a 4 GiB cap);
+    /// `STREAMMOE_EMBED_STREAM=0` turns it off, and
     /// `STREAMMOE_EMBED_CACHE_ROWS` sizes the cache (default 4096).
     pub embed_stream: bool,
     /// Overlap prefill expert staging with GPU work: each batched MoE
@@ -229,9 +230,15 @@ pub struct OpenConfig {
     /// groups; `n` is clamped to it); with bounded staging any value
     /// above 0 double-buffers the slots (groups of half of them). No
     /// extra memory; logits are bit-identical. `None` (default): env
-    /// `STREAMMOE_PREFILL_OVERLAP` (`n`), else 0 = off.
+    /// `STREAMMOE_PREFILL_OVERLAP` (`n`; 0 = off), else
+    /// [`DEFAULT_PREFILL_OVERLAP_GROUPS`] (on since 2026-11-05: first
+    /// word −15% on a3b).
     pub prefill_overlap_groups: Option<usize>,
 }
+
+/// Prefill overlap groups when neither the config nor the env sets
+/// them: n = 8 beat 2 and 4 on a3b at a 4 GiB cap.
+pub const DEFAULT_PREFILL_OVERLAP_GROUPS: usize = 8;
 
 impl Default for OpenConfig {
     fn default() -> Self {
@@ -258,7 +265,7 @@ impl Default for OpenConfig {
             max_checkpoints: crate::riir::DEFAULT_MAX_CHECKPOINTS,
             max_decode_tokens: 1,
             prefill_staging_experts: None,
-            embed_stream: false,
+            embed_stream: true,
             prefill_overlap_groups: None,
         }
     }
@@ -268,7 +275,8 @@ impl OpenConfig {
     /// [`Self::prefill_overlap_groups`], with the env fallback.
     pub fn resolved_prefill_overlap_groups(&self) -> usize {
         let n = self.prefill_overlap_groups.unwrap_or_else(|| {
-            std::env::var("STREAMMOE_PREFILL_OVERLAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("STREAMMOE_PREFILL_OVERLAP").ok().and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_PREFILL_OVERLAP_GROUPS)
         });
         n.min(crate::riir::attn::linear_attn_forward::MOE_INDEX_SETS)
     }

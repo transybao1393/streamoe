@@ -51,11 +51,11 @@ pub fn cache_rows_from_env() -> usize {
         .unwrap_or(DEFAULT_CACHE_ROWS)
 }
 
-/// `true` if `STREAMMOE_EMBED_STREAM` is set to `1` / `true` / `on`.
-pub fn enabled_from_env() -> bool {
+/// `true` if `STREAMMOE_EMBED_STREAM` is set to `0` / `false` / `off`.
+pub fn disabled_from_env() -> bool {
     matches!(
         std::env::var("STREAMMOE_EMBED_STREAM").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
+        Ok("0") | Ok("false") | Ok("off")
     )
 }
 

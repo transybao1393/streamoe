@@ -244,8 +244,8 @@ history of `.claude/memory/`, which is no longer tracked.
   its reads are still in flight) while forward time falls 4–12 ms.
 - **Prefill staged a layer's experts, then computed — never both at
   once.** `OpenConfig::prefill_overlap_groups` (env
-  `STREAMMOE_PREFILL_OVERLAP=<n>`, off by default until it is turned
-  on) overlaps them: with full staging an I/O thread reads the layer's
+  `STREAMMOE_PREFILL_OVERLAP=<n>`; on by default with n = 8 since
+  2026-11-05, `STREAMMOE_PREFILL_OVERLAP=0` turns it off) overlaps them: with full staging an I/O thread reads the layer's
   routed experts (`ExpertFiles::stage_layer_notify`) and every batch of
   ≥ 1/n of them that has landed goes to the GPU as an expert group,
   committed without a wait (`Backend::execute_nowait` /
@@ -314,7 +314,8 @@ history of `.claude/memory/`, which is no longer tracked.
 - Snapshots are not converted between KV formats: loading a snapshot
   into a context with another `kv_format` fails with
   `ShapeMismatch { field: "kv_format" }`. F32 snapshots stay v2 / v3.
-- `embed_stream` (or `STREAMMOE_EMBED_STREAM=1`) reads token-embedding
+- `embed_stream` (on by default since 2026-11-05; `STREAMMOE_EMBED_STREAM=0`
+  turns it off) reads token-embedding
   rows from `model_weights.bin` on demand instead of keeping the table
   resident: under `mem_cap` the weights account drops by the table
   (a3b 0.27 GiB, a17b 0.53 GiB) and the hot tier gets it; the row

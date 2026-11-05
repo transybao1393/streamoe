@@ -624,9 +624,9 @@ impl RsCtx<MetalBackend> {
             None => config.hot_tier_bytes.unwrap_or(0).min(range_expert_bytes),
             Some(_) => config.hot_tier_bytes.unwrap_or(u64::MAX),
         };
-        // Streamed embedding (opt-in): rows are read on demand, so the
-        // table leaves the resident weights. A tied LM head keeps it.
-        let embed_stream = if (config.embed_stream || io::embed_stream::enabled_from_env())
+        // Streamed embedding (default on): rows are read on demand, so
+        // the table leaves the resident weights. A tied LM head keeps it.
+        let embed_stream = if config.embed_stream && !io::embed_stream::disabled_from_env()
             && layer_range.start == 0
         {
             match io::embed_stream::EmbedStream::open(
@@ -640,7 +640,9 @@ impl RsCtx<MetalBackend> {
                     eprintln!("[embed-stream] keeping the embedding resident: {why:?}");
                     None
                 }
-                Err(_) => return Err(RsError::InitFailed),
+                // Unreadable files: keep it resident and let the plan
+                // and the weight load report the real error.
+                Err(_) => None,
             }
         } else {
             None
