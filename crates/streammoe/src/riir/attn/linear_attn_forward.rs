@@ -417,6 +417,11 @@ impl HeadTailScratch {
     }
 }
 
+/// `[chunk, k]` index tables in [`MoeGraphScratch::expert_indices`]:
+/// the most expert groups of one layer that can be in flight on the
+/// GPU at once (`prefill_overlap_groups` is clamped to it).
+pub const MOE_INDEX_SETS: usize = 8;
+
 /// Run-lifetime scratch for the shared MoE block (`graph2`) — the
 /// graph1→MoE boundary buffers plus the shared-FFN + permute-fuse
 /// working set. One instance, owned by the orchestrator, reused by
@@ -481,8 +486,13 @@ pub struct MoeGraphScratch {
     pub expert_stride: u64,
     /// Per-assignment-row expert slot table (`u32`), `chunk *
     /// k_active` wide — the gather kernel's `indices`. Filled per
-    /// layer from `buckets`.
+    /// layer from `buckets`. [`MOE_INDEX_SETS`] such tables back to
+    /// back: overlapped expert groups each read their own.
     pub expert_indices: BufId<ExpertIndicesBuf>,
+    /// Expert groups per batched MoE layer whose staging overlaps the
+    /// GPU ([`crate::riir::OpenConfig::prefill_overlap_groups`]); 0 =
+    /// off (stage everything, then compute).
+    pub overlap_groups: usize,
     /// **`Op::MoeGatherIdFuse` scratch** — per-expert assignment
     /// count `[n_experts]` u32. Always allocated; only touched by
     /// the new-kernel path. Tiny (~1 KB at n_experts=256).
@@ -603,9 +613,11 @@ impl MoeGraphScratch {
         let bucket_weights: BufId<BucketWeightsBuf> = pool
             .alloc(chunk * k_active * f32_sz, "mgs.bucket_weights", true)
             .expect("MoeGraphScratch::new pool alloc");
+        // `MOE_INDEX_SETS` tables, one per expert group in flight
+        // when staging overlaps the GPU (`prefill_overlap_groups`).
         let expert_indices: BufId<ExpertIndicesBuf> = pool
             .alloc(
-                chunk * k_active * std::mem::size_of::<u32>(),
+                MOE_INDEX_SETS * chunk * k_active * std::mem::size_of::<u32>(),
                 "mgs.expert_indices",
                 true,
             )
@@ -664,6 +676,7 @@ impl MoeGraphScratch {
             bucket_weights,
             out_sum,
             expert_indices,
+            overlap_groups: 0,
             expert_base,
             staging_experts,
             expert_stride: expert_size as u64,
@@ -3315,49 +3328,186 @@ where
     // expert weights, and combine sums the k slots in the same order.
     // Every expert is still read once per layer chunk. Always the
     // gather-id kernel (`STREAMMOE_MOE_GATHER_ID=0` is ignored here).
-    if let (Some(base_id), true) = (moe.expert_base, moe.staging_experts < v.num_experts) {
-        const GROUP_SKIP: u32 = 0xFFFF;
-        let slots = moe.staging_experts;
-        let mut bucket_of = vec![u32::MAX; v.num_experts];
-        for (bi, &e) in buckets.expert_ids.iter().enumerate() {
-            bucket_of[e as usize] = bi as u32;
-        }
-        let n_groups = num_buckets.div_ceil(slots).max(1);
+    //
+    // Overlap (`overlap_groups > 0`), full staging: an I/O thread
+    // stages the layer's routed experts at their own `expert_id`
+    // slots, and as they land the GPU starts on them — each batch of
+    // at least `routed / overlap_groups` landed experts becomes a
+    // group, committed without waiting; whatever lands after the last
+    // such group is the last group. Bounded staging double-buffers
+    // instead: groups of half the slots alternate between the two
+    // halves, and a half is restaged only after the group two back has
+    // finished. Each group in flight reads its own index table
+    // (`expert_indices` set). Same rows, same combine: bit-identical
+    // to staging first.
+    const GROUP_SKIP: u32 = 0xFFFF;
+    let q4 = moe.expert_stride == crate::riir::variants::ExpertLayout::Q4.expert_size() as u64;
+    let gather_id = moe_gather_id_enabled() || !q4;
+    let bounded = moe.staging_experts < v.num_experts;
+    let overlap = moe.overlap_groups > 0 && (bounded || gather_id);
+    let set_bytes = total_assignments * std::mem::size_of::<u32>();
+    if let (Some(base_id), false, true) = (moe.expert_base, bounded, overlap) {
+        let min_group = num_buckets.div_ceil(moe.overlap_groups).max(1);
+        let mut member = vec![false; v.num_experts];
         let mut group_indices = vec![GROUP_SKIP; total_assignments];
-        for gi in 0..n_groups {
-            let ids = &buckets.expert_ids[(gi * slots).min(num_buckets)..((gi + 1) * slots).min(num_buckets)];
-            let t0 = std::time::Instant::now();
-            crate::riir::io::io_trace::mark('S', layer_idx);
-            backend.pool_mut().with_bytes_mut(base_id, |staging| {
-                expert_files.stage_layer_compact(io_pool, layer_idx, ids, staging)
-            })??;
-            crate::riir::io::io_trace::mark('s', layer_idx);
-            expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
-            for (dst, &e) in group_indices.iter_mut().zip(&all_routing_indices) {
-                let b = bucket_of[e as usize] as usize;
-                *dst = if b / slots == gi { (b % slots) as u32 } else { GROUP_SKIP };
+        // Commit the group of experts `ids` (index set `set`).
+        let mut commit = |backend: &mut B, ids: &[usize], set: usize, last: bool| -> Result<(), LayerForwardError> {
+            member.fill(false);
+            for &e in ids {
+                member[e] = true;
             }
-            backend.pool_mut().upload(moe.expert_indices, unsafe {
-                std::slice::from_raw_parts(
-                    group_indices.as_ptr() as *const u8,
-                    total_assignments * std::mem::size_of::<u32>(),
-                )
+            for (dst, &e) in group_indices.iter_mut().zip(&all_routing_indices) {
+                *dst = if member[e as usize] { e as u32 } else { GROUP_SKIP };
+            }
+            backend.pool_mut().upload_at(moe.expert_indices, set * set_bytes, unsafe {
+                std::slice::from_raw_parts(group_indices.as_ptr() as *const u8, set_bytes)
             })?;
             let graph = build_graph2(
                 MoeExperts::GatherId {
                     expert_base: base_id,
                     indices: moe.expert_indices.into(),
-                    n_experts: slots as u32,
+                    indices_off: (set * set_bytes) as u64,
+                    n_experts: v.num_experts as u32,
                     down_mid: moe.bucket_input.into(),
                 },
-                gi + 1 == n_groups,
+                last,
             );
             if !moe.commit_planned.get() {
                 backend.pool_mut().commit_plan(&graph)?;
                 moe.commit_planned.set(true);
             }
-            backend.execute(&graph, "graph_moe")?;
+            if last {
+                backend.execute(&graph, "graph_moe")?;
+            } else {
+                backend.execute_nowait(&graph, "graph_moe_group")?;
+            }
+            Ok(())
+        };
+        /// The staging buffer, handed to the I/O thread.
+        struct StagingView(*mut u8, usize);
+        // SAFETY: the pointer is dereferenced only by the one thread
+        // the view moves to, inside the scope below.
+        unsafe impl Send for StagingView {}
+        let view = backend.pool_mut().with_bytes_mut(base_id, |b| StagingView(b.as_mut_ptr(), b.len()))?;
+        let ids = &buckets.expert_ids;
+        let t0 = std::time::Instant::now();
+        crate::riir::io::io_trace::mark('S', layer_idx);
+        let mut landed: Vec<usize> = Vec::with_capacity(num_buckets);
+        let mut sets_used = 0;
+        let staged = std::thread::scope(|sc| -> Result<_, LayerForwardError> {
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
+            let io = sc.spawn(move || {
+                let view = view;
+                // SAFETY: a live, persistent shared-storage buffer of
+                // `view.1` bytes; nothing else writes it while the
+                // layer stages, and the GPU reads only slots whose
+                // experts have landed (reported through `tx`).
+                let staging = unsafe { std::slice::from_raw_parts_mut(view.0, view.1) };
+                let notify = move |first: usize, n: usize| {
+                    let _ = tx.send((first, n));
+                };
+                expert_files.stage_layer_notify(io_pool, layer_idx, ids, staging, &notify)
+            });
+            // Each landed batch of at least `min_group` experts goes to
+            // the GPU while the rest are read; the last index set is
+            // kept for the last group.
+            while let Ok((first, n)) = rx.recv() {
+                landed.extend(first..first + n);
+                while let Ok((first, n)) = rx.try_recv() {
+                    landed.extend(first..first + n);
+                }
+                if landed.len() >= min_group && sets_used + 1 < MOE_INDEX_SETS {
+                    if let Err(e) = commit(backend, &landed, sets_used, false) {
+                        // Let the I/O thread finish first.
+                        drop(rx);
+                        let _ = io.join();
+                        return Err(e);
+                    }
+                    sets_used += 1;
+                    landed.clear();
+                }
+            }
+            Ok(io.join().expect("staging thread panicked"))
+        });
+        crate::riir::io::io_trace::mark('s', layer_idx);
+        expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
+        let staged = match staged {
+            Ok(r) => r,
+            Err(e) => {
+                backend.wait_pending(0)?;
+                return Err(e);
+            }
+        };
+        if let Err(e) = staged {
+            backend.wait_pending(0)?;
+            return Err(e.into());
         }
+        // The rest, with the shared FFN and the combine. Done with it,
+        // done with every earlier group (this only records stats).
+        commit(backend, &landed, sets_used, true)?;
+        backend.wait_pending(0)?;
+        record_routing_actual(prefetch.as_mut(), layer_idx, k_active, &all_routing_indices);
+        return Ok(());
+    }
+    if let (Some(base_id), true) = (moe.expert_base, bounded) {
+        let slots = moe.staging_experts;
+        let es = moe.expert_stride as usize;
+        let mut bucket_of = vec![u32::MAX; v.num_experts];
+        for (bi, &e) in buckets.expert_ids.iter().enumerate() {
+            bucket_of[e as usize] = bi as u32;
+        }
+        // Experts per group.
+        let group = if overlap { (slots / 2).max(1) } else { slots };
+        let n_groups = num_buckets.div_ceil(group).max(1);
+        let mut group_indices = vec![GROUP_SKIP; total_assignments];
+        for gi in 0..n_groups {
+            let ids = &buckets.expert_ids[(gi * group).min(num_buckets)..((gi + 1) * group).min(num_buckets)];
+            // Index set and first slot of this group.
+            let (set, base_slot) = if overlap { (gi % 2, (gi % 2) * group) } else { (0, 0) };
+            if overlap {
+                // The group two back used these slots: let it finish.
+                backend.wait_pending(1)?;
+            }
+            let t0 = std::time::Instant::now();
+            crate::riir::io::io_trace::mark('S', layer_idx);
+            // The group before may still be running on the GPU; it
+            // reads the other half of the slots.
+            backend.pool_mut().with_bytes_mut(base_id, |staging| {
+                expert_files.stage_layer_compact(io_pool, layer_idx, ids, &mut staging[base_slot * es..])
+            })??;
+            crate::riir::io::io_trace::mark('s', layer_idx);
+            expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
+            for (dst, &e) in group_indices.iter_mut().zip(&all_routing_indices) {
+                let b = bucket_of[e as usize] as usize;
+                *dst = if b / group == gi { (base_slot + b % group) as u32 } else { GROUP_SKIP };
+            }
+            backend.pool_mut().upload_at(moe.expert_indices, set * set_bytes, unsafe {
+                std::slice::from_raw_parts(group_indices.as_ptr() as *const u8, set_bytes)
+            })?;
+            let last = gi + 1 == n_groups;
+            let graph = build_graph2(
+                MoeExperts::GatherId {
+                    expert_base: base_id,
+                    indices: moe.expert_indices.into(),
+                    indices_off: (set * set_bytes) as u64,
+                    n_experts: slots as u32,
+                    down_mid: moe.bucket_input.into(),
+                },
+                last,
+            );
+            if !moe.commit_planned.get() {
+                backend.pool_mut().commit_plan(&graph)?;
+                moe.commit_planned.set(true);
+            }
+            if overlap && !last {
+                backend.execute_nowait(&graph, "graph_moe_group")?;
+            } else {
+                backend.execute(&graph, "graph_moe")?;
+            }
+        }
+        // Done with the last group, so with every earlier one too;
+        // this only records their stats.
+        backend.wait_pending(0)?;
         record_routing_actual(prefetch.as_mut(), layer_idx, k_active, &all_routing_indices);
         return Ok(());
     }
@@ -3447,14 +3597,14 @@ where
     }
 
     // Packed 3-bit experts have only the gather_mm_id kernel.
-    let q4 = moe.expert_stride == crate::riir::variants::ExpertLayout::Q4.expert_size() as u64;
-    let experts = if moe_gather_id_enabled() || !q4 {
+    let experts = if gather_id {
         // Reuses the `bucket_out` BufId as `down_mid` scratch via the
         // unidirectional `From<BucketOutBuf> for BufId<DownMidBuf>`
         // impl in `buftype.rs` (likewise gate / up in `push`).
         MoeExperts::GatherId {
             expert_base: expert_base_id,
             indices: moe.routing_indices,
+            indices_off: 0,
             n_experts: v.num_experts as u32,
             down_mid: moe.bucket_out.into(),
         }
@@ -3508,6 +3658,8 @@ enum MoeExperts {
     GatherId {
         expert_base: BufId<ExpertBaseBuf>,
         indices: BufId<RouterIdxBuf>,
+        /// Byte offset of the `[n_tokens, k]` table in `indices`.
+        indices_off: u64,
         n_experts: u32,
         down_mid: BufId<crate::riir::backend::DownMidBuf>,
     },
@@ -3533,7 +3685,7 @@ impl MoeExperts {
     ) {
         use crate::riir::backend::Op;
         match self {
-            MoeExperts::GatherId { expert_base, indices, n_experts, down_mid } => {
+            MoeExperts::GatherId { expert_base, indices, indices_off, n_experts, down_mid } => {
                 // New path: one-dispatch MoE matmul (`gather_mm_id.metal`).
                 // Reuses the `bucket_gate` / `bucket_up` BufIds as
                 // `gate_mid` / `up_mid` scratch via the unidirectional
@@ -3545,6 +3697,7 @@ impl MoeExperts {
                     expert_base,
                     expert_stride: moe.expert_stride,
                     indices,
+                    indices_off,
                     weights: moe.routing_weights,
                     // h_post_id is BufId<MoeInputBuf>: the post-norm MoE
                     // input. This is the load-bearing bug-of-record check —

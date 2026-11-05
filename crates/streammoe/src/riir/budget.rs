@@ -278,7 +278,7 @@ pub fn prefill_scratch_bytes(v: Variant, chunk: usize) -> u64 {
             + 1
             + 2 * max_k
             + k * hidden
-            + 3 * k
+            + (2 + crate::riir::attn::linear_attn_forward::MOE_INDEX_SETS) * k
             + v.num_experts.max(1))
         + v.num_experts.max(1);
 

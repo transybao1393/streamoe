@@ -242,6 +242,33 @@ history of `.claude/memory/`, which is no longer tracked.
   → 14.5 / 11.3 / 15.2). The `io` wait counter grows 2–7 ms per token
   (the routing now arrives sooner after the prefetch starts, so more of
   its reads are still in flight) while forward time falls 4–12 ms.
+- **Prefill staged a layer's experts, then computed — never both at
+  once.** `OpenConfig::prefill_overlap_groups` (env
+  `STREAMMOE_PREFILL_OVERLAP=<n>`, off by default until it is turned
+  on) overlaps them: with full staging an I/O thread reads the layer's
+  routed experts (`ExpertFiles::stage_layer_notify`) and every batch of
+  ≥ 1/n of them that has landed goes to the GPU as an expert group,
+  committed without a wait (`Backend::execute_nowait` /
+  `wait_pending`); what lands after the last such group is the last
+  group (shared FFN, combine). Groups follow read completion, not
+  expert order, so the disk never stalls on a group boundary. Bounded
+  staging double-buffers (groups of half the slots, alternating
+  halves). Each in-flight group reads its own index table
+  (`MOE_INDEX_SETS` = 8 in `expert_indices`, 16 KiB each at chunk
+  512, in `prefill_scratch`); no other memory. Bit-identical
+  (`bounded_staging::overlapped_staging_matches_staging_first`: full
+  staging at n = 2 / 3 / 8, bounded 16 / 40 slots). A first version
+  that staged fixed groups in turn (stage g+1, then commit it) gained
+  on the long prompt only: each group's staging call ended on its
+  slowest read, so I/O time rose (short prompts +70 ms I/O, −100 ms
+  GPU, net zero). a3b chat, 4-bit, internal SSD, n_ctx 4096, F32 KV,
+  off → n = 8, 3 runs each, 2026-11-05, greedy output and hot-tier hits
+  identical in every run: 4 GiB, three chat prompts (24–25 tokens)
+  first word 1.210 → 1.046 s (−14%, prefill ~21 → ~24 tok/s); a
+  1659-token prompt 15.43 → 13.04 s (−15%, 107.7 → 127.5 tok/s);
+  6 GiB 1.170 → 0.989 s (−15%) and 15.19 → 12.84 s (−15%, 109.4 →
+  129.4 tok/s). n = 2 and 4 gained less (one sweep run at 4 GiB). The
+  397B (bounded, 64-slot groups) has not been measured with it.
 
 ## Precautions
 
@@ -506,7 +533,9 @@ history of `.claude/memory/`, which is no longer tracked.
   the routed experts at the SSD's peak (~4.6 GB/s); GPU time between
   stages is ~0.33 s per short prefill, so the ceiling is −23% time to
   first word with perfect guesses, realistically −10–15%, for staging
-  slots the GPU may still be reading.
+  slots the GPU may still be reading. (Overlapping within a layer —
+  no guesses — reached −14–15%: see `prefill_overlap_groups` under
+  Fixed > Speed.)
 - All-2-bit experts, re-measured on a3b (2026-10-26): experts rounded
   to 4 levels (`tools/requant_experts.py`, kept in the 4-bit layout) vs
   the 4-bit model on 314 teacher-forced tokens and 10 scored tasks

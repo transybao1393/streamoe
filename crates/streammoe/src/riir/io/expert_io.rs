@@ -708,7 +708,29 @@ impl ExpertFiles {
                 actual: staging.len(),
             });
         }
-        self.stage_into(pool, layer_idx, expert_ids, staging, |e| e)
+        self.stage_into(pool, layer_idx, expert_ids, staging, |e| e, &|_, _| {})
+    }
+
+    /// [`Self::stage_layer`] that calls `on_done(first, n)` as soon as
+    /// experts `first..first + n` are in place (from an I/O thread, in
+    /// completion order), so a caller can start computing on them
+    /// while the rest are still being read (overlapped prefill).
+    pub fn stage_layer_notify(
+        &self,
+        pool: &rayon::ThreadPool,
+        layer_idx: usize,
+        expert_ids: &[i32],
+        staging: &mut [u8],
+        on_done: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<(), ExpertIoError> {
+        let num_experts = VARIANT.num_experts;
+        if staging.len() < num_experts * self.expert_size {
+            return Err(ExpertIoError::BadOutLen {
+                expected: num_experts * self.expert_size,
+                actual: staging.len(),
+            });
+        }
+        self.stage_into(pool, layer_idx, expert_ids, staging, |e| e, on_done)
     }
 
     /// [`Self::stage_layer`] into a bounded staging buffer: `expert_ids`
@@ -733,13 +755,19 @@ impl ExpertFiles {
             expert_ids.windows(2).all(|w| w[0] < w[1]),
             "stage_layer_compact: expert ids must be strictly ascending"
         );
-        self.stage_into(pool, layer_idx, expert_ids, staging, |e| {
-            expert_ids.binary_search(&(e as i32)).expect("planned expert is listed")
-        })
+        self.stage_into(
+            pool,
+            layer_idx,
+            expert_ids,
+            staging,
+            |e| expert_ids.binary_search(&(e as i32)).expect("planned expert is listed"),
+            &|_, _| {},
+        )
     }
 
     /// Shared body of the staging paths: expert `e` lands at slot
     /// `slot_of(e)`, which must ascend with `e` over `expert_ids`.
+    /// `on_done(first, n)` runs once each run of experts is in place.
     fn stage_into(
         &self,
         pool: &rayon::ThreadPool,
@@ -747,6 +775,7 @@ impl ExpertFiles {
         expert_ids: &[i32],
         staging: &mut [u8],
         slot_of: impl Fn(usize) -> usize,
+        on_done: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<(), ExpertIoError> {
         use rayon::prelude::*;
         let es = self.expert_size;
@@ -783,11 +812,14 @@ impl ExpertFiles {
                 if t.hot {
                     if hot.is_some_and(|h| h.copy_out(layer_idx, first, dst)) {
                         self.counters.record_prefill_hot(layer_idx, 1);
+                        on_done(first, t.n as usize);
                         return Ok(());
                     }
                     // Evicted since planning: read it instead.
                 }
-                self.read_run_disk(ReadKind::Prefill, layer_idx, first, t.n as usize, dst)
+                self.read_run_disk(ReadKind::Prefill, layer_idx, first, t.n as usize, dst)?;
+                on_done(first, t.n as usize);
+                Ok(())
             })
         })
     }
