@@ -31,10 +31,10 @@ use std::time::Instant;
 use streammoe::{Ctx, KvFormat, OpenConfig, PrefetchGuess};
 use tokenizers::Tokenizer;
 
-#[path = "../draft.rs"]
+#[path = "../lookup.rs"]
 #[allow(dead_code)]
-mod draft;
-use draft::{argmax, Drafter, Guard};
+mod lookup;
+use lookup::{argmax, Drafter, Guard};
 
 const GIB: f64 = (1u64 << 30) as f64;
 

@@ -46,7 +46,7 @@ use streammoe::{Ctx, ExpertIoStats, KvFormat, OpenConfig, PrefetchGuess, ReqId, 
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
-mod draft;
+mod lookup;
 mod spec;
 
 const GIB: f64 = (1u64 << 30) as f64;

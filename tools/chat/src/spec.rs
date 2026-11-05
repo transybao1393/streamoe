@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use streammoe::riir::MAX_DECODE_TOKENS;
 use streammoe::{ReqId, StageOutput};
 
-use crate::draft::{Drafter, Guard, argmax};
+use crate::lookup::{Drafter, Guard, argmax};
 use crate::{Chat, Turn};
 
 /// What `--spec` asked for at startup.
