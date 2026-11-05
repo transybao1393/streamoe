@@ -594,6 +594,9 @@ pub struct MetalBackend {
     /// `=0` escape hatch keeps the QmmCall-at-M=1 path reachable for
     /// future A/B work without a rebuild.
     matvec_m1_v3: bool,
+    /// Command buffers committed by [`Backend::execute_nowait`] and not
+    /// yet waited for, oldest first ([`Backend::wait_pending`]).
+    pending: std::sync::Mutex<std::collections::VecDeque<(::metal::CommandBuffer, &'static str)>>,
 }
 
 impl MetalBackend {
@@ -653,6 +656,7 @@ impl MetalBackend {
             embed_gather_4bit_pso,
             profile_per_op: std::env::var_os("STREAMMOE_PROFILE_PER_OP").is_some(),
             moe_gather: std::env::var("STREAMMOE_MOE_GATHER").map_or(true, |v| v != "0"),
+            pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
             matvec_m1_v3: std::env::var("STREAMMOE_MATVEC_M1_V3").map_or(true, |v| v != "0"),
         })
     }
@@ -733,6 +737,38 @@ impl Backend for MetalBackend {
         let mut ctx = self.begin_encoding();
         self.encode_graph(graph, &mut ctx);
         self.submit_and_wait(ctx, label)
+    }
+
+    fn execute_nowait(&self, graph: &Graph, label: &'static str) -> Result<(), GraphError> {
+        if self.profile_per_op {
+            return self.execute(graph, label);
+        }
+        let mut ctx = self.begin_encoding();
+        self.encode_graph(graph, &mut ctx);
+        ctx.cmdbuf.commit();
+        crate::riir::backend::gpu::gpu_timing::mark(label);
+        self.pending.lock().expect("pending mutex poisoned").push_back((ctx.cmdbuf, label));
+        Ok(())
+    }
+
+    fn wait_pending(&self, keep: usize) -> Result<(), GraphError> {
+        loop {
+            let next = {
+                let mut q = self.pending.lock().expect("pending mutex poisoned");
+                if q.len() <= keep {
+                    return Ok(());
+                }
+                q.pop_front().expect("non-empty")
+            };
+            let (cmdbuf, label) = next;
+            let t0 = std::time::Instant::now();
+            cmdbuf.wait_until_completed();
+            let cpu_wait_ns = t0.elapsed().as_nanos() as u64;
+            if cmdbuf.status() == ::metal::MTLCommandBufferStatus::Error {
+                panic!("Metal command buffer '{label}' (not waited at commit) completed with error status");
+            }
+            self.metal.record_wait(label, &cmdbuf, cpu_wait_ns);
+        }
     }
 
     fn begin_layer(&mut self, chunk_idx: usize, layer_idx: usize) {
@@ -1310,6 +1346,7 @@ impl Backend for MetalBackend {
                 expert_base,
                 expert_stride,
                 indices,
+                indices_off,
                 weights,
                 mlp_in,
                 out_sum,
@@ -1331,6 +1368,7 @@ impl Backend for MetalBackend {
                     self.pool.handle(*expert_base),
                     *expert_stride,
                     self.pool.handle(*indices),
+                    *indices_off,
                     self.pool.handle(*weights),
                     self.pool.handle(*mlp_in),
                     self.pool.handle(*out_sum),

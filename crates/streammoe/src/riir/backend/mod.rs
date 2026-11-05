@@ -152,8 +152,9 @@ pub trait BufferPool {
     /// Run `f` over the whole buffer at `id` in place, so a producer
     /// can fill it without a host staging copy (plan phase 6: prefill
     /// expert reads land directly in the staging buffer). The caller
-    /// must ensure no GPU work touching the buffer is in flight, the
-    /// same rule as [`Self::upload_at`].
+    /// must ensure no GPU work touching the bytes `f` writes is in
+    /// flight (overlapped prefill staging writes slots that GPU work
+    /// still in flight does not read), as for [`Self::upload_at`].
     fn with_bytes_mut<B: Buf, R>(
         &mut self,
         id: BufId<B>,
@@ -285,6 +286,20 @@ pub trait Backend {
         let mut ctx = self.begin_encoding();
         self.encode_graph(graph, &mut ctx);
         self.submit_and_wait(ctx, label)
+    }
+
+    /// Encode `graph` and commit it without waiting for it (Metal), so
+    /// the CPU can work while the GPU runs it; [`Self::wait_pending`]
+    /// waits. Commands run in commit order on one queue. The default
+    /// (CPU) runs it inline, like [`Self::execute`].
+    fn execute_nowait(&self, graph: &Graph, label: &'static str) -> Result<(), Self::Error> {
+        self.execute(graph, label)
+    }
+
+    /// Wait, oldest first, until at most `keep` of the commands
+    /// [`Self::execute_nowait`] committed are still in flight.
+    fn wait_pending(&self, _keep: usize) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     /// Hook fired by the prefill orchestrator at the top of each
@@ -635,6 +650,9 @@ pub enum Op {
         expert_stride: u64,
         /// Router output — `[n_tokens, k]` i32.
         indices: BufId<RouterIdxBuf>,
+        /// Byte offset of the `[n_tokens, k]` table in `indices` (an
+        /// expert group's own index set when groups overlap; else 0).
+        indices_off: u64,
         /// Router output — `[n_tokens, k]` f32.
         weights: BufId<RouterWeightsBuf>,
         /// Input to the MoE-MLP matmul stack — the **post-RmsNorm**

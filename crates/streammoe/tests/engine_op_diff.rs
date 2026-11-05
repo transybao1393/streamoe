@@ -604,6 +604,7 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
                 expert_base: expert_base_id,
                 expert_stride: v.expert_size_4bit() as u64,
                 indices: scratch.routing_indices,
+                indices_off: 0,
                 weights: scratch.routing_weights,
                 mlp_in: scratch.h_post,
                 out_sum: scratch.out_sum,

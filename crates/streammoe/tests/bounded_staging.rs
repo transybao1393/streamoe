@@ -28,7 +28,7 @@ use streammoe::{Ctx, OpenConfig};
 const GIB: u64 = 1 << 30;
 const DECODE: usize = 8;
 
-fn open(staging: Option<usize>) -> Ctx {
+fn open(staging: Option<usize>, overlap: usize) -> Ctx {
     let p = default_a3b_paths();
     let root = std::env::var_os("STREAMMOE_TEST_ROOT").map_or(p.root.clone(), PathBuf::from);
     let gib: f64 = std::env::var("STREAMMOE_TEST_CAP_GIB").map_or(4.0, |g| g.parse().expect("GiB"));
@@ -39,6 +39,7 @@ fn open(staging: Option<usize>) -> Ctx {
         // Three chunks for the prompt below.
         prefill_chunk: Some(64),
         prefill_staging_experts: staging,
+        prefill_overlap_groups: Some(overlap),
         ..OpenConfig::default()
     };
     Ctx::open_with(&p.weights, &p.manifest, &p.vocab, &root, false, &cfg).expect("open")
@@ -78,16 +79,39 @@ fn assert_bit_identical(label: &str, a: &[Vec<f32>], b: &[Vec<f32>]) {
 #[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
 fn bounded_staging_matches_full_staging() {
     let full = {
-        let mut ctx = open(None);
+        let mut ctx = open(None, 0);
         run(&mut ctx)
     };
     // 16 slots: ~a dozen groups per layer chunk; 40 → 40 (a multiple
     // of 8) with a short last group.
     for staging in [16, 40] {
-        let mut ctx = open(Some(staging));
+        let mut ctx = open(Some(staging), 0);
         let got = run(&mut ctx);
         let hot = ctx.expert_io_stats().hot.expect("hot tier");
         eprintln!("[bounded_staging] {staging} slots: hot tier {hot:?}");
         assert_bit_identical(&format!("{staging} slots"), &full, &got);
+    }
+}
+
+/// Overlapped staging (`prefill_overlap_groups`): the GPU computing on
+/// experts that have landed while the rest are read — full staging
+/// with groups of ≥ 1/2, 1/3 and 1/8 of a layer's routed experts (in
+/// the order reads complete), bounded staging (16 and 40 slots)
+/// double-buffered — gives the same logits, bit for bit, as staging
+/// first.
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn overlapped_staging_matches_staging_first() {
+    let base = {
+        let mut ctx = open(None, 0);
+        run(&mut ctx)
+    };
+    for (staging, groups) in [(None, 2), (None, 3), (None, 8), (Some(16), 1), (Some(40), 1)] {
+        let mut ctx = open(staging, groups);
+        let got = run(&mut ctx);
+        // The overlapped groups really ran (committed without a wait).
+        let early = ctx.cmdbuf_stats().iter().find(|(l, _)| *l == "graph_moe_group").map_or(0, |(_, s)| s.count);
+        assert!(early > 0, "staging {staging:?}, overlap {groups}: no overlapped group ran");
+        assert_bit_identical(&format!("staging {staging:?}, overlap {groups}"), &base, &got);
     }
 }

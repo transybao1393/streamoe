@@ -1862,6 +1862,7 @@ pub fn encode_moe_gather_id_fuse(
     expert_base: &Buffer,
     expert_stride: u64,
     indices: &Buffer,
+    indices_off: u64,
     weights: &Buffer,
     mlp_in: &Buffer,
     out_sum: &Buffer,
@@ -1891,7 +1892,7 @@ pub fn encode_moe_gather_id_fuse(
         cmdbuf,
         &streammoe_metal::MoeIdMap0Call {
             indices,
-            indices_offset: 0,
+            indices_offset: indices_off,
             htpe,
             htpe_offset: 0,
             hids,

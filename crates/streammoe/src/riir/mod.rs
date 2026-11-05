@@ -462,6 +462,9 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// ([`OpenConfig::prefill_staging_experts`], resolved at open):
     /// `VARIANT.num_experts` for full staging, fewer when bounded.
     prefill_staging_experts: usize,
+    /// Expert groups per batched MoE layer whose staging overlaps the
+    /// GPU ([`OpenConfig::resolved_prefill_overlap_groups`]); 0 = off.
+    prefill_overlap_groups: usize,
     /// Under a cap: the plan total less `runtime_overhead`, i.e. every
     /// byte the plan accounts for exactly. The open-time log reports
     /// the measured footprint above it as `unplanned`.
@@ -873,6 +876,7 @@ impl RsCtx<MetalBackend> {
             mem_cap: config.mem_cap,
             prefill_chunk,
             prefill_staging_experts,
+            prefill_overlap_groups: config.resolved_prefill_overlap_groups(),
             planned_exact,
             runtime_overhead: config.runtime_overhead,
             baseline_peak,
@@ -2227,9 +2231,11 @@ impl RsCtx<MetalBackend> {
             let expert_size = self.experts.expert_size();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             let staging = self.prefill_staging_experts;
-            self.moe_graph_scratch = Some(attn::linear_attn_forward::MoeGraphScratch::new_with_staging(
+            let mut scratch = attn::linear_attn_forward::MoeGraphScratch::new_with_staging(
                 pool, k_active, mode, chunk, expert_size, staging,
-            ));
+            );
+            scratch.overlap_groups = self.prefill_overlap_groups;
+            self.moe_graph_scratch = Some(scratch);
         }
         if self.hidden_double_buffer.is_none() {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
