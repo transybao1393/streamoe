@@ -14,8 +14,16 @@
 //!
 //! in host-clock seconds, `cpu_resumed` being when the waiting CPU
 //! thread got control back. Gaps between one buffer's `gpu_end` and the
-//! next one's `gpu_start` are time the GPU sat idle. Unset (the default)
-//! costs one `OnceLock` load per wait.
+//! next one's `gpu_start` are time the GPU sat idle. Command buffers
+//! nobody waits on (early expert dispatch) are [`record_later`]ed and
+//! written once complete; host-side events (the start and end of a
+//! layer's expert reads, a commit) are [`mark`]ed as
+//!
+//! ```text
+//! @<label> <host_time>
+//! ```
+//!
+//! Unset (the default) costs one `OnceLock` load per call.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -64,8 +72,44 @@ pub fn record(label: &str, cmdbuf: &CommandBufferRef) {
     let resumed = host_now();
     let (start, end) = gpu_span(cmdbuf);
     let mut out = t.lock().unwrap();
+    flush_later(&mut out);
     let _ = writeln!(out, "{label} {start:.9} {end:.9} {resumed:.9}");
     // Flushed per line: servers are often stopped with a signal, and
     // ~80 lines per token cost nothing next to the token.
     let _ = out.flush();
+}
+
+/// Command buffers handed to [`record_later`], written by the next
+/// [`record`] once they have completed.
+static LATER: Mutex<Vec<(&'static str, metal::CommandBuffer)>> = Mutex::new(Vec::new());
+
+/// Trace a committed command buffer nobody waits on: its line is written
+/// by a later [`record`] once it has completed (`cpu_resumed` is then
+/// that later time). No-op unless tracing is on.
+pub fn record_later(label: &'static str, cmdbuf: &CommandBufferRef) {
+    if trace().is_none() {
+        return;
+    }
+    LATER.lock().unwrap().push((label, cmdbuf.to_owned()));
+}
+
+fn flush_later(out: &mut BufWriter<File>) {
+    let mut later = LATER.lock().unwrap();
+    later.retain(|(label, cb)| {
+        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+            return true;
+        }
+        let (start, end) = gpu_span(cb);
+        let _ = writeln!(out, "{label} {start:.9} {end:.9} {:.9}", host_now());
+        false
+    });
+}
+
+/// Mark a host-side event at the current host time. No-op unless
+/// tracing is on.
+pub fn mark(label: &str) {
+    let Some(t) = trace() else { return };
+    let now = host_now();
+    let mut out = t.lock().unwrap();
+    let _ = writeln!(out, "@{label} {now:.9}");
 }

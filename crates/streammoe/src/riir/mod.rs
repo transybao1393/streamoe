@@ -3481,6 +3481,7 @@ impl RsCtx<MetalBackend> {
                     k_active,
                 );
             }
+            crate::riir::backend::gpu::gpu_timing::mark("layer_prefetched");
 
             // Slice 5d-8: chain enabled for every non-last layer
             // (gpu_combine is hardcoded true here). Last layer's

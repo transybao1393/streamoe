@@ -342,6 +342,7 @@ pub(crate) fn gpu_batched_experts_begin_mmap(
         done,
     )?;
     cmd_buffer.commit();
+    gpu_timing::mark("commit:moe.experts");
     ring.push(DeferredState {
         cmd_buffer,
         mode: DeferredMode::Gpu,

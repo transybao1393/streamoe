@@ -2231,6 +2231,8 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                 )?;
                 if let Some(cmdbuf) = early {
                     cmdbuf.commit();
+                    crate::riir::backend::gpu::gpu_timing::mark("commit:moe.experts_early");
+                    crate::riir::backend::gpu::gpu_timing::record_later("moe.experts_early", &cmdbuf);
                     early_done = ready;
                 }
             }
@@ -2241,6 +2243,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             //    bound slot landing is I/O wait on the critical path.
             let io_t0 = std::time::Instant::now();
             crate::riir::io::io_trace::mark('R', layer_idx);
+            crate::riir::backend::gpu::gpu_timing::mark("io_start");
             let prefetch_status = prefetch.begin_layer(layer_idx);
 
             // 2. Per-slot hit/miss decision. Set-based, not
@@ -2303,6 +2306,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             expert_files.counters().record_decode_layer(layer_idx, hot_count, hit_count);
             expert_files.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
             crate::riir::io::io_trace::mark('W', layer_idx);
+            crate::riir::backend::gpu::gpu_timing::mark("io_end");
 
             // 3b. Cross-layer guesses (plan phase 6): keep this layer's
             //     post-attention residual for the next layer's guess.

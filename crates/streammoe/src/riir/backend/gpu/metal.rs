@@ -355,6 +355,7 @@ impl MetalContext {
         between: impl FnOnce(),
     ) {
         cmdbuf.commit();
+        super::gpu_timing::mark(label);
         between();
         let t0 = std::time::Instant::now();
         cmdbuf.wait_until_completed();
