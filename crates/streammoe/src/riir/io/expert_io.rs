@@ -701,15 +701,56 @@ impl ExpertFiles {
         expert_ids: &[i32],
         staging: &mut [u8],
     ) -> Result<(), ExpertIoError> {
-        use rayon::prelude::*;
-        let es = self.expert_size;
         let num_experts = VARIANT.num_experts;
-        if staging.len() < num_experts * es {
+        if staging.len() < num_experts * self.expert_size {
             return Err(ExpertIoError::BadOutLen {
-                expected: num_experts * es,
+                expected: num_experts * self.expert_size,
                 actual: staging.len(),
             });
         }
+        self.stage_into(pool, layer_idx, expert_ids, staging, |e| e)
+    }
+
+    /// [`Self::stage_layer`] into a bounded staging buffer: `expert_ids`
+    /// (strictly ascending, as `build_expert_buckets` emits them) go to
+    /// consecutive slots, `expert_ids[i]` at `i * expert_size`. Runs of
+    /// consecutive experts still coalesce, since they land in
+    /// consecutive slots.
+    pub fn stage_layer_compact(
+        &self,
+        pool: &rayon::ThreadPool,
+        layer_idx: usize,
+        expert_ids: &[i32],
+        staging: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
+        if staging.len() < expert_ids.len() * self.expert_size {
+            return Err(ExpertIoError::BadOutLen {
+                expected: expert_ids.len() * self.expert_size,
+                actual: staging.len(),
+            });
+        }
+        assert!(
+            expert_ids.windows(2).all(|w| w[0] < w[1]),
+            "stage_layer_compact: expert ids must be strictly ascending"
+        );
+        self.stage_into(pool, layer_idx, expert_ids, staging, |e| {
+            expert_ids.binary_search(&(e as i32)).expect("planned expert is listed")
+        })
+    }
+
+    /// Shared body of the staging paths: expert `e` lands at slot
+    /// `slot_of(e)`, which must ascend with `e` over `expert_ids`.
+    fn stage_into(
+        &self,
+        pool: &rayon::ThreadPool,
+        layer_idx: usize,
+        expert_ids: &[i32],
+        staging: &mut [u8],
+        slot_of: impl Fn(usize) -> usize,
+    ) -> Result<(), ExpertIoError> {
+        use rayon::prelude::*;
+        let es = self.expert_size;
+        let num_experts = VARIANT.num_experts;
         for &e in expert_ids {
             if e < 0 || e as usize >= num_experts {
                 return Err(ExpertIoError::BadExpertIdx {
@@ -729,7 +770,7 @@ impl ExpertFiles {
         let mut rest: &mut [u8] = staging;
         let mut base = 0usize;
         for t in tasks {
-            let start = t.first as usize * es;
+            let start = slot_of(t.first as usize) * es;
             let tail = std::mem::take(&mut rest).split_at_mut(start - base).1;
             let (dst, tail) = tail.split_at_mut(t.n as usize * es);
             work.push((t, dst));
@@ -972,6 +1013,40 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(matches!(err, ExpertIoError::FastCopyMismatch { layer: 0, .. }), "{err}");
+        let _ = std::fs::remove_dir_all(primary.parent().unwrap());
+    }
+
+    /// `stage_layer_compact` puts the i-th listed expert at slot i
+    /// (runs coalesced) and leaves the slots past the list untouched.
+    #[test]
+    fn stage_layer_compact_packs_listed_experts() {
+        use std::io::{Seek, SeekFrom, Write};
+        let v = VARIANT;
+        let es = v.expert_size_4bit();
+        let (primary, _fast) = scratch_dirs("compact");
+        let path = primary.join("packed_experts").join("layer_00.bin");
+        let mut f = File::create(&path).unwrap();
+        f.set_len((v.num_experts * es) as u64).unwrap();
+        let ids = [2i32, 3, 4, 9];
+        for &e in &ids {
+            f.seek(SeekFrom::Start((e as usize * es) as u64)).unwrap();
+            f.write_all(&vec![e as u8 + 1; es]).unwrap();
+        }
+        drop(f);
+        let ef = ExpertFiles::open_range_tiered(&primary, None, false, false, 0..1).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let mut staging = vec![0xAAu8; (ids.len() + 1) * es];
+        ef.stage_layer_compact(&pool, 0, &ids, &mut staging).unwrap();
+        for (slot, &e) in ids.iter().enumerate() {
+            assert!(staging[slot * es..(slot + 1) * es].iter().all(|&b| b == e as u8 + 1), "slot {slot}");
+        }
+        assert!(staging[ids.len() * es..].iter().all(|&b| b == 0xAA));
+        // Too small for the list.
+        let mut small = vec![0u8; 3 * es];
+        assert!(matches!(
+            ef.stage_layer_compact(&pool, 0, &ids, &mut small),
+            Err(ExpertIoError::BadOutLen { .. })
+        ));
         let _ = std::fs::remove_dir_all(primary.parent().unwrap());
     }
 
