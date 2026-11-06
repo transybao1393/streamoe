@@ -76,6 +76,8 @@ pub mod gated_residual_gpu;
 pub mod layer;
 pub mod ngram;
 pub mod ple;
+#[cfg(all(test, feature = "model-qwen3-8-flash-next-tiny"))]
+mod prefetch_tests;
 pub mod qsa;
 pub mod tiny;
 pub mod weights;

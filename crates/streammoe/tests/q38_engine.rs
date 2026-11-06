@@ -196,3 +196,87 @@ fn ctx_rejects_unsupported_config() {
         assert!(r.is_err());
     }
 }
+
+/// Speculative prefetch and the hot tier through the context, under a
+/// cap: the logits of every arm equal prefetch-off / no-tier bit for
+/// bit, the counters move, and the footprint stays under the cap.
+#[test]
+fn ctx_prefetch_and_hot_tier_under_cap() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38_engine] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let m = dir.join("streammoe");
+    let a = m.join("artifacts");
+    let es = 30720u64; // the tiny model's expert size (layout.json)
+    let cap = 2 * GIB;
+    // (label, prefetch_experts, lookahead, hot_tier_bytes)
+    let arms: [(&str, Option<usize>, bool, Option<u64>); 4] = [
+        ("off", Some(0), false, Some(0)),
+        ("default prefetch (capped)", None, false, Some(0)),
+        ("prefetch 1 + lookahead, 8-expert tier", Some(1), true, Some(8 * es)),
+        ("default prefetch, tier takes the rest", None, false, None),
+    ];
+    let mut base: Option<Vec<Vec<f32>>> = None;
+    for (label, n, ahead, hot) in arms {
+        let cfg = OpenConfig {
+            n_ctx: 64,
+            mem_cap: Some(cap),
+            prefetch_experts: n,
+            prefetch_lookahead: ahead,
+            hot_tier_bytes: hot,
+            ..OpenConfig::default()
+        };
+        let mut ctx = Ctx::open_with(
+            &a.join("model_weights.bin"),
+            &a.join("model_weights.json"),
+            &a.join("vocab.bin"),
+            &m.join("root"),
+            false,
+            &cfg,
+        )
+        .expect("open the tiny model");
+        let v = ctx.n_vocab();
+        let mut rows = Vec::new();
+        for g in &gs {
+            ctx.memory_clear();
+            for (r, &tok) in g.ids.iter().chain(&g.decode).enumerate() {
+                let mut l = vec![0.0f32; v];
+                ctx.eval_token(tok, r, 0, &mut l).unwrap();
+                rows.push(l);
+            }
+        }
+        let (hits, misses) = ctx.prefetch_stats();
+        let st = ctx.expert_io_stats();
+        let h = st.hot.unwrap_or_default();
+        let fp = ctx.footprint().expect("footprint");
+        eprintln!(
+            "[q38_engine] {label}: prefetch hits {hits} misses {misses}, prefetch reads {}, demand reads {}, \
+             hot hits {} / misses {}, tier {} slots; footprint {:.1} MiB of cap {} MiB",
+            st.prefetch.reads,
+            st.demand.reads,
+            h.hits,
+            h.misses,
+            h.capacity,
+            fp.current as f64 / (1u64 << 20) as f64,
+            cap >> 20
+        );
+        assert!(fp.current <= cap, "{label}: footprint over the cap");
+        match n {
+            Some(0) => assert_eq!((hits, st.prefetch.reads), (0, 0), "{label}"),
+            _ if hot.is_none() => {} // every expert fits the tier: little left to prefetch
+            _ => assert!(hits > 0, "{label}: no prefetch hits"),
+        }
+        if hot != Some(0) {
+            assert!(h.hits > 0, "{label}: no hot-tier hits");
+        }
+        match &base {
+            None => base = Some(rows),
+            Some(want) => {
+                let same = rows.iter().zip(want).all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()));
+                assert!(same, "{label}: logits differ from prefetch off / no tier");
+            }
+        }
+    }
+}

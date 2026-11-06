@@ -733,7 +733,7 @@ impl RsCtx<MetalBackend> {
             // Staging every expert of a layer does not fit: bound it,
             // and let the batched MoE layer run in expert groups.
             #[cfg(feature = "model-qwen3-8-flash-next")]
-            q38_ctx::plan(&mut plan, n_ctx, expert_size, experts_dir)?;
+            q38_ctx::plan(&mut plan, n_ctx, expert_size, experts_dir, config.resolved_prefetch_experts())?;
             if config.prefill_staging_experts.is_none() && plan.check(cap).is_err() {
                 let bounded = budget::staging_experts(budget::BOUNDED_STAGING_EXPERTS);
                 if bounded < prefill_staging_experts && plan.get(budget::Account::PrefillStaging) > 0 {
@@ -1243,11 +1243,15 @@ impl RsCtx<MetalBackend> {
     /// outcomes. Useful for per-request hit-rate telemetry; pair with
     /// [`Self::reset_prefetch_stats`] to scope to a single request.
     pub fn prefetch_stats(&self) -> (u64, u64) {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_prefetch_stats();
         self.prefetch.stats()
     }
 
     /// Zero the prefetch hit/miss counters.
     pub fn reset_prefetch_stats(&self) {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        self.q38_reset_prefetch_stats();
         self.prefetch.reset_stats();
     }
 
