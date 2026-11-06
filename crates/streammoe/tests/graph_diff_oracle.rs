@@ -27,7 +27,12 @@
 //! the Ops under test. Bytes are deterministic (seeded) so failures
 //! are reproducible.
 
-#![cfg(feature = "model-qwen3-6-35b-a3b")]
+#![cfg(any(
+    feature = "model-qwen3-6-35b-a3b",
+    // Qwen3-Next: the a3b layer shapes with 512 experts top-10 (the tiny
+    // build's synthetic sizes do not fit these fixtures).
+    all(feature = "model-qwen3-next-80b-a3b", not(feature = "model-qwen3-next-tiny")),
+))]
 
 use std::fs;
 use std::path::PathBuf;
