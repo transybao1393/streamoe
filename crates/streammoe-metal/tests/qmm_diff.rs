@@ -52,15 +52,16 @@ impl XorShift {
 
 /// `[out_dim, in_dim]` 4-bit affine weights in MLX's layout: packed
 /// `[out_dim, in_dim/8]` u32 (8 nibbles/word), bf16 scales + biases
-/// `[out_dim, in_dim/64]`. `in_dim` must be a multiple of 64.
+/// `[out_dim, in_dim/gs]`. `in_dim` must be a multiple of `gs`.
 fn gen_weights(
     rng: &mut XorShift,
     out_dim: usize,
     in_dim: usize,
+    gs: usize,
 ) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
-    assert_eq!(in_dim % 64, 0, "in_dim must be a multiple of group_size 64");
+    assert_eq!(in_dim % gs, 0, "in_dim must be a multiple of group_size {gs}");
     let in_packed = in_dim / 8;
-    let n_groups = in_dim / 64;
+    let n_groups = in_dim / gs;
     let packed: Vec<u32> =
         (0..out_dim * in_packed).map(|_| rng.next_u64() as u32).collect();
     let scales: Vec<u16> = (0..out_dim * n_groups)
@@ -82,9 +83,10 @@ fn cpu_qmm(
     out_dim: usize,
     in_dim: usize,
     n_tokens: usize,
+    gs: usize,
 ) -> Vec<f32> {
     let in_packed = in_dim / 8;
-    let n_groups = in_dim / 64;
+    let n_groups = in_dim / gs;
     let mut out = vec![0.0f32; n_tokens * out_dim];
     for t in 0..n_tokens {
         for r in 0..out_dim {
@@ -92,7 +94,7 @@ fn cpu_qmm(
             for k in 0..in_dim {
                 let word = packed[r * in_packed + k / 8];
                 let nibble = (word >> ((k % 8) * 4)) & 0xF;
-                let g = k / 64;
+                let g = k / gs;
                 let scale = bf16_to_f32(scales[r * n_groups + g]);
                 let bias = bf16_to_f32(biases[r * n_groups + g]);
                 let w = nibble as f32 * scale + bias;
@@ -122,9 +124,13 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 // --- the test ---------------------------------------------------------------
 
 fn run_case(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
+    run_case_gs(in_dim, out_dim, n_tokens, seed, 64);
+}
+
+fn run_case_gs(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64, gs: u32) {
     let mut rng = XorShift::new(seed);
     let (packed, scales, biases) =
-        gen_weights(&mut rng, out_dim as usize, in_dim as usize);
+        gen_weights(&mut rng, out_dim as usize, in_dim as usize, gs as usize);
     let x: Vec<f32> = (0..(n_tokens * in_dim) as usize)
         .map(|_| rng.unit())
         .collect();
@@ -137,6 +143,7 @@ fn run_case(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
         out_dim as usize,
         in_dim as usize,
         n_tokens as usize,
+        gs as usize,
     );
 
     // --- GPU ---
@@ -192,6 +199,7 @@ fn run_case(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
                 packed_offset: 0,
                 scales_offset: w_bytes as u64,
                 biases_offset: (w_bytes + s_bytes) as u64,
+                group_size: gs,
             },
             input: &in_buf,
             input_offset: 0,
@@ -227,7 +235,7 @@ fn run_case(in_dim: u32, out_dim: u32, n_tokens: u32, seed: u64) {
         );
     }
     eprintln!(
-        "qmm_t {in_dim}->{out_dim} N={n_tokens}: worst cosine = {worst:.9}"
+        "qmm_t gs{gs} {in_dim}->{out_dim} N={n_tokens}: worst cosine = {worst:.9}"
     );
 }
 
@@ -259,4 +267,48 @@ fn qmm_t_ragged_both_matches_cpu() {
 #[test]
 fn qmm_t_a3b_qkv_shape_matches_cpu() {
     run_case(2048, 12288, 256, 0x0E55);
+}
+
+// --- group size 32 (Qwen3.8-Flash-Next) -------------------------------------
+// Prefill shapes: hidden 2560; full-attention q (24 x 256, plus the
+// output gate) and kv (2 x 256); linear-attention qkv (16 QK x 128 x 2 +
+// 48 V x 128), z (48 x 128) and out_proj; the shared expert 2560 <-> 640.
+
+#[test]
+fn qmm_t_gs32_attn_q_gate_matches_cpu() {
+    run_case_gs(2560, 12288, 64, 0x3201, 32);
+}
+
+#[test]
+fn qmm_t_gs32_attn_kv_matches_cpu() {
+    run_case_gs(2560, 512, 100, 0x3202, 32);
+}
+
+#[test]
+fn qmm_t_gs32_linear_qkv_matches_cpu() {
+    run_case_gs(2560, 10240, 64, 0x3203, 32);
+}
+
+#[test]
+fn qmm_t_gs32_out_proj_matches_cpu() {
+    run_case_gs(6144, 2560, 70, 0x3204, 32);
+}
+
+#[test]
+fn qmm_t_gs32_shared_expert_matches_cpu() {
+    run_case_gs(2560, 640, 128, 0x3205, 32);
+    run_case_gs(640, 2560, 128, 0x3206, 32);
+}
+
+/// Ragged on both axes at group 32 (bounds-guarded kernel).
+#[test]
+fn qmm_t_gs32_ragged_matches_cpu() {
+    run_case_gs(2560, 300, 70, 0x3207, 32);
+}
+
+/// LM head rows (vocab 248320) in prefill: a 4096-row slice plus a
+/// ragged tail, to keep the f32 CPU reference fast.
+#[test]
+fn qmm_t_gs32_lm_head_rows_match_cpu() {
+    run_case_gs(2560, 4096 + 17, 8, 0x3208, 32);
 }

@@ -20,7 +20,7 @@
 //     (a3b top-k), uint16_t-per-id staging in threadgroup memory.
 //
 // What's streammoe-adapted
-//   * Quant format: **W4_gs64** (4-bit affine, group_size=64, bf16
+//   * Quant format: **W4 / W3, gs 64 or 32** (affine, `args.group_size`, bf16
 //     scales+biases per group). The templated `dequantize_func`
 //     hook in llama.cpp is replaced with an inline dequant of the
 //     16 nibbles the kernel needs per K-tile (8 bytes packed →
@@ -100,6 +100,10 @@ struct streammoe_mm_id_args {
     // per 3 bytes, little-endian 24-bit packs — MLX's 3-bit layout).
     // `nb01_w` and the offsets above already follow it.
     int32_t  bits;
+    // Quantization group size along K: 64 (a3b and the other MLX
+    // builds) or 32 (Qwen3.8-Flash-Next). A multiple of 16, so each
+    // thread's 16-weight chunk has one (scale, bias). `nb01_s` follows it.
+    int32_t  group_size;
 };
 
 // ===============================================================
@@ -296,10 +300,11 @@ kernel void streammoe_mm_id(
     //   3) simdgroup_load both tiles; simdgroup_multiply_accumulate.
     // ---------------------------------------------------------
 
-    // Inner W4_gs64 dequant: each thread loads `8 bytes packed =
+    // Inner W4 dequant: each thread loads `8 bytes packed =
     // 16 nibbles = 16 f32 weights` per K-tile. With group_size=64
     // and NK=32, two consecutive K-tiles share the same (scale,
-    // bias) — tracked via the `loop_k / 64` group index below.
+    // bias); at group_size=32 each K-tile has its own — tracked via
+    // the `g_thread` group index below.
     // `il0` (= `tiitg % NL0`, value 0 or 1) is the within-K-tile
     // thread-offset and is fixed per thread.
 
@@ -322,16 +327,19 @@ kernel void streammoe_mm_id(
             + args.nb01_w * (r0 + lr0)
             + (q3 ? 6 * il0 + (loop_k * 3) / 8 : 8 * il0 + (loop_k / 2));
 
-        // Scale/bias for this thread's group. Group index =
-        // `(loop_k) / GROUP_SIZE = loop_k / 64`. nb01_s is the
-        // byte stride between rows in the scales/biases planes
-        // (each row has K/GROUP_SIZE bf16 entries).
+        // Scale/bias for this thread's group: its 16 weights start at
+        // K index `loop_k + 16 * il0`, all in group
+        // `(loop_k + 16 * il0) / group_size` (= `loop_k / 64` at
+        // group 64, `loop_k / 32` at group 32). nb01_s is the byte
+        // stride between rows in the scales/biases planes (each row
+        // has K/group_size bf16 entries).
+        const int g_thread = (loop_k + 16 * il0) / args.group_size;
         device const bfloat16_t * s_thread = x_scales_base
             + (args.nb01_s / 2) * (r0 + lr0)
-            + (loop_k / 64);
+            + g_thread;
         device const bfloat16_t * b_thread = x_biases_base
             + (args.nb01_s / 2) * (r0 + lr0)
-            + (loop_k / 64);
+            + g_thread;
         float scale = (float)(*s_thread);
         float bias  = (float)(*b_thread);
 

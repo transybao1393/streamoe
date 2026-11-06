@@ -38,7 +38,7 @@ use streammoe_metal::{Kernels, QmmCall, QuantWeights};
 
 use super::encoder::pipeline_bundle;
 use crate::riir::io::mtl_weight_buf::MtlWeightBuf;
-use crate::riir::variants::GROUP_SIZE;
+use crate::riir::variants::{group_size_for_bits, GROUP_SIZE};
 
 /// One projection matvec to encode. Weight / scales / biases live at
 /// byte offsets within the shared [`MtlWeightBuf`]; input and output
@@ -62,7 +62,7 @@ pub struct MatvecSpec<'a> {
     pub in_dim: u32,
     /// Quantization bits — 4 (default) or 8. On A3B `mlp.gate.weight`
     /// and `mlp.shared_expert_gate.weight` are 8-bit; everything else
-    /// is 4-bit.
+    /// is 4-bit. Also picks the group size ([`group_size_for_bits`]).
     pub bits: u32,
 }
 
@@ -119,7 +119,7 @@ pub fn encode_matvec(
     wf_buf: &MtlWeightBuf,
     spec: &MatvecSpec,
 ) {
-    let group_size = GROUP_SIZE as u32;
+    let group_size = group_size_for_bits(spec.bits) as u32;
     let use_qmv = spec.bits == 4 && qmv_fits(spec.in_dim, spec.w_off, 0);
     let (pipeline, use_v3_layout) = if spec.bits == 8 {
         (&pipes.v3_8bit, true)
@@ -197,7 +197,7 @@ pub fn encode_matvec_n_tokens(
     if n_tokens == 0 {
         return;
     }
-    let group_size = GROUP_SIZE as u32;
+    let group_size = group_size_for_bits(bits) as u32;
     let use_qmv = bits == 4 && n_tokens == 1 && qmv_fits(in_dim, w_off, input_off);
     let use_v3 = bits == 8 || in_dim <= 4096;
     let pipeline = if use_qmv {
@@ -282,6 +282,7 @@ pub fn encode_dense_matmul_n_tokens(
                     packed_offset: w_off,
                     scales_offset: s_off,
                     biases_offset: b_off,
+                    group_size: GROUP_SIZE as u32,
                 },
                 input,
                 input_offset: input_off,

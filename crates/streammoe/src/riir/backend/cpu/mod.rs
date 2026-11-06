@@ -24,7 +24,7 @@ use crate::riir::backend::cpu::cpu_ops::{
 use crate::riir::io::embedding::{bf16_to_f32, embed_lookup_at};
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_cpu::moe_permute_fuse_cpu;
-use crate::riir::variants::{GROUP_SIZE, VARIANT};
+use crate::riir::variants::{group_size_for_bits, GROUP_SIZE, VARIANT};
 
 use super::buftype::{Buf, KvCacheKBuf};
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
@@ -969,7 +969,7 @@ impl Backend for CpuBackend {
                 let in_skip = (*input_off as usize) / 4;
                 let out_skip = (*output_off as usize) / 4;
                 let in_packed_words = in_dim * out_dim / (if bits == 4 { 8 } else { 4 });
-                let in_scales = out_dim * (in_dim / GROUP_SIZE);
+                let in_scales = out_dim * (in_dim / group_size_for_bits(bits));
                 let w_bytes = self
                     .wf
                     .bytes_at(weight.w_off, in_packed_words * 4)

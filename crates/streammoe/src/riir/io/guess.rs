@@ -24,7 +24,7 @@
 use crate::riir::io::embedding::bf16_to_f32;
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::expert_forward::MAX_K;
-use crate::riir::variants::{GROUP_SIZE, RMS_NORM_EPS, VARIANT};
+use crate::riir::variants::{group_size_for_bits, RMS_NORM_EPS, VARIANT};
 
 /// Byte ranges in the weight file for one layer's router gate and the
 /// post-attention norm that feeds it.
@@ -34,7 +34,8 @@ pub struct GateRef {
     pub norm: (u64, usize),
     /// `mlp.gate.weight` (u32-packed, `[num_experts, hidden_dim * bits / 32]`).
     pub weight: (u64, usize),
-    /// `mlp.gate.scales` (bf16, `[num_experts, hidden_dim / GROUP_SIZE]`).
+    /// `mlp.gate.scales` (bf16, `[num_experts, hidden_dim / group]`,
+    /// group = [`group_size_for_bits`]`(bits)`).
     pub scales: (u64, usize),
     /// `mlp.gate.biases` (bf16, same shape as scales).
     pub biases: (u64, usize),
@@ -61,7 +62,7 @@ impl GateRef {
         if bits != 4 && bits != 8 {
             return None;
         }
-        let groups = v.hidden_dim / GROUP_SIZE;
+        let groups = v.hidden_dim / group_size_for_bits(bits);
         let ok = ns == v.hidden_dim * 2
             && ws == v.num_experts * v.hidden_dim * bits as usize / 8
             && ss == v.num_experts * groups * 2
@@ -94,7 +95,7 @@ pub fn rms_norm_bf16(x: &[f32], w: &[u8], eps: f32, out: &mut [f32]) {
 /// Serial `out[r] = Σ_c dequant(W[r, c]) · x[c]` for a `bits`-bit
 /// (4 or 8) MLX-packed matrix: `packed` holds `32 / bits` values per
 /// u32, low bits first; `scales` / `biases` are bf16 per
-/// [`GROUP_SIZE`] inputs. Matches `dequant_matvec_4bit_cpu` /
+/// [`group_size_for_bits`]`(bits)` inputs. Matches `dequant_matvec_4bit_cpu` /
 /// `dequant_matvec_8bit_v3_cpu` without the thread pool.
 pub fn gate_logits(
     packed: &[u32],
@@ -108,8 +109,9 @@ pub fn gate_logits(
     let per_word = (32 / bits) as usize;
     let mask = (1u32 << bits) - 1;
     let in_packed = in_dim / per_word;
-    let in_groups = in_dim / GROUP_SIZE;
-    let words_per_group = GROUP_SIZE / per_word;
+    let group = group_size_for_bits(bits);
+    let in_groups = in_dim / group;
+    let words_per_group = group / per_word;
     for (r, o) in out.iter_mut().enumerate() {
         let row = &packed[r * in_packed..(r + 1) * in_packed];
         let mut acc = 0.0f32;
@@ -118,7 +120,7 @@ pub fn gate_logits(
             let bias = bf16_to_f32(biases[r * in_groups + g]);
             for p in 0..words_per_group {
                 let word = row[g * words_per_group + p];
-                let xs = &x[g * GROUP_SIZE + p * per_word..][..per_word];
+                let xs = &x[g * group + p * per_word..][..per_word];
                 for (n, &xv) in xs.iter().enumerate() {
                     let q = ((word >> (n as u32 * bits)) & mask) as f32;
                     acc = q.mul_add(scale, bias).mul_add(xv, acc);
@@ -258,13 +260,15 @@ mod tests {
 
     #[test]
     fn gate_logits_matches_threaded_kernels() {
-        let (in_dim, out_dim) = (4 * GROUP_SIZE, 5);
+        let (in_dim, out_dim) = (256, 5);
         let mut seed = 7u64;
         let x: Vec<f32> = (0..in_dim).map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0).collect();
-        let groups = in_dim / GROUP_SIZE;
-        let scales: Vec<u16> = (0..out_dim * groups).map(|i| bf16(0.01 + 0.001 * i as f32)).collect();
-        let biases: Vec<u16> = (0..out_dim * groups).map(|i| bf16(-0.05 + 0.002 * i as f32)).collect();
         for bits in [4u32, 8] {
+            let groups = in_dim / group_size_for_bits(bits);
+            let scales: Vec<u16> =
+                (0..out_dim * groups).map(|i| bf16(0.01 + 0.001 * i as f32)).collect();
+            let biases: Vec<u16> =
+                (0..out_dim * groups).map(|i| bf16(-0.05 + 0.002 * i as f32)).collect();
             let words = out_dim * in_dim * bits as usize / 32;
             let packed: Vec<u32> = (0..words).map(|_| lcg(&mut seed)).collect();
             let mut want = vec![0f32; out_dim];

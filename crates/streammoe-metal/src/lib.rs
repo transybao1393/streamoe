@@ -22,7 +22,8 @@
 //! let kernels = Kernels::new(device).expect("build MLX kernels");
 //! kernels.encode(cmd, &QmmCall {
 //!     weights: QuantWeights { buffer: wf, packed_offset: 0,
-//!                             scales_offset: 1 << 20, biases_offset: 2 << 20 },
+//!                             scales_offset: 1 << 20, biases_offset: 2 << 20,
+//!                             group_size: 64 },
 //!     input: x, input_offset: 0,
 //!     output: y, output_offset: 0,
 //!     in_dim: 2048, out_dim: 4096, n_tokens: 8192,
@@ -91,10 +92,15 @@ const QMM_T_TILE: u32 = 32;
 
 const QMM_T_ALIGNED: &str = "affine_qmm_t_float_gs_64_b_4_alN_true_batch_0";
 const QMM_T_UNALIGNED: &str = "affine_qmm_t_float_gs_64_b_4_alN_false_batch_0";
+/// The same GEMM at group size 32 (Qwen3.8-Flash-Next).
+const QMM_T_ALIGNED_GS32: &str = "affine_qmm_t_float_gs_32_b_4_alN_true_batch_0";
+const QMM_T_UNALIGNED_GS32: &str = "affine_qmm_t_float_gs_32_b_4_alN_false_batch_0";
 
 /// The gathered MoE GEMM. One Metal function; its `align_M/N/K` are
 /// function constants (indices 200/201/202), specialised per PSO.
 const GATHER_QMM_RHS: &str = "affine_gather_qmm_rhs_float_gs_64_b_4_t_true";
+/// The gathered GEMM at group size 32 (BM=32 tile only).
+const GATHER_QMM_RHS_GS32: &str = "affine_gather_qmm_rhs_float_gs_32_b_4_t_true";
 /// Experimental BM=64 / WM=4 variant of the gather kernel. Same
 /// alignment-flag PSO matrix as the BM=32 default; selected at
 /// runtime by [`gather_tile_variant`] (env `STREAMMOE_GATHER_QMM_TILE`).
@@ -320,8 +326,9 @@ pub fn assemble_source() -> String {
 ///
 /// MLX affine 4-bit format: `packed` holds 8 four-bit nibbles per `u32`
 /// (`[out_dim, in_dim/8]` row-major); `scales` and `biases` hold one bf16
-/// value per group of 64 input elements (`[out_dim, in_dim/64]`
-/// row-major); the dequantized weight is `nibble * scale + bias`.
+/// value per group of `group_size` input elements
+/// (`[out_dim, in_dim/group_size]` row-major); the dequantized weight is
+/// `nibble * scale + bias`.
 ///
 /// All three live at byte offsets within one shared Metal buffer — the
 /// layout streammoe's mmap'd weight file already uses.
@@ -335,7 +342,14 @@ pub struct QuantWeights<'a> {
     pub scales_offset: u64,
     /// Byte offset of the bf16 biases region.
     pub biases_offset: u64,
+    /// Quantization group size: one of [`QMM_GROUP_SIZES`] (64, or 32
+    /// for Qwen3.8-Flash-Next). Selects the kernel instantiation.
+    pub group_size: u32,
 }
+
+/// Group sizes the 4-bit GEMMs ([`QmmCall`], [`GatherQmmCall`]) are
+/// built for.
+pub const QMM_GROUP_SIZES: &[u32] = &[64, 32];
 
 /// One quantized matmul: `output[n_tokens, out_dim] =
 /// input[n_tokens, in_dim] @ dequant(weights)[out_dim, in_dim]ᵀ`.
@@ -471,11 +485,16 @@ pub struct Kernels {
     qmm_t_aligned: ComputePipelineState,
     /// Fallback variant with bounds-guarded loads.
     qmm_t_unaligned: ComputePipelineState,
+    /// `qmm_t_aligned` / `qmm_t_unaligned` at group size 32.
+    qmm_t_aligned_gs32: ComputePipelineState,
+    qmm_t_unaligned_gs32: ComputePipelineState,
     /// `affine_gather_qmm_rhs` PSOs, indexed by the alignment triple
     /// `(align_M) | (align_N << 1) | (align_K << 2)`. All eight are built
     /// up front so a [`GatherQmmCall`] dispatch picks the exact-fit PSO
     /// for any M/N/K without a bounds-unsafe fallback in release builds.
     gather: [ComputePipelineState; 8],
+    /// `gather` at group size 32 (every tile variant uses it).
+    gather_gs32: [ComputePipelineState; 8],
     /// BM=64 / WM=4 variant of the gather kernel — same alignment-PSO
     /// matrix shape as `gather`. Selected at dispatch time by
     /// [`gather_tile_variant`]. All arrays always built; the extra
@@ -508,7 +527,7 @@ pub struct Kernels {
 
 impl Kernels {
     /// Compile the vendored MLX kernels on `device` and build the
-    /// `affine_qmm_t` pipelines (4-bit affine weights, group_size 64, f32
+    /// `affine_qmm_t` pipelines (4-bit affine weights, group_size 64 or 32, f32
     /// compute, bf16 scales, non-batched).
     pub fn new(device: &DeviceRef) -> Result<Self, MlxError> {
         let options = CompileOptions::new();
@@ -591,6 +610,8 @@ impl Kernels {
 
         let gather =
             build_gather_array(GATHER_QMM_RHS, QMM_T_THREADS_PER_GROUP)?;
+        let gather_gs32 =
+            build_gather_array(GATHER_QMM_RHS_GS32, QMM_T_THREADS_PER_GROUP)?;
         // BM=64/WM=4 variant runs 256 threads/threadgroup.
         let gather_bm64 = build_gather_array(GATHER_QMM_RHS_BM64, 256)?;
         // BM=16/WM=2 variant runs the same 128 threads/threadgroup as
@@ -612,7 +633,10 @@ impl Kernels {
         Ok(Self {
             qmm_t_aligned: build(QMM_T_ALIGNED)?,
             qmm_t_unaligned: build(QMM_T_UNALIGNED)?,
+            qmm_t_aligned_gs32: build(QMM_T_ALIGNED_GS32)?,
+            qmm_t_unaligned_gs32: build(QMM_T_UNALIGNED_GS32)?,
             gather,
+            gather_gs32,
             gather_bm64,
             gather_bm16,
             sdpa_va: build(SDPA_VA)?,
@@ -646,10 +670,13 @@ impl Kernels {
 /// shape-aware selection seam. Encoding cannot fail.
 impl KernelCall for QmmCall<'_> {
     fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
-        let pipeline = if self.out_dim % QMM_T_TILE == 0 {
-            &kernels.qmm_t_aligned
-        } else {
-            &kernels.qmm_t_unaligned
+        let aligned = self.out_dim % QMM_T_TILE == 0;
+        let pipeline = match (self.weights.group_size, aligned) {
+            (64, true) => &kernels.qmm_t_aligned,
+            (64, false) => &kernels.qmm_t_unaligned,
+            (32, true) => &kernels.qmm_t_aligned_gs32,
+            (32, false) => &kernels.qmm_t_unaligned_gs32,
+            (gs, _) => panic!("QmmCall: no qmm_t for group_size {gs}; built: {QMM_GROUP_SIZES:?}"),
         };
 
         // The kernel's K/N/M are `int`; streammoe's dims fit i32.
@@ -699,7 +726,14 @@ impl KernelCall for QmmCall<'_> {
 /// bounds-unsafe path. Encoding cannot fail.
 impl KernelCall for GatherQmmCall<'_> {
     fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
-        let variant = gather_tile_variant();
+        // Group size 32 is built for the default BM=32 tile only.
+        let variant = match self.weights.group_size {
+            64 => gather_tile_variant(),
+            32 => GatherTileVariant::Bm32Wm2,
+            gs => panic!(
+                "GatherQmmCall: no gather_qmm for group_size {gs}; built: {QMM_GROUP_SIZES:?}"
+            ),
+        };
         let bm = variant.bm();
         // BN stays 32 in both variants; only the M-tile changes with BM.
         let align_m = self.n_tokens % bm == 0;
@@ -709,6 +743,9 @@ impl KernelCall for GatherQmmCall<'_> {
             | (usize::from(align_n) << 1)
             | (usize::from(align_k) << 2);
         let pipeline = match variant {
+            GatherTileVariant::Bm32Wm2 if self.weights.group_size == 32 => {
+                &kernels.gather_gs32[idx]
+            }
             GatherTileVariant::Bm32Wm2 => &kernels.gather[idx],
             GatherTileVariant::Bm64Wm4 => &kernels.gather_bm64[idx],
             GatherTileVariant::Bm16Wm2 => &kernels.gather_bm16[idx],
@@ -855,6 +892,7 @@ struct MoeMmIdArgs {
     k: i32,
     ne11: i32,
     bits: i32,
+    group_size: i32,
 }
 
 /// `constant` args struct for [`MoeCombineTopkCall`]. Layout must
@@ -960,6 +998,10 @@ pub struct MoeGatherIdCall<'a> {
     /// Weight width: 4, or 3 for packed 3-bit experts (8 weights per
     /// 3 bytes, MLX's layout). `nb01_w` and the offsets must match.
     pub bits: u32,
+    /// Quantization group size along K (64, or 32 for
+    /// Qwen3.8-Flash-Next; any multiple of 16 that divides K).
+    /// `nb01_s` must be `K / group_size * 2`.
+    pub group_size: u32,
 }
 
 /// Reduce `mid[n_tokens, k, hidden]` × `weights[n_tokens, k]` →
@@ -1045,6 +1087,14 @@ impl KernelCall for MoeGatherIdCall<'_> {
             self.k, MOE_MM_ID_SUPPORTED_TOPK
         );
 
+        debug_assert!(
+            self.group_size >= 16
+                && self.group_size % 16 == 0
+                && self.k_in % self.group_size == 0
+                && self.nb01_s == u64::from(self.k_in / self.group_size) * 2,
+            "MoeGatherIdCall: group_size {} / k_in {} / nb01_s {} disagree",
+            self.group_size, self.k_in, self.nb01_s
+        );
         let args = MoeMmIdArgs {
             k_in: self.k_in as i32,
             n_out: self.n_out as i32,
@@ -1061,6 +1111,7 @@ impl KernelCall for MoeGatherIdCall<'_> {
             k: self.k as i32,
             ne11: self.ne11 as i32,
             bits: self.bits as i32,
+            group_size: self.group_size as i32,
         };
 
         let enc = cmdbuf.new_compute_command_encoder();

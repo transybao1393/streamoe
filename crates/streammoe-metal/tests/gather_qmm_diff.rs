@@ -59,15 +59,16 @@ impl XorShift {
 
 /// One expert's `[out_dim, in_dim]` 4-bit affine weights in MLX's layout:
 /// packed `[out_dim, in_dim/8]` u32 (8 nibbles/word), bf16 scales + biases
-/// `[out_dim, in_dim/64]`. `in_dim` must be a multiple of 64.
+/// `[out_dim, in_dim/gs]`. `in_dim` must be a multiple of `gs`.
 fn gen_weights(
     rng: &mut XorShift,
     out_dim: usize,
     in_dim: usize,
+    gs: usize,
 ) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
-    assert_eq!(in_dim % 64, 0, "in_dim must be a multiple of group_size 64");
+    assert_eq!(in_dim % gs, 0, "in_dim must be a multiple of group_size {gs}");
     let in_packed = in_dim / 8;
-    let n_groups = in_dim / 64;
+    let n_groups = in_dim / gs;
     let packed: Vec<u32> =
         (0..out_dim * in_packed).map(|_| rng.next_u64() as u32).collect();
     let scales: Vec<u16> = (0..out_dim * n_groups)
@@ -89,9 +90,10 @@ fn cpu_gather_qmm(
     out_dim: usize,
     in_dim: usize,
     n_tokens: usize,
+    gs: usize,
 ) -> Vec<f32> {
     let in_packed = in_dim / 8;
-    let n_groups = in_dim / 64;
+    let n_groups = in_dim / gs;
     let mut out = vec![0.0f32; n_tokens * out_dim];
     for t in 0..n_tokens {
         let (packed, scales, biases) = &experts[indices[t] as usize];
@@ -100,7 +102,7 @@ fn cpu_gather_qmm(
             for k in 0..in_dim {
                 let word = packed[r * in_packed + k / 8];
                 let nibble = (word >> ((k % 8) * 4)) & 0xF;
-                let g = k / 64;
+                let g = k / gs;
                 let scale = bf16_to_f32(scales[r * n_groups + g]);
                 let bias = bf16_to_f32(biases[r * n_groups + g]);
                 let w = nibble as f32 * scale + bias;
@@ -168,12 +170,24 @@ fn run_gather_case(
     seed: u64,
     label: &str,
 ) {
+    run_gather_case_gs(in_dim, out_dim, n_tokens, indices, seed, label, 64);
+}
+
+fn run_gather_case_gs(
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    indices: &[u32],
+    seed: u64,
+    label: &str,
+    gs: u32,
+) {
     let mut rng = XorShift::new(seed);
     let n_experts =
         indices.iter().copied().max().unwrap_or(0) as usize + 1;
 
     let experts: Vec<(Vec<u32>, Vec<u16>, Vec<u16>)> = (0..n_experts)
-        .map(|_| gen_weights(&mut rng, out_dim as usize, in_dim as usize))
+        .map(|_| gen_weights(&mut rng, out_dim as usize, in_dim as usize, gs as usize))
         .collect();
     let x: Vec<f32> = (0..(n_tokens * in_dim) as usize)
         .map(|_| rng.unit())
@@ -186,6 +200,7 @@ fn run_gather_case(
         out_dim as usize,
         in_dim as usize,
         n_tokens as usize,
+        gs as usize,
     );
 
     // --- GPU ---
@@ -253,6 +268,7 @@ fn run_gather_case(
                 packed_offset: 0,
                 scales_offset: w_bytes as u64,
                 biases_offset: (w_bytes + s_bytes) as u64,
+                group_size: gs,
             },
             input: &in_buf,
             input_offset: 0,
@@ -293,7 +309,7 @@ fn run_gather_case(
         );
     }
     eprintln!(
-        "gather {label} {in_dim}->{out_dim} N={n_tokens} E={n_experts}: \
+        "gather {label} gs{gs} {in_dim}->{out_dim} N={n_tokens} E={n_experts}: \
          worst cosine = {worst:.9}"
     );
 }
@@ -353,4 +369,27 @@ fn gather_a3b_moe_shape_matches_cpu() {
     let mut rng = XorShift::new(0x7077);
     let indices = sorted_indices(&mut rng, 512, 8);
     run_gather_case(2048, 768, 512, &indices, 0x7077, "a3b_moe");
+}
+
+// --- group size 32 (Qwen3.8-Flash-Next experts: 2560 <-> 640) ---------------
+
+#[test]
+fn gather_gs32_gate_up_shape_matches_cpu() {
+    let mut rng = XorShift::new(0x3211);
+    let indices = sorted_indices(&mut rng, 320, 10);
+    run_gather_case_gs(2560, 640, 320, &indices, 0x3211, "q38_gate_up", 32);
+}
+
+#[test]
+fn gather_gs32_down_shape_matches_cpu() {
+    let mut rng = XorShift::new(0x3212);
+    let indices = sorted_indices(&mut rng, 320, 10);
+    run_gather_case_gs(640, 2560, 320, &indices, 0x3212, "q38_down", 32);
+}
+
+#[test]
+fn gather_gs32_shuffled_ragged_matches_cpu() {
+    let mut rng = XorShift::new(0x3213);
+    let indices = shuffled_indices(&mut rng, 100, 6);
+    run_gather_case_gs(2560, 300, 100, &indices, 0x3213, "q38_shuffled", 32);
 }

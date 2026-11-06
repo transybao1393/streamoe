@@ -912,6 +912,7 @@ impl Backend for MetalBackend {
                                 packed_offset: weight.w_off,
                                 scales_offset: weight.s_off,
                                 biases_offset: weight.b_off,
+                                group_size: GROUP_SIZE as u32,
                             },
                             input: self.pool.handle(*input),
                             input_offset: *input_off,

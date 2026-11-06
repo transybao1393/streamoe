@@ -623,6 +623,7 @@ fn bench_matvec(metal: &mut MetalContext) {
                             packed_offset: w_off,
                             scales_offset: s_off,
                             biases_offset: b_off,
+                            group_size: GROUP_SIZE as u32,
                         },
                         input: &in_buf,
                         input_offset: 0,

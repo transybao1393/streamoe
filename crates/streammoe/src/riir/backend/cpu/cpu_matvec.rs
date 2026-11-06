@@ -32,14 +32,14 @@ use rayon::prelude::*;
 
 use crate::riir::io::embedding::bf16_to_f32;
 use crate::riir::io::weight_file::WeightFile;
-use crate::riir::variants::GROUP_SIZE;
+use crate::riir::variants::{GROUP_SIZE, GROUP_SIZE_8BIT};
 
 /// Errors from the CPU matvec primitive.
 #[derive(Debug, thiserror::Error)]
 pub enum CpuMatvecError {
     /// `in_dim` must be a multiple of [`GROUP_SIZE`] so the group
     /// boundaries align with the BF16 scale / bias arrays.
-    #[error("in_dim {in_dim} is not a multiple of GROUP_SIZE={group_size}")]
+    #[error("in_dim {in_dim} is not a multiple of group size {group_size}")]
     InDimNotMultiple { in_dim: usize, group_size: usize },
     /// Sliced lengths don't match the declared shape.
     #[error("slice length mismatch on '{field}': got {got} elements, expected {expected}")]
@@ -85,15 +85,29 @@ pub fn dequant_matvec_4bit_cpu(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), CpuMatvecError> {
-    if in_dim % GROUP_SIZE != 0 {
-        return Err(CpuMatvecError::InDimNotMultiple {
-            in_dim,
-            group_size: GROUP_SIZE,
-        });
+    dequant_matvec_4bit_gs_cpu(packed, scales, biases, in_dim, out_dim, GROUP_SIZE, x, out)
+}
+
+/// [`dequant_matvec_4bit_cpu`] at an explicit `group_size` (a multiple
+/// of 8): the reference for any group, e.g. 32 for Qwen3.8-Flash-Next.
+/// Same per-weight arithmetic and order as the fixed-group form.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_matvec_4bit_gs_cpu(
+    packed: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), CpuMatvecError> {
+    if group_size == 0 || group_size % 8 != 0 || in_dim % group_size != 0 {
+        return Err(CpuMatvecError::InDimNotMultiple { in_dim, group_size });
     }
     let in_packed = in_dim / 8;
-    let in_groups = in_dim / GROUP_SIZE;
-    let packed_per_group = GROUP_SIZE / 8;
+    let in_groups = in_dim / group_size;
+    let packed_per_group = group_size / 8;
 
     let expect_packed = out_dim * in_packed;
     let expect_scales = out_dim * in_groups;
@@ -142,7 +156,7 @@ pub fn dequant_matvec_4bit_cpu(
             let scale = bf16_to_f32(scale_row[g]);
             let bias = bf16_to_f32(bias_row[g]);
             let group_packed = &packed_row[g * packed_per_group..(g + 1) * packed_per_group];
-            let x_group = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let x_group = &x[g * group_size..(g + 1) * group_size];
             for p in 0..packed_per_group {
                 let word = group_packed[p];
                 let x_chunk = &x_group[p * 8..p * 8 + 8];
@@ -165,7 +179,7 @@ pub fn dequant_matvec_4bit_cpu(
 /// at `shaders.metal:608`):
 /// - `packed`: `[out_dim, in_dim / 4]` u32, four 8-bit bytes per u32 in
 ///   little-endian byte order (byte `n` occupies bits `n*8..n*8+8`).
-/// - `scales` / `biases`: `[out_dim, in_dim / GROUP_SIZE]` bf16, one per group.
+/// - `scales` / `biases`: `[out_dim, in_dim / GROUP_SIZE_8BIT]` bf16, one per group.
 ///
 /// Dequant of `(r, c)`: `byte * scale[r, c/GS] + bias[r, c/GS]`.
 ///
@@ -182,15 +196,28 @@ pub fn dequant_matvec_8bit_v3_cpu(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), CpuMatvecError> {
-    if in_dim % GROUP_SIZE != 0 {
-        return Err(CpuMatvecError::InDimNotMultiple {
-            in_dim,
-            group_size: GROUP_SIZE,
-        });
+    dequant_matvec_8bit_gs_cpu(packed, scales, biases, in_dim, out_dim, GROUP_SIZE_8BIT, x, out)
+}
+
+/// [`dequant_matvec_8bit_v3_cpu`] at an explicit `group_size` (a
+/// multiple of 4).
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_matvec_8bit_gs_cpu(
+    packed: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), CpuMatvecError> {
+    if group_size == 0 || group_size % 4 != 0 || in_dim % group_size != 0 {
+        return Err(CpuMatvecError::InDimNotMultiple { in_dim, group_size });
     }
     let in_packed = in_dim / 4;
-    let in_groups = in_dim / GROUP_SIZE;
-    let packed_per_group = GROUP_SIZE / 4;
+    let in_groups = in_dim / group_size;
+    let packed_per_group = group_size / 4;
 
     let expect_packed = out_dim * in_packed;
     let expect_scales = out_dim * in_groups;
@@ -239,7 +266,7 @@ pub fn dequant_matvec_8bit_v3_cpu(
             let scale = bf16_to_f32(scale_row[g]);
             let bias = bf16_to_f32(bias_row[g]);
             let group_packed = &packed_row[g * packed_per_group..(g + 1) * packed_per_group];
-            let x_group = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let x_group = &x[g * group_size..(g + 1) * group_size];
             for p in 0..packed_per_group {
                 let word = group_packed[p];
                 let x_chunk = &x_group[p * 4..p * 4 + 4];

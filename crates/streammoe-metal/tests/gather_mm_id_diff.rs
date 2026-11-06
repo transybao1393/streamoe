@@ -56,18 +56,19 @@ impl XorShift {
     }
 }
 
-// --- synthetic W4_gs64 expert weights ----------------------------------------
+// --- synthetic W4 expert weights (group size gs) -----------------------------
 
-/// `[N, K]` packed nibbles + `[N, K/64]` bf16 scales + biases.
+/// `[N, K]` packed nibbles + `[N, K/gs]` bf16 scales + biases.
 /// One "gate" matrix per expert.
 fn gen_expert(
     rng: &mut XorShift,
     n_out: usize,
     k_in: usize,
+    gs: usize,
 ) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
-    assert_eq!(k_in % 64, 0, "K must be a multiple of group_size 64");
+    assert_eq!(k_in % gs, 0, "K must be a multiple of group_size {gs}");
     let in_packed_u32 = k_in / 8; // 8 nibbles per u32
-    let n_groups = k_in / 64;
+    let n_groups = k_in / gs;
     let packed: Vec<u32> = (0..n_out * in_packed_u32)
         .map(|_| rng.next_u64() as u32)
         .collect();
@@ -92,9 +93,10 @@ fn cpu_reference(
     k_in: usize,
     n_tokens: usize,
     k: usize,
+    gs: usize,
 ) -> Vec<f32> {
     let in_packed_u32 = k_in / 8;
-    let n_groups = k_in / 64;
+    let n_groups = k_in / gs;
     let mut out = vec![0.0f32; n_tokens * k * n_out];
     for t in 0..n_tokens {
         for s in 0..k {
@@ -105,7 +107,7 @@ fn cpu_reference(
                 for kk in 0..k_in {
                     let word = packed[r * in_packed_u32 + kk / 8];
                     let nibble = (word >> ((kk % 8) * 4)) & 0xF;
-                    let g = kk / 64;
+                    let g = kk / gs;
                     let scale =
                         bf16_to_f32(scales[r * n_groups + g]);
                     let bias =
@@ -147,17 +149,31 @@ fn run_case(
     n_out: usize,
     seed: u64,
 ) {
+    run_case_gs(label, n_experts, n_tokens, k, k_in, n_out, seed, 64);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_case_gs(
+    label: &str,
+    n_experts: usize,
+    n_tokens: usize,
+    k: usize,
+    k_in: usize,
+    n_out: usize,
+    seed: u64,
+    gs: usize,
+) {
     assert!(
         moe_mm_id_supports_topk(k as u32),
         "test fixture k={k} not a supported gather-id top-k"
     );
-    assert_eq!(k_in % 64, 0);
+    assert_eq!(k_in % gs, 0);
 
     let mut rng = XorShift::new(seed);
 
     // --- synthetic inputs ---
     let experts: Vec<_> = (0..n_experts)
-        .map(|_| gen_expert(&mut rng, n_out, k_in))
+        .map(|_| gen_expert(&mut rng, n_out, k_in, gs))
         .collect();
     let activations: Vec<f32> = (0..n_tokens * k_in)
         .map(|_| rng.unit())
@@ -178,7 +194,7 @@ fn run_case(
 
     // --- CPU reference ---
     let cpu_out = cpu_reference(
-        &experts, &indices, &activations, n_out, k_in, n_tokens, k,
+        &experts, &indices, &activations, n_out, k_in, n_tokens, k, gs,
     );
 
     // --- GPU build ---
@@ -271,9 +287,9 @@ fn run_case(
 
     // Stride math (per `Variant::*_off_4bit` analogues):
     // - packed:  N rows × (K/2) bytes per row → nb01_w = K/2.
-    // - scales:  N rows × (K/64) × 2 bytes per row → nb01_s = K/32.
+    // - scales:  N rows × (K/gs) × 2 bytes per row → nb01_s = K/gs*2.
     let nb01_w = (k_in / 2) as u64;
-    let nb01_s = (k_in / 32) as u64; // K/64 groups × 2 bytes
+    let nb01_s = (k_in / gs * 2) as u64; // K/gs groups × 2 bytes
     kernels.encode(
         cmdbuf,
         &MoeIdMap0Call {
@@ -317,6 +333,7 @@ fn run_case(
             nb11: 0,
             nb12: (k_in * 4) as u64,
             bits: 4,
+            group_size: gs as u32,
         },
     );
     cmdbuf.commit();
@@ -407,16 +424,30 @@ fn run_down_shape_case(
     n_out: usize,
     seed: u64,
 ) {
+    run_down_shape_case_gs(label, n_experts, n_tokens, k, k_in, n_out, seed, 64);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_down_shape_case_gs(
+    label: &str,
+    n_experts: usize,
+    n_tokens: usize,
+    k: usize,
+    k_in: usize,
+    n_out: usize,
+    seed: u64,
+    gs: usize,
+) {
     assert!(
         moe_mm_id_supports_topk(k as u32),
         "test fixture k={k} not a supported gather-id top-k"
     );
-    assert_eq!(k_in % 64, 0);
+    assert_eq!(k_in % gs, 0);
 
     let mut rng = XorShift::new(seed);
 
     let experts: Vec<_> = (0..n_experts)
-        .map(|_| gen_expert(&mut rng, n_out, k_in))
+        .map(|_| gen_expert(&mut rng, n_out, k_in, gs))
         .collect();
     // `[n_tokens, k, k_in]` flat — per-(token, slot) activations.
     let activations: Vec<f32> =
@@ -437,7 +468,7 @@ fn run_down_shape_case(
     //                                x[t, s, kk]  where e=indices[t,s].
     let cpu_out = {
         let in_packed_u32 = k_in / 8;
-        let n_groups = k_in / 64;
+        let n_groups = k_in / gs;
         let mut out = vec![0.0f32; n_tokens * k * n_out];
         for t in 0..n_tokens {
             for s in 0..k {
@@ -448,7 +479,7 @@ fn run_down_shape_case(
                     for kk in 0..k_in {
                         let word = packed[r * in_packed_u32 + kk / 8];
                         let nibble = (word >> ((kk % 8) * 4)) & 0xF;
-                        let g = kk / 64;
+                        let g = kk / gs;
                         let scale =
                             bf16_to_f32(scales[r * n_groups + g]);
                         let bias =
@@ -551,7 +582,7 @@ fn run_down_shape_case(
     let cmdbuf = queue.new_command_buffer();
 
     let nb01_w = (k_in / 2) as u64;
-    let nb01_s = (k_in / 32) as u64;
+    let nb01_s = (k_in / gs * 2) as u64;
     kernels.encode(
         cmdbuf,
         &MoeIdMap0Call {
@@ -595,6 +626,7 @@ fn run_down_shape_case(
             nb11: (k_in * 4) as u64,
             nb12: (k * k_in * 4) as u64,
             bits: 4,
+            group_size: gs as u32,
         },
     );
     cmdbuf.commit();
@@ -770,6 +802,7 @@ fn run_gather_bits(
     k: usize,
     k_in: usize,
     n_out: usize,
+    gs: usize,
 ) -> Vec<f32> {
     let n_experts = weights.len();
     let (w_bytes, s_bytes) = (weights[0].len(), scales[0].len() * 2);
@@ -825,7 +858,7 @@ fn run_gather_bits(
             ne11: 1,
             nb02: per_expert as u64,
             nb01_w: (k_in * bits as usize / 8) as u64,
-            nb01_s: (k_in / 32) as u64,
+            nb01_s: (k_in / gs * 2) as u64,
             packed_off: 0,
             scales_off: w_bytes as u64,
             biases_off: (w_bytes + s_bytes) as u64,
@@ -833,6 +866,7 @@ fn run_gather_bits(
             nb11: 0,
             nb12: (k_in * 4) as u64,
             bits,
+            group_size: gs as u32,
         },
     );
     cmdbuf.commit();
@@ -844,9 +878,27 @@ fn run_gather_bits(
 /// codes stored in 4-bit nibbles, and both match the CPU reference.
 #[test]
 fn moe_mm_id_packed_3bit_matches_nibble_layout() {
-    let (n_experts, n_tokens, k, k_in, n_out) = (16, 48, 8, 512, 128);
-    let mut rng = XorShift::new(0x3B17_0001);
-    let mut experts: Vec<_> = (0..n_experts).map(|_| gen_expert(&mut rng, n_out, k_in)).collect();
+    packed_3bit_case(16, 48, 8, 512, 128, 0x3B17_0001, 64);
+}
+
+/// The same at group size 32 and Qwen3.8-Flash-Next's gate shape
+/// (top-10, 2560 -> 640).
+#[test]
+fn moe_mm_id_packed_3bit_gs32_matches_nibble_layout() {
+    packed_3bit_case(32, 24, 10, 2560, 640, 0x3B17_0032, 32);
+}
+
+fn packed_3bit_case(
+    n_experts: usize,
+    n_tokens: usize,
+    k: usize,
+    k_in: usize,
+    n_out: usize,
+    seed: u64,
+    gs: usize,
+) {
+    let mut rng = XorShift::new(seed);
+    let mut experts: Vec<_> = (0..n_experts).map(|_| gen_expert(&mut rng, n_out, k_in, gs)).collect();
     for (packed, _, _) in experts.iter_mut() {
         for w in packed.iter_mut() {
             *w &= 0x7777_7777; // every code 0..7
@@ -873,14 +925,35 @@ fn moe_mm_id_packed_3bit_matches_nibble_layout() {
     let packed: Vec<Vec<u8>> = experts.iter().map(|e| pack_3bit(&e.0)).collect();
     assert_eq!(packed[0].len() * 4, nibbles[0].len() * 3);
     let run = |w: &[Vec<u8>], bits| {
-        run_gather_bits(&device, &kernels, w, &scales, &biases, bits, &indices, &activations, n_tokens, k, k_in, n_out)
+        run_gather_bits(&device, &kernels, w, &scales, &biases, bits, &indices, &activations, n_tokens, k, k_in, n_out, gs)
     };
     let q4 = run(&nibbles, 4);
     let q3 = run(&packed, 3);
     let differ = q4.iter().zip(&q3).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
     assert_eq!(differ, 0, "{differ} of {} outputs differ between layouts", q4.len());
-    let cpu = cpu_reference(&experts, &indices, &activations, n_out, k_in, n_tokens, k);
+    let cpu = cpu_reference(&experts, &indices, &activations, n_out, k_in, n_tokens, k, gs);
     let cos = cosine(&cpu, &q3);
     assert!(cos >= COSINE_FLOOR, "packed 3-bit vs CPU cosine {cos}");
-    eprintln!("[packed-3bit] {} outputs bit-identical across layouts; cosine vs CPU {cos:.6}", q3.len());
+    eprintln!("[packed-3bit gs{gs}] {} outputs bit-identical across layouts; cosine vs CPU {cos:.6}", q3.len());
+}
+
+// ---------------------------------------------------------------------
+// Group size 32 (Qwen3.8-Flash-Next: 512 experts, top-10, hidden 2560,
+// expert intermediate 640). Few tokens keep the f32 CPU reference fast.
+// ---------------------------------------------------------------------
+
+#[test]
+fn moe_mm_id_diff_gs32_q38_gate() {
+    run_case_gs("q38-gs32-gate", 512, 16, 10, 2560, 640, 0x0038_6A7E, 32);
+}
+
+#[test]
+fn moe_mm_id_diff_gs32_q38_down() {
+    run_down_shape_case_gs("q38-gs32-down", 512, 16, 10, 640, 2560, 0x0038_D0E5, 32);
+}
+
+#[test]
+fn moe_mm_id_diff_gs32_k8_mid() {
+    run_case_gs("gs32-mid", 32, 64, 8, 512, 256, 0x0032_B1D0, 32);
+    run_down_shape_case_gs("gs32-mid-down", 32, 64, 8, 512, 256, 0x0032_D0B1, 32);
 }

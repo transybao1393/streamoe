@@ -69,3 +69,19 @@ instantiate_kernel(
 instantiate_kernel(
     "affine_gather_qmm_rhs_float_gs_64_b_4_t_true_bm16",
     affine_gather_qmm_rhs, float, 64, 4, 16, 32, 32, 2, 2, true, bfloat16_t)
+
+// streammoe-metal: group_size 32 (Qwen3.8-Flash-Next's MLX 4-bit build).
+// Same templates at gs 32 — the loaders need `group_size % BK == 0`
+// (BK = 32). Only the default BM=32 gather tile is built at gs 32; the
+// experimental BM=16 / BM=64 tiles fall back to it.
+instantiate_kernel(
+    "affine_qmm_t_float_gs_32_b_4_alN_true_batch_0",
+    affine_qmm_t, float, 32, 4, true, 0, 32, 32, 32, bfloat16_t)
+
+instantiate_kernel(
+    "affine_qmm_t_float_gs_32_b_4_alN_false_batch_0",
+    affine_qmm_t, float, 32, 4, false, 0, 32, 32, 32, bfloat16_t)
+
+instantiate_kernel(
+    "affine_gather_qmm_rhs_float_gs_32_b_4_t_true",
+    affine_gather_qmm_rhs, float, 32, 4, 32, 32, 32, 2, 2, true, bfloat16_t)
