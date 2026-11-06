@@ -239,6 +239,8 @@ impl Q38Exec for MetalBackend {
                 enc.set_buffer(2, Some(pool.handle(out)), 0);
                 set_u32(enc, 3, group);
                 set_f32(enc, 4, eps);
+                // gain_len: one token's `hc · H` gains.
+                set_u32(enc, 5, group * n_groups);
                 enc.dispatch_thread_groups(MTLSize::new(n_groups as NSUInteger, 1, 1), MTLSize::new(256, 1, 1));
             }
             FamOp::SiluScale { v, scale, n } => {
@@ -256,6 +258,7 @@ impl Q38Exec for MetalBackend {
                 enc.set_buffer(2, Some(pool.handle(out)), 0);
                 set_u32(enc, 3, hidden);
                 set_u32(enc, 4, hc);
+                set_u32(enc, 5, hidden); // total = T · H, T = 1
                 let (g, t) = grid1(hidden, 256);
                 enc.dispatch_thread_groups(g, t);
             }
@@ -263,6 +266,7 @@ impl Q38Exec for MetalBackend {
                 enc.set_compute_pipeline_state(&fam.gr.inj_weights);
                 enc.set_buffer(0, Some(pool.handle(inj)), 0);
                 set_u32(enc, 1, hc);
+                set_u32(enc, 2, hc); // n = T · hc, T = 1
                 let (g, t) = grid1(hc, 32);
                 enc.dispatch_thread_groups(g, t);
             }
@@ -274,6 +278,7 @@ impl Q38Exec for MetalBackend {
                 enc.set_buffer(2, Some(pool.handle(inj)), 0);
                 set_u32(enc, 3, hidden);
                 set_u32(enc, 4, total);
+                set_u32(enc, 5, hc);
                 let (g, t) = grid1(total, 256);
                 enc.dispatch_thread_groups(g, t);
             }
@@ -284,6 +289,7 @@ impl Q38Exec for MetalBackend {
                 enc.set_buffer(1, Some(pool.handle(hyper)), 0);
                 set_u32(enc, 2, hidden);
                 set_u32(enc, 3, total);
+                set_u32(enc, 4, hc);
                 let (g, t) = grid1(total, 256);
                 enc.dispatch_thread_groups(g, t);
             }
