@@ -512,6 +512,8 @@ pub struct Q38Engine<B: Q38Exec> {
     expert_size: usize,
     /// Tokens consumed (the next token's position).
     pos: usize,
+    /// Command buffers submitted so far ([`Self::submits`]).
+    submits: std::sync::atomic::AtomicU64,
 }
 
 impl<B: Q38Exec> Q38Engine<B> {
@@ -622,6 +624,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             n_ctx,
             expert_size,
             pos: 0,
+            submits: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -632,6 +635,12 @@ impl<B: Q38Exec> Q38Engine<B> {
 
     pub fn n_ctx(&self) -> usize {
         self.n_ctx
+    }
+
+    /// Command buffers (Metal) / passes (CPU) submitted since the
+    /// engine was built.
+    pub fn submits(&self) -> u64 {
+        self.submits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// QSA mode (`STREAMMOE_QSA`, default sparse).
@@ -669,16 +678,17 @@ impl<B: Q38Exec> Q38Engine<B> {
             gain_off: hc.gain_off,
             out: bu.normed,
             group: h,
-            n_groups: n,
+            gain_len: width,
+            rows: 1,
             eps: c.rms_eps,
         }));
         steps.push(matvec("q38.hc_mix_down", hc.down, bu.normed, bu.low, width, c.hc_lowrank as u32));
         steps.push(Step::F(FamOp::SiluScale { v: bu.low, scale: 1.0 / n as f32, n: c.hc_lowrank as u32 }));
         steps.push(matvec("q38.hc_mix_up", hc.up, bu.low, bu.mix, c.hc_lowrank as u32, width));
-        steps.push(Step::F(FamOp::HcMix { mix: bu.mix, normed: bu.normed, out: bu.mixed, hidden: h, hc: n }));
+        steps.push(Step::F(FamOp::HcMix { mix: bu.mix, normed: bu.normed, out: bu.mixed, hidden: h, hc: n, n_tokens: 1 }));
         if let Some(inj) = hc.inject {
             steps.push(matvec("q38.hc_block_inject", inj, bu.normed, bu.inj, width, n));
-            steps.push(Step::F(FamOp::InjWeights { inj: bu.inj, hc: n }));
+            steps.push(Step::F(FamOp::InjWeights { inj: bu.inj, hc: n, n_tokens: 1 }));
         }
     }
 
@@ -690,6 +700,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             inj: self.bufs.inj,
             hidden: c.hidden as u32,
             hc: c.hc_count as u32,
+            n_tokens: 1,
         })
     }
 
@@ -783,6 +794,7 @@ impl<B: Q38Exec> Q38Engine<B> {
     fn flush(&self, b: &B, steps: &mut Vec<Step>, label: &'static str) -> Result<()> {
         if !steps.is_empty() {
             run_steps(b, &self.fam, steps, label)?;
+            self.submits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             steps.clear();
         }
         Ok(())
@@ -973,6 +985,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             hyper: self.bufs.hyper,
             hidden: c.hidden as u32,
             hc: c.hc_count as u32,
+            n_tokens: 1,
         }));
         for l in 0..c.num_layers {
             if self.ple.as_ref().is_some_and(|p| p.0 == l) {

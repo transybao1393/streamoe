@@ -26,10 +26,20 @@
 //!
 //! A pass is a list of [`Step`]s encoded into one command buffer
 //! ([`run_steps`]).
+//!
+//! **One place per kernel signature.** On Metal every [`FamOp`] arm is
+//! one call to a shared encoder: the Gated Residual kernels through
+//! [`Q38GpuKernels`]'s `encode_*` functions (the ones the T-token
+//! Gated Residual path uses), the engine-only kernels through
+//! [`Q38EngineKernels`]. No arm binds kernel arguments itself, so a
+//! kernel that gains an argument changes in one function.
+//!
+//! Every op takes a row count (`n_tokens` / `rows` / `n_groups` /
+//! `n`): a prefill chunk of `T` tokens is the same ops at `T` rows.
 
 use std::cell::RefCell;
 
-use metal::{CompileOptions, ComputePipelineState, MTLSize, NSUInteger};
+use metal::{BufferRef, CommandBufferRef, CompileOptions, ComputePipelineState, Device, MTLSize, NSUInteger};
 
 use super::gated_residual_gpu::{Q38GpuError, Q38GpuKernels};
 use crate::riir::backend::buftype::{Buf, HiddenBuf};
@@ -56,17 +66,19 @@ pub enum FamOp {
     /// `out[g·group + i] = x̂ · (1 + gain[g·group + i])`, RMS over each
     /// of `n_groups` groups of `group` (the Gated Residual's
     /// `hc_norm`).
-    HcNorm { x: FBuf, gain_off: u64, out: FBuf, group: u32, n_groups: u32, eps: f32 },
+    /// `rows` rows of `gain_len` values (`gain_len / group` groups
+    /// each), every row scaled by the same `gain_len` gains.
+    HcNorm { x: FBuf, gain_off: u64, out: FBuf, group: u32, gain_len: u32, rows: u32, eps: f32 },
     /// `v[i] = silu(v[i] · scale)`, `n` values.
     SiluScale { v: FBuf, scale: f32, n: u32 },
-    /// `out[j] = mean_c sigmoid(mix[c·H + j]) · normed[c·H + j]`.
-    HcMix { mix: FBuf, normed: FBuf, out: FBuf, hidden: u32, hc: u32 },
-    /// `inj[c] = 2 · sigmoid(inj[c] / hc)`.
-    InjWeights { inj: FBuf, hc: u32 },
-    /// `hyper[c·H + j] += inj[c] · block[j]`.
-    HcInject { hyper: FBuf, block: FBuf, inj: FBuf, hidden: u32, hc: u32 },
-    /// `hyper[c·H + j] = h[j]`.
-    HcExpand { h: FBuf, hyper: FBuf, hidden: u32, hc: u32 },
+    /// `out[t, j] = mean_c sigmoid(mix[t, c·H + j]) · normed[t, c·H + j]`.
+    HcMix { mix: FBuf, normed: FBuf, out: FBuf, hidden: u32, hc: u32, n_tokens: u32 },
+    /// `inj[t, c] = 2 · sigmoid(inj[t, c] / hc)`.
+    InjWeights { inj: FBuf, hc: u32, n_tokens: u32 },
+    /// `hyper[t, c·H + j] += inj[t, c] · block[t, j]`.
+    HcInject { hyper: FBuf, block: FBuf, inj: FBuf, hidden: u32, hc: u32, n_tokens: u32 },
+    /// `hyper[t, c·H + j] = h[t, j]`.
+    HcExpand { h: FBuf, hyper: FBuf, hidden: u32, hc: u32, n_tokens: u32 },
     /// In place: each `dim` slice of `x` (`n_groups` of them) RMS-
     /// normalized and scaled by `1 + gain[i]` (`gain` `[dim]`, shared).
     HeadNormOnePlus { x: FBuf, gain_off: u64, dim: u32, n_groups: u32, eps: f32 },
@@ -183,9 +195,9 @@ kernel void q38e_add(
 }
 "#;
 
-/// The family's Metal pipelines.
-pub struct Q38MetalFam {
-    pub gr: Q38GpuKernels,
+/// Encoders of the kernels in [`Q38_ENGINE_SHADERS`]: the one place
+/// that binds their arguments.
+pub struct Q38EngineKernels {
     pub head_norm: ComputePipelineState,
     pub gated_norm_sigmoid: ComputePipelineState,
     pub add: ComputePipelineState,
@@ -203,12 +215,8 @@ fn set_f32(enc: &metal::ComputeCommandEncoderRef, i: u64, v: f32) {
     enc.set_bytes(i, 4, (&v as *const f32).cast());
 }
 
-impl Q38Exec for MetalBackend {
-    type Fam = Q38MetalFam;
-
-    fn fam_new(&self) -> Result<Q38MetalFam, Q38GpuError> {
-        let device = self.metal().device();
-        let gr = Q38GpuKernels::new(device)?;
+impl Q38EngineKernels {
+    pub fn new(device: &Device) -> Result<Self, Q38GpuError> {
         let lib = device
             .new_library_with_source(Q38_ENGINE_SHADERS, &CompileOptions::new())
             .map_err(Q38GpuError::Compile)?;
@@ -218,109 +226,128 @@ impl Q38Exec for MetalBackend {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|msg| Q38GpuError::Pipeline { name, msg })
         };
-        Ok(Q38MetalFam {
-            gr,
+        Ok(Self {
             head_norm: p("q38e_head_norm_one_plus")?,
             gated_norm_sigmoid: p("q38e_gated_rms_norm_sigmoid")?,
             add: p("q38e_add")?,
         })
     }
 
+    /// In place: `n_groups` slices of `dim`, RMS-normalized, times
+    /// `1 + gain[i]` (bf16 `[dim]` at byte `gain_off` of `gain`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_head_norm_one_plus(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        x: &BufferRef,
+        gain: &BufferRef,
+        gain_off: u64,
+        dim: u32,
+        n_groups: u32,
+        eps: f32,
+    ) {
+        if n_groups == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.head_norm);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(gain), gain_off as NSUInteger);
+        set_u32(enc, 2, dim);
+        set_f32(enc, 3, eps);
+        enc.dispatch_thread_groups(MTLSize::new(n_groups as NSUInteger, 1, 1), MTLSize::new(128, 1, 1));
+        enc.end_encoding();
+    }
+
+    /// `out = rms_norm(values) · w · sigmoid(z)` per `dim` slice
+    /// (`n_groups` of them; bf16 `w` `[dim]` at byte `weight_off`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gated_rms_norm_sigmoid(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        values: &BufferRef,
+        z: &BufferRef,
+        weight: &BufferRef,
+        weight_off: u64,
+        out: &BufferRef,
+        dim: u32,
+        n_groups: u32,
+        eps: f32,
+    ) {
+        if n_groups == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.gated_norm_sigmoid);
+        enc.set_buffer(0, Some(values), 0);
+        enc.set_buffer(1, Some(z), 0);
+        enc.set_buffer(2, Some(weight), weight_off as NSUInteger);
+        enc.set_buffer(3, Some(out), 0);
+        set_u32(enc, 4, dim);
+        set_f32(enc, 5, eps);
+        enc.dispatch_thread_groups(MTLSize::new(n_groups as NSUInteger, 1, 1), MTLSize::new(128, 1, 1));
+        enc.end_encoding();
+    }
+
+    /// `dst[i] += src[i]`, `n` values.
+    pub fn encode_add(&self, cmdbuf: &CommandBufferRef, dst: &BufferRef, src: &BufferRef, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.add);
+        enc.set_buffer(0, Some(dst), 0);
+        enc.set_buffer(1, Some(src), 0);
+        set_u32(enc, 2, n);
+        let (g, t) = grid1(n, 256);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
+    }
+}
+
+/// The family's Metal pipelines.
+pub struct Q38MetalFam {
+    pub gr: Q38GpuKernels,
+    pub eng: Q38EngineKernels,
+}
+
+impl Q38Exec for MetalBackend {
+    type Fam = Q38MetalFam;
+
+    fn fam_new(&self) -> Result<Q38MetalFam, Q38GpuError> {
+        let device = self.metal().device();
+        Ok(Q38MetalFam { gr: Q38GpuKernels::new(device)?, eng: Q38EngineKernels::new(device)? })
+    }
+
     fn encode_fam(&self, fam: &Q38MetalFam, op: &FamOp, ctx: &mut Self::EncodeCtx) {
         let cmd = ctx.cmdbuf();
         let pool = self.pool();
+        let h = |id: FBuf| -> &BufferRef { pool.handle(id) };
         let wbuf = self.weight_buf().buffer();
-        let enc = cmd.new_compute_command_encoder();
+        let u = |v: u32| v as usize;
         match *op {
-            FamOp::HcNorm { x, gain_off, out, group, n_groups, eps } => {
-                enc.set_compute_pipeline_state(&fam.gr.hc_norm);
-                enc.set_buffer(0, Some(pool.handle(x)), 0);
-                enc.set_buffer(1, Some(wbuf), gain_off as NSUInteger);
-                enc.set_buffer(2, Some(pool.handle(out)), 0);
-                set_u32(enc, 3, group);
-                set_f32(enc, 4, eps);
-                // gain_len: one token's `hc · H` gains.
-                set_u32(enc, 5, group * n_groups);
-                enc.dispatch_thread_groups(MTLSize::new(n_groups as NSUInteger, 1, 1), MTLSize::new(256, 1, 1));
+            FamOp::HcNorm { x, gain_off, out, group, gain_len, rows, eps } => {
+                fam.gr.encode_hc_norm_rows(cmd, h(x), wbuf, gain_off, h(out), u(group), u(gain_len), u(rows), eps)
             }
-            FamOp::SiluScale { v, scale, n } => {
-                enc.set_compute_pipeline_state(&fam.gr.silu_scale);
-                enc.set_buffer(0, Some(pool.handle(v)), 0);
-                set_f32(enc, 1, scale);
-                set_u32(enc, 2, n);
-                let (g, t) = grid1(n, 64);
-                enc.dispatch_thread_groups(g, t);
+            FamOp::SiluScale { v, scale, n } => fam.gr.encode_silu_scale(cmd, h(v), scale, u(n)),
+            FamOp::HcMix { mix, normed, out, hidden, hc, n_tokens } => {
+                fam.gr.encode_hc_mix_n(cmd, h(mix), h(normed), h(out), u(hidden), u(hc), u(n_tokens))
             }
-            FamOp::HcMix { mix, normed, out, hidden, hc } => {
-                enc.set_compute_pipeline_state(&fam.gr.hc_mix);
-                enc.set_buffer(0, Some(pool.handle(mix)), 0);
-                enc.set_buffer(1, Some(pool.handle(normed)), 0);
-                enc.set_buffer(2, Some(pool.handle(out)), 0);
-                set_u32(enc, 3, hidden);
-                set_u32(enc, 4, hc);
-                set_u32(enc, 5, hidden); // total = T · H, T = 1
-                let (g, t) = grid1(hidden, 256);
-                enc.dispatch_thread_groups(g, t);
+            FamOp::InjWeights { inj, hc, n_tokens } => fam.gr.encode_inj_weights_n(cmd, h(inj), u(hc), u(n_tokens)),
+            FamOp::HcInject { hyper, block, inj, hidden, hc, n_tokens } => {
+                fam.gr.encode_inject_n(cmd, h(hyper), h(block), 0, h(inj), u(hidden), u(hc), u(n_tokens))
             }
-            FamOp::InjWeights { inj, hc } => {
-                enc.set_compute_pipeline_state(&fam.gr.inj_weights);
-                enc.set_buffer(0, Some(pool.handle(inj)), 0);
-                set_u32(enc, 1, hc);
-                set_u32(enc, 2, hc); // n = T · hc, T = 1
-                let (g, t) = grid1(hc, 32);
-                enc.dispatch_thread_groups(g, t);
-            }
-            FamOp::HcInject { hyper, block, inj, hidden, hc } => {
-                let total = hidden * hc;
-                enc.set_compute_pipeline_state(&fam.gr.hc_inject);
-                enc.set_buffer(0, Some(pool.handle(hyper)), 0);
-                enc.set_buffer(1, Some(pool.handle(block)), 0);
-                enc.set_buffer(2, Some(pool.handle(inj)), 0);
-                set_u32(enc, 3, hidden);
-                set_u32(enc, 4, total);
-                set_u32(enc, 5, hc);
-                let (g, t) = grid1(total, 256);
-                enc.dispatch_thread_groups(g, t);
-            }
-            FamOp::HcExpand { h, hyper, hidden, hc } => {
-                let total = hidden * hc;
-                enc.set_compute_pipeline_state(&fam.gr.hc_expand);
-                enc.set_buffer(0, Some(pool.handle(h)), 0);
-                enc.set_buffer(1, Some(pool.handle(hyper)), 0);
-                set_u32(enc, 2, hidden);
-                set_u32(enc, 3, total);
-                set_u32(enc, 4, hc);
-                let (g, t) = grid1(total, 256);
-                enc.dispatch_thread_groups(g, t);
+            FamOp::HcExpand { h: src, hyper, hidden, hc, n_tokens } => {
+                fam.gr.encode_expand_n(cmd, h(src), h(hyper), u(hidden), u(hc), u(n_tokens))
             }
             FamOp::HeadNormOnePlus { x, gain_off, dim, n_groups, eps } => {
-                enc.set_compute_pipeline_state(&fam.head_norm);
-                enc.set_buffer(0, Some(pool.handle(x)), 0);
-                enc.set_buffer(1, Some(wbuf), gain_off as NSUInteger);
-                set_u32(enc, 2, dim);
-                set_f32(enc, 3, eps);
-                enc.dispatch_thread_groups(MTLSize::new(n_groups as NSUInteger, 1, 1), MTLSize::new(128, 1, 1));
+                fam.eng.encode_head_norm_one_plus(cmd, h(x), wbuf, gain_off, dim, n_groups, eps)
             }
             FamOp::GatedRmsNormSigmoid { values, z, weight_off, out, dim, n_groups, eps } => {
-                enc.set_compute_pipeline_state(&fam.gated_norm_sigmoid);
-                enc.set_buffer(0, Some(pool.handle(values)), 0);
-                enc.set_buffer(1, Some(pool.handle(z)), 0);
-                enc.set_buffer(2, Some(wbuf), weight_off as NSUInteger);
-                enc.set_buffer(3, Some(pool.handle(out)), 0);
-                set_u32(enc, 4, dim);
-                set_f32(enc, 5, eps);
-                enc.dispatch_thread_groups(MTLSize::new(n_groups as NSUInteger, 1, 1), MTLSize::new(128, 1, 1));
+                fam.eng.encode_gated_rms_norm_sigmoid(cmd, h(values), h(z), wbuf, weight_off, h(out), dim, n_groups, eps)
             }
-            FamOp::Add { dst, src, n } => {
-                enc.set_compute_pipeline_state(&fam.add);
-                enc.set_buffer(0, Some(pool.handle(dst)), 0);
-                enc.set_buffer(1, Some(pool.handle(src)), 0);
-                set_u32(enc, 2, n);
-                let (g, t) = grid1(n, 256);
-                enc.dispatch_thread_groups(g, t);
-            }
+            FamOp::Add { dst, src, n } => fam.eng.encode_add(cmd, h(dst), h(src), n),
         }
-        enc.end_encoding();
     }
 }
 
@@ -368,12 +395,13 @@ impl Q38Exec for CpuBackend {
     fn encode_fam(&self, _: &(), op: &FamOp, _ctx: &mut ()) {
         let pool = self.pool();
         match *op {
-            FamOp::HcNorm { x, gain_off, out, group, n_groups, eps } => {
-                let (group, n) = (group as usize, (group * n_groups) as usize);
-                let gain = bf16_gain(self, gain_off, n);
+            FamOp::HcNorm { x, gain_off, out, group, gain_len, rows, eps } => {
+                let (group, gl) = (group as usize, gain_len as usize);
+                let n = gl * rows as usize;
+                let gain = bf16_gain(self, gain_off, gl);
                 let xv = f32s(pool.handle(x));
                 let mut ov = f32s_mut(pool.handle(out));
-                rms_groups(&xv[..n], &mut ov[..n], group, eps, |g, i| 1.0 + gain[g * group + i]);
+                rms_groups(&xv[..n], &mut ov[..n], group, eps, |g, i| 1.0 + gain[(g * group + i) % gl]);
             }
             FamOp::SiluScale { v, scale, n } => {
                 let mut vv = f32s_mut(pool.handle(v));
@@ -382,40 +410,48 @@ impl Q38Exec for CpuBackend {
                     *x = t / (1.0 + (-t).exp());
                 }
             }
-            FamOp::HcMix { mix, normed, out, hidden, hc } => {
+            FamOp::HcMix { mix, normed, out, hidden, hc, n_tokens } => {
                 let (h, hc) = (hidden as usize, hc as usize);
                 let (m, nv) = (f32s(pool.handle(mix)), f32s(pool.handle(normed)));
                 let mut ov = f32s_mut(pool.handle(out));
-                for j in 0..h {
-                    let mut acc = 0.0f32;
-                    for c in 0..hc {
-                        acc += sigmoid(m[c * h + j]) * nv[c * h + j];
+                for t in 0..n_tokens as usize {
+                    let row = t * hc * h;
+                    for j in 0..h {
+                        let mut acc = 0.0f32;
+                        for c in 0..hc {
+                            acc += sigmoid(m[row + c * h + j]) * nv[row + c * h + j];
+                        }
+                        ov[t * h + j] = acc / hc as f32;
                     }
-                    ov[j] = acc / hc as f32;
                 }
             }
-            FamOp::InjWeights { inj, hc } => {
+            FamOp::InjWeights { inj, hc, n_tokens } => {
                 let mut iv = f32s_mut(pool.handle(inj));
-                for v in iv[..hc as usize].iter_mut() {
+                for v in iv[..(hc * n_tokens) as usize].iter_mut() {
                     *v = 2.0 * sigmoid(*v / hc as f32);
                 }
             }
-            FamOp::HcInject { hyper, block, inj, hidden, hc } => {
+            FamOp::HcInject { hyper, block, inj, hidden, hc, n_tokens } => {
                 let (h, hc) = (hidden as usize, hc as usize);
                 let (bv, iv) = (f32s(pool.handle(block)), f32s(pool.handle(inj)));
                 let mut hv = f32s_mut(pool.handle(hyper));
-                for c in 0..hc {
-                    for j in 0..h {
-                        hv[c * h + j] = bv[j].mul_add(iv[c], hv[c * h + j]);
+                for t in 0..n_tokens as usize {
+                    let (b, w, y) = (&bv[t * h..(t + 1) * h], &iv[t * hc..(t + 1) * hc], t * hc * h);
+                    for c in 0..hc {
+                        for j in 0..h {
+                            hv[y + c * h + j] = b[j].mul_add(w[c], hv[y + c * h + j]);
+                        }
                     }
                 }
             }
-            FamOp::HcExpand { h, hyper, hidden, hc } => {
-                let hd = hidden as usize;
-                let src = f32s(pool.handle(h))[..hd].to_vec();
+            FamOp::HcExpand { h, hyper, hidden, hc, n_tokens } => {
+                let (hd, hc, n) = (hidden as usize, hc as usize, n_tokens as usize);
+                let src = f32s(pool.handle(h))[..n * hd].to_vec();
                 let mut hv = f32s_mut(pool.handle(hyper));
-                for c in 0..hc as usize {
-                    hv[c * hd..(c + 1) * hd].copy_from_slice(&src);
+                for t in 0..n {
+                    for c in 0..hc {
+                        hv[(t * hc + c) * hd..(t * hc + c + 1) * hd].copy_from_slice(&src[t * hd..(t + 1) * hd]);
+                    }
                 }
             }
             FamOp::HeadNormOnePlus { x, gain_off, dim, n_groups, eps } => {

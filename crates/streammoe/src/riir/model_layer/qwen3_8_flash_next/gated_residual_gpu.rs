@@ -259,16 +259,7 @@ impl Q38GpuKernels {
         n_groups: usize,
         eps: f32,
     ) {
-        let enc = cmdbuf.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.hc_norm);
-        enc.set_buffer(0, Some(x), 0);
-        enc.set_buffer(1, Some(gain), gain_off);
-        enc.set_buffer(2, Some(out), 0);
-        set_const(enc, 3, &(group as u32));
-        set_const(enc, 4, &eps);
-        set_const(enc, 5, &((group * n_groups) as u32));
-        enc.dispatch_thread_groups(MTLSize::new(n_groups as u64, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding();
+        self.encode_hc_norm_rows(cmdbuf, x, gain, gain_off, out, group, group * n_groups, 1, eps)
     }
 
     /// [`Self::encode_hc_norm`] over `rows` rows of `gain_len` values
@@ -344,41 +335,75 @@ impl Q38GpuKernels {
 
         w.mix_down.encode_n(cmdbuf, bufs.normed.raw(), 0, bufs.low.raw(), 0, n);
         let lowrank = w.mix_down.out_dim();
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.silu_scale);
-            enc.set_buffer(0, Some(bufs.low.raw()), 0);
-            set_const(enc, 1, &(1.0f32 / hc as f32));
-            set_const(enc, 2, &((n * lowrank) as u32));
-            let (g, t) = grid1(n * lowrank, 64);
-            enc.dispatch_thread_groups(g, t);
-            enc.end_encoding();
-        }
+        self.encode_silu_scale(cmdbuf, bufs.low.raw(), 1.0f32 / hc as f32, n * lowrank);
         w.mix_up.encode_n(cmdbuf, bufs.low.raw(), 0, bufs.mix.raw(), 0, n);
-        {
-            let enc = cmdbuf.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.hc_mix);
-            enc.set_buffer(0, Some(bufs.mix.raw()), 0);
-            enc.set_buffer(1, Some(bufs.normed.raw()), 0);
-            enc.set_buffer(2, Some(bufs.mixed.raw()), 0);
-            set_const(enc, 3, &(h as u32));
-            set_const(enc, 4, &(hc as u32));
-            set_const(enc, 5, &((n * h) as u32));
-            let (g, t) = grid1(n * h, 256);
-            enc.dispatch_thread_groups(g, t);
-            enc.end_encoding();
-        }
+        self.encode_hc_mix_n(cmdbuf, bufs.mix.raw(), bufs.normed.raw(), bufs.mixed.raw(), h, hc, n);
         if let Some(bi) = w.block_inject {
             bi.encode_n(cmdbuf, bufs.normed.raw(), 0, bufs.inj.raw(), 0, n);
-            let enc = cmdbuf.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.inj_weights);
-            enc.set_buffer(0, Some(bufs.inj.raw()), 0);
-            set_const(enc, 1, &(hc as u32));
-            set_const(enc, 2, &((n * hc) as u32));
-            let (g, t) = grid1(n * hc, 32);
-            enc.dispatch_thread_groups(g, t);
-            enc.end_encoding();
+            self.encode_inj_weights_n(cmdbuf, bufs.inj.raw(), hc, n);
         }
+    }
+
+    /// `v[i] = silu(v[i] · scale)` for `n` values.
+    pub fn encode_silu_scale(&self, cmdbuf: &CommandBufferRef, v: &BufferRef, scale: f32, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.silu_scale);
+        enc.set_buffer(0, Some(v), 0);
+        set_const(enc, 1, &scale);
+        set_const(enc, 2, &(n as u32));
+        let (g, t) = grid1(n, 64);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
+    }
+
+    /// The copy mix for `n_tokens` rows: `out [n, H]`,
+    /// `out[t, j] = mean_c sigmoid(mix[t, c·H + j]) · normed[t, c·H + j]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_hc_mix_n(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        mix: &BufferRef,
+        normed: &BufferRef,
+        out: &BufferRef,
+        hidden: usize,
+        hc: usize,
+        n_tokens: usize,
+    ) {
+        let total = n_tokens * hidden;
+        if total == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.hc_mix);
+        enc.set_buffer(0, Some(mix), 0);
+        enc.set_buffer(1, Some(normed), 0);
+        enc.set_buffer(2, Some(out), 0);
+        set_const(enc, 3, &(hidden as u32));
+        set_const(enc, 4, &(hc as u32));
+        set_const(enc, 5, &(total as u32));
+        let (g, t) = grid1(total, 256);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
+    }
+
+    /// Injection weights in place for `n_tokens` rows of `hc`:
+    /// `inj = 2 · sigmoid(inj / hc)`.
+    pub fn encode_inj_weights_n(&self, cmdbuf: &CommandBufferRef, inj: &BufferRef, hc: usize, n_tokens: usize) {
+        let n = n_tokens * hc;
+        if n == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.inj_weights);
+        enc.set_buffer(0, Some(inj), 0);
+        set_const(enc, 1, &(hc as u32));
+        set_const(enc, 2, &(n as u32));
+        let (g, t) = grid1(n, 32);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
     }
 
     /// `hyper[c · H + j] += inj[c] · block_out[j]`.
