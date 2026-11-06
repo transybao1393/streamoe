@@ -31,6 +31,7 @@ pub mod config;
 pub(crate) mod decode_multi;
 pub mod gpu_capture;
 pub mod io;
+pub mod model_layer;
 pub mod moe;
 pub mod range;
 pub mod requests;

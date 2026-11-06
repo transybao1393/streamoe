@@ -21,6 +21,8 @@ model-qwen3-6-35b-a3b   = []
 model-cogito-v2-671b    = []
 # OLMoE-1B-7B-0125-Instruct (olmoe architecture).
 model-olmoe-1b-7b       = []
+# Qwen3.8-Flash-Next (qwen4_exp preview); layers in riir/model_layer/.
+model-qwen3-8-flash-next = []
 
 [dependencies]
 thiserror   = { workspace = true }
