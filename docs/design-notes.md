@@ -469,8 +469,64 @@ are uploaded (2,560 floats per token); `key_proj` / `value_proj` are
 graph matvecs; the norms, the signed-sqrt gate and the dilated conv
 are two family ops (`PleOp::Gate`, `PleOp::Conv`), and the conv state
 lives in a GPU buffer. The PLE layer no longer flushes or reads the
-residual back. The ops take T rows (the conv walks them in order), so
-chunked prefill can reuse them once the engine's PLE buffers hold T
-rows; until then a call with more rows takes the host path. Checked
+residual back. The ops take T rows (the conv walks them in order); the
+engine's PLE buffers hold a prefill chunk, so chunked prefill runs them
+too. Checked
 against `ple_reference.py`'s fixture (Metal 3.6e-7, CPU 2.6e-7) and,
 in the engine, against the host PLE (≤ 1.5e-6 on the logits).
+
+### Command buffers and batched prefill in the engine
+
+**One encoder per kernel signature** (`engine_exec.rs`). Every family
+op's Metal arm is one call to a shared encoder: the Gated Residual
+kernels through `Q38GpuKernels::encode_*` (the functions the T-token
+Gated Residual path uses), the engine's own kernels (per-head norm
+with `1 + w`, sigmoid-gated norm, add, row gather) through
+`Q38EngineKernels`, the PLE through `PleGpuKernels::encode`, QSA sparse
+rows through `QsaGpuKernels::encode_sdpa_rows`. Nothing binds kernel
+arguments by hand, so the round-2 bug (T-token kernels gained trailing
+arguments the engine left unset) cannot recur there.
+
+**Command buffers per token** (`Q38Engine::submits`, tiny model,
+Metal, decode):
+
+| | Within the QSA budget | Past it |
+| --- | --- | --- |
+| Before (round 2) | 7 | 7 |
+| Indexer readback deferred, MoE rows gathered on the GPU | 6 | 7 |
+| + PLE on the GPU (q38-prefetch-ple) | **5** | **6** |
+
+What is left is one per layer (the router logits: the host must pick
+the experts before it reads them), the tail, and past the budget one
+per QSA layer (the host scores the chunk's indexer queries against the
+block keys before the sparse attention). A QSA layer within the budget
+adds none: its raw indexer keys only need caching, so they are read
+back after the router's submit. Each layer's router readback still
+waits for every earlier command buffer (the prefetch's set reuse
+relies on it).
+
+**Batched prefill** (`Q38Engine::eval` → `forward_chunk`). The prompt
+runs in chunks of `STREAMMOE_Q38_CHUNK` tokens (default 64, at most
+`n_ctx`), the same ops at T rows: the Gated Residual ops and matvecs
+(MLX `qmm` at T > 1), the Gated DeltaNet conv / recurrence ops (they
+walk the chunk in order, so no chunked GDN kernel is needed),
+`push_qsa_pre_sdpa` over the chunk then dense SDPA, or past the budget
+host block selection (`qsa_select_rows`) and the GPU sparse-rows kernel,
+so no K / V copies to the host in prefill or decode. The MoE groups the
+chunk's tokens by expert (`build_expert_buckets`, as the other
+families' batched prefill does) and runs `MoeBatchedPermuteFuse` per
+group of `top_k` experts through the demand slots; each extra group is
+one more submit. The final mixer and LM head run on the last row and
+only when logits are wanted. The per-token buffers hold a chunk; the
+plan's `PrefillScratch` counts them (~50 MB at 64 rows on the real
+model).
+
+Tiny model (debug build, Metal, 48-token prompt, indicative): 336 → 14
+command buffers, ~350 → ~5,600 tok/s. Batched vs a step per token
+(`batched_prefill_matches_per_token`, chunks 5 / 7 / 64 crossing the
+8-token budget): logits 1.3e-6, state ~1e-17, the next decode tokens
+1.1e-6 on Metal; bit-identical on the CPU backend.
+
+On the real model a 64-token chunk routes to ~300 distinct experts per
+layer, read 10 at a time with the GPU idle meanwhile; overlapping the
+reads of the next group with the GPU work of this one is the next step.

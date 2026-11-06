@@ -248,3 +248,178 @@ fn engine_state_round_trip() {
     assert!(e.state_load(&mut b, &bad).is_err());
     assert_eq!(e.pos(), g.input_ids.len() + g.decode_tokens.len());
 }
+
+/// `max |a − b| / max |b|` over two `state_save` snapshots read as
+/// 4-byte words: words with equal bits count 0 (the header and the PLE
+/// token history are integers), the scale is the largest finite `|b|`.
+fn state_rel_err(a: &[u8], b: &[u8]) -> f32 {
+    assert_eq!(a.len(), b.len(), "snapshot sizes differ");
+    assert_eq!(a[..16], b[..16], "snapshot headers differ");
+    let w = |s: &[u8]| s.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>();
+    let (wa, wb) = (w(a), w(b));
+    let scale = wb.iter().filter(|x| x.is_finite()).fold(0.0f32, |m, &x| m.max(x.abs())).max(1e-6);
+    let mut worst = 0.0f32;
+    for (&x, &y) in wa.iter().zip(&wb) {
+        if x.to_bits() != y.to_bits() {
+            let d = (x - y).abs();
+            worst = worst.max(if d.is_finite() { d } else { f32::INFINITY });
+        }
+    }
+    worst / scale
+}
+
+/// After `run`: the last logits, the snapshot, and the logits of three
+/// decode tokens.
+fn run_and_continue<B: Q38Exec>(
+    e: &mut Q38Engine<B>,
+    b: &mut B,
+    m: &Model,
+    pool: &rayon::ThreadPool,
+    run: impl FnOnce(&mut Q38Engine<B>, &mut B, &mut [f32]),
+) -> (Vec<f32>, Vec<u8>, Vec<Vec<f32>>) {
+    let v = VARIANT.vocab_size;
+    e.reset(b).unwrap();
+    let mut last = vec![0.0f32; v];
+    run(e, b, &mut last);
+    let mut snap = vec![0u8; e.state_size()];
+    e.state_save(b, &mut snap).unwrap();
+    let decode = [5, 17, 300]
+        .iter()
+        .map(|&t| {
+            let mut l = vec![0.0f32; v];
+            e.step(b, &m.wf, &m.experts, pool, t, Some(&mut l)).unwrap();
+            l
+        })
+        .collect();
+    (last, snap, decode)
+}
+
+/// Batched prefill (`eval` in chunks) against one `step` per token, on
+/// one backend: last logits, the state after the prompt and the next
+/// three decode tokens' logits within [`TOL_CPU_METAL`]. The prompt
+/// (48 tokens) runs far past the tiny model's QSA budget (8 tokens +
+/// one block), and chunk sizes 5 and 7 make chunks that cross it and
+/// go sparse mid-chunk; 64 is the whole prompt in one chunk. Returns
+/// the worst error.
+fn batched_vs_per_token<B: Q38Exec>(e: &mut Q38Engine<B>, b: &mut B, m: &Model, pool: &rayon::ThreadPool) -> f32 {
+    let v = VARIANT.vocab_size;
+    let prompt: Vec<i32> = (0..48).map(|i| ((i * 37 + 5) % v) as i32).collect();
+    let (lp, sp, dp) = run_and_continue(e, b, m, pool, |e, b, out| {
+        for (i, &t) in prompt.iter().enumerate() {
+            let last = i + 1 == prompt.len();
+            e.step(b, &m.wf, &m.experts, pool, t, if last { Some(&mut *out) } else { None }).unwrap();
+        }
+    });
+    let mut worst = 0.0f32;
+    for chunk in [5, 7, 64] {
+        e.set_prefill_chunk(chunk);
+        let (lb, sb, db) = run_and_continue(e, b, m, pool, |e, b, out| {
+            e.eval(b, &m.wf, &m.experts, pool, &prompt, Some(out)).unwrap();
+        });
+        let el = rel_err(&lb, &lp);
+        let es = state_rel_err(&sb, &sp);
+        let ed = db.iter().zip(&dp).map(|(x, y)| rel_err(x, y)).fold(0.0f32, f32::max);
+        eprintln!("[q38 engine]   chunk {chunk}: logits {el:.3e}, state {es:.3e}, decode {ed:.3e}");
+        assert!(el <= TOL_CPU_METAL, "chunk {chunk}: last logits rel err {el}");
+        assert!(es <= TOL_CPU_METAL, "chunk {chunk}: state rel err {es}");
+        assert!(ed <= TOL_CPU_METAL, "chunk {chunk}: decode rel err {ed}");
+        assert_eq!(argmax(&lb), argmax(&lp), "chunk {chunk}: argmax");
+        worst = worst.max(el).max(es).max(ed);
+    }
+    e.set_prefill_chunk(usize::MAX);
+    worst
+}
+
+/// [`batched_vs_per_token`] on Metal and on the CPU backend, and the
+/// chunked prompt path against the goldens (every prompt, chunk 5:
+/// prompt 0 has 20 tokens, past the budget).
+#[test]
+fn batched_prefill_matches_per_token() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38 engine] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let m = open_model(&dir);
+    let es = m.experts.expert_size();
+    let pool = io_pool();
+    let mut gb = metal(&dir);
+    let mut ge = Q38Engine::new(&mut gb, &m.wf, &m.root, 64, es).unwrap();
+    ge.set_qsa_mode(QsaMode::Sparse);
+    eprintln!("[q38 engine] batched vs per-token, Metal:");
+    let wm = batched_vs_per_token(&mut ge, &mut gb, &m, &pool);
+    let mut cb = cpu(&dir);
+    let mut ce = Q38Engine::new(&mut cb, &m.wf, &m.root, 64, es).unwrap();
+    ce.set_qsa_mode(QsaMode::Sparse);
+    eprintln!("[q38 engine] batched vs per-token, CPU:");
+    let wc = batched_vs_per_token(&mut ce, &mut cb, &m, &pool);
+    let v = VARIANT.vocab_size;
+    let mut wg = 0.0f32;
+    for (pi, g) in gs.iter().enumerate() {
+        let want = golden_rows(g);
+        for (name, got) in [
+            ("metal", {
+                ge.reset(&mut gb).unwrap();
+                ge.set_prefill_chunk(5);
+                let mut l = vec![0.0f32; v];
+                ge.eval(&mut gb, &m.wf, &m.experts, &pool, &g.input_ids, Some(&mut l)).unwrap();
+                l
+            }),
+            ("cpu", {
+                ce.reset(&mut cb).unwrap();
+                ce.set_prefill_chunk(5);
+                let mut l = vec![0.0f32; v];
+                ce.eval(&mut cb, &m.wf, &m.experts, &pool, &g.input_ids, Some(&mut l)).unwrap();
+                l
+            }),
+        ] {
+            let e = rel_err(&got, want[g.input_ids.len() - 1]);
+            wg = wg.max(e);
+            assert!(e <= TOL_GOLDEN, "prompt {pi} {name}: chunked prefill vs golden rel err {e}");
+        }
+    }
+    eprintln!("[q38 engine] batched vs per-token worst: metal {wm:.3e}, cpu {wc:.3e}; chunked vs golden {wg:.3e}");
+}
+
+/// Command buffers per decode token and the prefill rate on the tiny
+/// model (Metal). Prints only: the counts are reported, the rate is
+/// indicative (debug build, tiny shapes).
+#[test]
+fn engine_submits_and_prefill_rate() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38 engine] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let m = open_model(&dir);
+    let pool = io_pool();
+    let mut b = metal(&dir);
+    let mut e = Q38Engine::new(&mut b, &m.wf, &m.root, 64, m.experts.expert_size()).unwrap();
+    e.set_qsa_mode(QsaMode::Sparse);
+    let v = VARIANT.vocab_size;
+    let prompt: Vec<i32> = (0..48).map(|i| ((i * 37 + 5) % v) as i32).collect();
+    let mut l = vec![0.0f32; v];
+    // Warm-up (pipelines, page cache).
+    e.eval(&mut b, &m.wf, &m.experts, &pool, &gs[0].input_ids, Some(&mut l)).unwrap();
+    e.reset(&mut b).unwrap();
+    let s0 = e.submits();
+    let t0 = std::time::Instant::now();
+    e.eval(&mut b, &m.wf, &m.experts, &pool, &prompt, Some(&mut l)).unwrap();
+    let dt = t0.elapsed().as_secs_f64();
+    let prefill_submits = e.submits() - s0;
+    // Decode: within the budget (a fresh sequence) and past it.
+    e.reset(&mut b).unwrap();
+    let s1 = e.submits();
+    e.step(&mut b, &m.wf, &m.experts, &pool, 3, Some(&mut l)).unwrap();
+    let dense = e.submits() - s1;
+    e.eval(&mut b, &m.wf, &m.experts, &pool, &prompt[..20], None).unwrap();
+    let s2 = e.submits();
+    e.step(&mut b, &m.wf, &m.experts, &pool, 3, Some(&mut l)).unwrap();
+    let sparse = e.submits() - s2;
+    eprintln!(
+        "[q38 engine] submits per decode token: {dense} (within the QSA budget), {sparse} (past it); \
+         prefill of {} tokens: {prefill_submits} submits, {:.1} tok/s",
+        prompt.len(),
+        prompt.len() as f64 / dt
+    );
+}
