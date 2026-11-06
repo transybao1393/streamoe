@@ -503,7 +503,11 @@ pub const BITS: usize = 4;
 /// RoPE base frequency. Per-variant: Qwen3 family uses 1e7 (much
 /// higher than the 1e4 default); DeepSeek-V3 / Cogito-V2 uses 1e4
 /// (the YaRN scaling layers on top of this base); OLMoE uses 1e4.
-#[cfg(any(feature = "model-qwen3-5-a17b", feature = "model-qwen3-6-35b-a3b"))]
+#[cfg(any(
+    feature = "model-qwen3-5-a17b",
+    feature = "model-qwen3-6-35b-a3b",
+    feature = "model-qwen3-8-flash-next",
+))]
 pub const ROPE_THETA: f32 = 10_000_000.0;
 #[cfg(any(feature = "model-cogito-v2-671b", feature = "model-olmoe-1b-7b"))]
 pub const ROPE_THETA: f32 = 10_000.0;
@@ -514,9 +518,9 @@ pub const ROPE_THETA: f32 = 10_000.0;
 /// position when `i % 3 == 2 && i < 3 * s[2]`, else by the temporal
 /// one. A text token has all three equal, which is plain RoPE. `None`
 /// for variants without vision input (or not yet checked: A17B).
-#[cfg(feature = "model-qwen3-6-35b-a3b")]
+#[cfg(any(feature = "model-qwen3-6-35b-a3b", feature = "model-qwen3-8-flash-next"))]
 pub const MROPE_SECTION: Option<[usize; 3]> = Some([11, 11, 10]);
-#[cfg(not(feature = "model-qwen3-6-35b-a3b"))]
+#[cfg(not(any(feature = "model-qwen3-6-35b-a3b", feature = "model-qwen3-8-flash-next")))]
 pub const MROPE_SECTION: Option<[usize; 3]> = None;
 
 /// Which of a token's `[t, h, w]` positions frequency pair `i` uses
@@ -794,16 +798,81 @@ pub const VARIANT: Variant = Variant {
     yarn_mscale_all_dim: 1.0,
 };
 
+/// Qwen3.8-Flash-Next (`qwen4_exp`, architecture preview), MLX 4-bit
+/// (`mlx-community/Qwen3.8-Flash-Next-4bit`, group size 32). Source:
+/// `text_config` of its `config.json`.
+///
+/// The fields below cover what it shares with the qwen3_5_moe shape:
+/// 12 × (3 Gated DeltaNet + 1 full-attention) layers, gated q_proj
+/// with per-head Q/K norms and quarter-head interleaved MRoPE, softmax
+/// top-10 routing with a sigmoid-gated shared expert. What `Variant`
+/// cannot express — the Gated Residual (`hc_count` copies of the
+/// hidden state), no per-layer input / post-attention norms, `1 + w`
+/// norm gains, the sigmoid gate of the Gated DeltaNet output norm,
+/// Qwen Sparse Attention's indexer, the n-gram PLE and group-size-32
+/// quantization — lives in `model_layer::qwen3_8_flash_next::config`.
+/// `num_attn_heads * head_dim` (6144) is not a multiple of
+/// `hidden_dim` (2560); that static check is skipped for this variant.
+#[cfg(feature = "model-qwen3-8-flash-next")]
+pub const VARIANT: Variant = Variant {
+    name: "Qwen3.8-Flash-Next-4bit",
+    hidden_dim: 2560,
+    num_layers: 48,
+    num_attn_heads: 24,
+    num_kv_heads: 2,
+    head_dim: 256,
+    vocab_size: 248320,
+    num_experts: 512,
+    num_experts_per_tok: 10,
+    moe_intermediate: 640,
+    shared_intermediate: 640,
+    full_attn_interval: 4,
+    linear_num_v_heads: 48,
+    linear_num_k_heads: 16,
+    eos_token_1: 248046,
+    eos_token_2: 248044,
+    // Same vocabulary and eos ids as Qwen3.5 / 3.6; the think ids are
+    // assumed equal (no tokenizer.json on this host to check).
+    think_start_token: 248068,
+    think_end_token: 248069,
+    attn_kind: AttnKind::Gqa,
+    rope_kind: RopeKind::Vanilla,
+    router_kind: RouterKind::Softmax,
+    shared_expert_gate: SharedExpertGate::SigmoidGate,
+    attn_output_gate: true,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 64, // head_dim / 4 (partial_rotary_factor 0.25)
+    norm_topk_prob: true,
+    q_lora_rank: 0,
+    kv_lora_rank: 0,
+    qk_nope_head_dim: 0,
+    qk_rope_head_dim: 0,
+    v_head_dim: 0,
+    n_group: 0,
+    topk_group: 0,
+    routed_scaling_factor: 1.0,
+    first_k_dense_replace: 0,
+    dense_intermediate: 0,
+    yarn_factor: 1.0,
+    yarn_original_max_pos: 0,
+    yarn_beta_fast: 0.0,
+    yarn_beta_slow: 0.0,
+    yarn_mscale: 1.0,
+    yarn_mscale_all_dim: 1.0,
+};
+
 #[cfg(not(any(
     feature = "model-qwen3-5-a17b",
     feature = "model-qwen3-6-35b-a3b",
     feature = "model-cogito-v2-671b",
     feature = "model-olmoe-1b-7b",
+    feature = "model-qwen3-8-flash-next",
 )))]
 compile_error!(
     "streammoe: enable exactly one model variant feature \
      (`model-qwen3-5-a17b`, `model-qwen3-6-35b-a3b`, \
-     `model-cogito-v2-671b`, or `model-olmoe-1b-7b`)."
+     `model-cogito-v2-671b`, `model-olmoe-1b-7b`, or \
+     `model-qwen3-8-flash-next`)."
 );
 
 // --- Static sanity checks ----------------------------------------
@@ -830,6 +899,8 @@ const _: () = {
             VARIANT.num_attn_heads % VARIANT.num_kv_heads == 0,
             "num_attn_heads must be a multiple of num_kv_heads (GQA)"
         );
+        // Qwen3.8-Flash-Next: 24 × 256 = 6144 against hidden 2560.
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         assert!(
             (VARIANT.num_attn_heads * VARIANT.head_dim) % VARIANT.hidden_dim == 0,
             "num_attn_heads * head_dim must be a multiple of hidden_dim"
@@ -952,7 +1023,11 @@ mod tests {
     /// The qwen3_5_moe attention shape: gated q_proj, per-head Q/K
     /// norms, quarter-head RoPE, renormalized top-K, gated shared
     /// expert.
-    #[cfg(any(feature = "model-qwen3-5-a17b", feature = "model-qwen3-6-35b-a3b"))]
+    #[cfg(any(
+        feature = "model-qwen3-5-a17b",
+        feature = "model-qwen3-6-35b-a3b",
+        feature = "model-qwen3-8-flash-next",
+    ))]
     #[test]
     fn qwen_attention_and_routing_flags() {
         let v = VARIANT;
