@@ -41,6 +41,8 @@
 //!   end-to-end forward ([`layer::Q38CpuModel`]).
 //! - [`ngram`] / [`ple`] — the per-layer n-gram embedding: hashing,
 //!   streamed row table (`MFNG` file), PLE layer forward.
+//! - [`qsa`] — Qwen Sparse Attention: dense and block-selected
+//!   attention, the indexer, graph ops, [`qsa::QsaBlock`].
 //! - [`tiny`] — tiny random-weight models matching the torch port
 //!   `tools/model_layer/qwen3_8_flash_next/core_ref.py`.
 //!
@@ -83,5 +85,6 @@ pub mod gated_residual_gpu;
 pub mod layer;
 pub mod ngram;
 pub mod ple;
+pub mod qsa;
 pub mod tiny;
 pub mod weights;

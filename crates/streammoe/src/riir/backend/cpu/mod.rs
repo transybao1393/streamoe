@@ -1059,11 +1059,15 @@ impl Backend for CpuBackend {
                 let k_buf = self.read_f32(*k);
                 let v_buf = self.read_f32(*v);
                 let mut o_buf = self.write_f32(*attn_out);
+                // The cache buffers hold `n_ctx` rows; attend over the
+                // `kv_len_total` filled ones (as the Metal kernel does).
+                let kv_rows = *kv_len_total as usize * (*num_heads / *heads_per_kv * *head_dim) as usize;
+                let q_len = *n_tokens as usize * (*num_heads * *head_dim) as usize;
                 sdpa_causal_tiled_n_tokens_cpu(
-                    &q_buf,
-                    &k_buf,
-                    &v_buf,
-                    &mut o_buf,
+                    &q_buf[..q_len],
+                    &k_buf[..kv_rows],
+                    &v_buf[..kv_rows],
+                    &mut o_buf[..q_len],
                     *n_tokens as usize,
                     *num_heads as usize,
                     *heads_per_kv as usize,
