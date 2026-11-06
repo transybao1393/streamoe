@@ -27,6 +27,12 @@ model-qwen3-8-flash-next = []
 # tools/model_layer/qwen3_8_flash_next/make_tiny.py --shapes engine
 # (hidden 256), for the engine integration tests. Not a model.
 model-qwen3-8-flash-next-tiny = ["model-qwen3-8-flash-next"]
+# Qwen3-Next-80B-A3B (qwen3_next): the qwen3_5_moe code path, converted
+# by tools/model_layer/qwen3_next/convert.py.
+model-qwen3-next-80b-a3b = []
+# Test only: Qwen3-Next at the tiny random-weight shapes of
+# tools/model_layer/qwen3_next/make_tiny.py (hidden 512). Not a model.
+model-qwen3-next-tiny = ["model-qwen3-next-80b-a3b"]
 
 [dependencies]
 thiserror   = { workspace = true }
