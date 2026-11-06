@@ -24,7 +24,8 @@ use super::budget::{Account, BudgetPlan};
 use super::config::OpenConfig;
 use super::model_layer::qwen3_8_flash_next::engine::{self, Q38Engine, Q38EngineError, Q38PlanBytes};
 use super::snapshot::state_snapshot::StateSnapshotError;
-use super::{KvFormat, MetalBackend, RsCtx, RsError, StageInput, StageOutput};
+use super::io::expert_io_mode::ExpertIoMode;
+use super::{KvFormat, MetalBackend, PrefetchState, RsCtx, RsError, StageInput, StageOutput};
 
 /// The family engine and where its model lives.
 pub(crate) struct Q38Slot {
@@ -63,17 +64,23 @@ pub(crate) fn check_config(config: &OpenConfig) -> Result<(), RsError> {
 /// The engine's buffers in the budget plan, on the existing accounts:
 /// QSA K / V → `Kv`; Gated DeltaNet state plus the host family state
 /// (indexer keys, PLE state, n-gram row cache) → `LinearState`; the
-/// K-expert staging → `ExpertSlots`; per-token scratch at the prefill
-/// chunk's rows → `PrefillScratch`. No prefill staging (a chunk's
-/// experts go through the same `top_k` slots, `top_k` at a time), no KV
-/// scratch, no multi-decode buffers.
-pub(crate) fn plan(plan: &mut BudgetPlan, n_ctx: usize, expert_size: u64, root: &std::path::Path) -> Result<Q38PlanBytes, RsError> {
+/// expert staging (K demand slots + two prefetch sets) → `ExpertSlots`;
+/// per-token scratch at the prefill chunk's rows → `PrefillScratch`. No
+/// prefill staging (a chunk's experts go through the `top_k` demand
+/// slots, `top_k` at a time), no KV scratch, no multi-decode buffers.
+pub(crate) fn plan(
+    plan: &mut BudgetPlan,
+    n_ctx: usize,
+    expert_size: u64,
+    root: &std::path::Path,
+    prefetch_experts: usize,
+) -> Result<Q38PlanBytes, RsError> {
     let ngram = super::model_layer::qwen3_8_flash_next::ngram::NgramTable::open(
         &engine::ngram_path(root),
         engine::ngram_cache_rows(),
     )
     .map_err(|e| unsupported(&format!("n-gram table: {e}")))?;
-    let p = engine::plan_bytes(n_ctx, expert_size as usize, ngram.cache_bytes());
+    let p = engine::plan_bytes_with(n_ctx, expert_size as usize, ngram.cache_bytes(), prefetch_experts);
     plan.set(Account::Kv, p.kv);
     plan.set(Account::KvScratch, 0);
     plan.set(Account::LinearState, p.linear_state + p.family_state);
@@ -108,9 +115,15 @@ impl RsCtx<MetalBackend> {
         }
         self.ensure_backend()?;
         let es = self.experts.expert_size();
+        // Speculative expert prefetch with the context's settings
+        // (`prefetch_experts`, `prefetch_lookahead`); this family's
+        // decode always preads, so it runs in either IO mode.
+        let mut pf = PrefetchState::new(crate::riir::variants::VARIANT.num_layers, ExpertIoMode::Pread);
+        pf.set_max_experts(self.prefetch.max_experts());
+        pf.set_lookahead(self.prefetch.lookahead());
         let Self { backend, wf, q38, n_ctx, .. } = self;
         let b = backend.as_mut().expect("just built");
-        let e = Q38Engine::new(b, wf, &q38.root, *n_ctx, es).map_err(|e| {
+        let e = Q38Engine::with_prefetch(b, wf, &q38.root, *n_ctx, es, Some(pf)).map_err(|e| {
             eprintln!("[q38] engine init failed: {e}");
             RsError::InitFailed
         })?;
@@ -153,7 +166,21 @@ impl RsCtx<MetalBackend> {
             });
         }
         let b = backend.as_mut().expect("built with the engine");
-        e.eval(b, wf, experts, io_pool, tokens, logits).map_err(eval_err)
+        let r = e.eval(b, wf, experts, io_pool, tokens, logits);
+        // A failed token can leave prefetch reads in flight.
+        e.drain_prefetch();
+        r.map_err(eval_err)
+    }
+
+    /// Prefetch `(hits, misses)` of the engine ([`RsCtx::prefetch_stats`]).
+    pub(crate) fn q38_prefetch_stats(&self) -> (u64, u64) {
+        self.q38.engine.as_ref().map_or((0, 0), |e| e.prefetch_stats())
+    }
+
+    pub(crate) fn q38_reset_prefetch_stats(&self) {
+        if let Some(e) = self.q38.engine.as_ref() {
+            e.reset_prefetch_stats();
+        }
     }
 
     pub(crate) fn q38_clear(&mut self) {

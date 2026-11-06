@@ -102,6 +102,8 @@ pub enum FamOp {
     /// [`QsaGpuKernels::encode_sdpa_rows`] (no K / V copies to the
     /// host); CPU: [`sdpa_rows`] per query.
     SparseRows { q: FBuf, gate: FBuf, k_cache: FBuf, v_cache: FBuf, out: FBuf, n_tokens: u32 },
+    /// The PLE gate / conv ([`super::ple_gpu`]).
+    Ple(super::ple_gpu::PleOp),
 }
 
 /// One entry of a pass.
@@ -236,6 +238,7 @@ pub struct Q38EngineKernels {
     pub gated_norm_sigmoid: ComputePipelineState,
     pub add: ComputePipelineState,
     pub gather_rows: ComputePipelineState,
+    pub ple: super::ple_gpu::PleGpuKernels,
 }
 
 fn grid1(n: u32, tg: u32) -> (MTLSize, MTLSize) {
@@ -266,6 +269,7 @@ impl Q38EngineKernels {
             gated_norm_sigmoid: p("q38e_gated_rms_norm_sigmoid")?,
             add: p("q38e_add")?,
             gather_rows: p("q38e_gather_rows")?,
+            ple: super::ple_gpu::PleGpuKernels::new(device)?,
         })
     }
 
@@ -337,6 +341,20 @@ impl Q38EngineKernels {
         set_u32(enc, 2, n);
         let (g, t) = grid1(n, 256);
         enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
+    }
+
+    /// A PLE gate / conv op on its own encoder ([`super::ple_gpu::PleGpuKernels::encode`]
+    /// binds the arguments).
+    pub fn encode_ple(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        op: &super::ple_gpu::PleOp,
+        pool: &crate::riir::backend::gpu::MetalBufferPool,
+        wbuf: &BufferRef,
+    ) {
+        let enc = cmdbuf.new_compute_command_encoder();
+        self.ple.encode(enc, op, pool, wbuf);
         enc.end_encoding();
     }
 
@@ -443,6 +461,7 @@ impl Q38Exec for MetalBackend {
                     u(n_tokens),
                 )
             }
+            FamOp::Ple(ref p) => fam.eng.encode_ple(cmd, p, pool, wbuf),
         }
     }
 }
@@ -605,6 +624,7 @@ impl Q38Exec for CpuBackend {
                     sdpa_rows(s, qt, gt, &kc, &vc, 0, Some(rows), &mut ov[t * qd..(t + 1) * qd]);
                 }
             }
+            FamOp::Ple(ref p) => super::ple_gpu::apply_cpu(self, p),
         }
     }
 }

@@ -14,7 +14,7 @@
 //! ```text
 //! hyper = expand(embed(tokens))                        [T, hc · H]
 //! per layer l:
-//!   if PLE layer: hyper += ple(hyper, tokens)          host (PleLayer), GPU add
+//!   if PLE layer: hyper += ple(hyper, tokens)          n-gram rows (host) → GPU (ple_gpu)
 //!   x, inj = gated_residual(attn_hc, hyper)            FamOp + matvecs
 //!   y = gated_deltanet(x)                              graph ops (the conv / recurrence walk
 //!                                                      the chunk in order), sigmoid-gated norm
@@ -32,15 +32,41 @@
 //! x = gated_residual(mixer, hyper) → lm_head           last row; no final norm
 //! ```
 //!
+//! ## Expert reads
+//!
+//! The routed experts come from the hot tier (a copy from RAM), a
+//! speculative prefetch slot, or a pread, into one staging buffer the
+//! permute-fuse op reads at `slot · expert_size`:
+//!
+//! ```text
+//! slots [0, K)              demand reads and hot-tier copies, bucket i in slot i
+//! slots [K + s·P, K + s·P + P)   prefetch set s = layer % 2, P = min(prefetch_experts, K)
+//! ```
+//!
+//! The prefetch is `io::prefetch::PrefetchState`, the a3b decode
+//! path's state machine (previous-token guess, strongest pick first,
+//! hot-tier experts masked out): layer L's reads are issued at the top
+//! of layer L, before its first command buffer, so they run under the
+//! GPU work up to its router; with `prefetch_lookahead` layer L+1's go
+//! out right after layer L's router readback. A routed expert found in
+//! the layer's set binds that slot (no copy). Wrong guesses finish in
+//! the background; everything in flight is drained at the end of the
+//! token. Off with `prefetch_experts = 0` (then only `K` slots are
+//! allocated).
+//!
+//! Safety of the set reuse rests on the per-layer router readback
+//! waiting for every command buffer queued before it: set `L % 2` was
+//! last bound by layer L-2's experts, which are queued before layer
+//! L-1's router readback, which completes before layer L starts.
+//!
 //! **Command buffers.** One per layer: everything from the previous
 //! layer's experts to this layer's router logits, which the host reads
-//! to pick the experts to load. On top of that: the PLE layer (the host
-//! PLE reads the residual), a QSA layer past the budget (the host
+//! to pick the experts to load. On top of that: a QSA layer past the budget (the host
 //! scores blocks from the chunk's indexer projection), each extra
 //! expert group of a chunk, and the tail. A QSA layer within the budget
 //! adds none: its indexer keys are read back after the router's submit
-//! (`drain_pending_index`). Tiny model, decode: 6 per token
-//! within the budget, 7 past it ([`Q38Engine::submits`]). The QSA Q / K
+//! (`drain_pending_index`). Tiny model, decode: 5 per token
+//! within the budget, 6 past it ([`Q38Engine::submits`]). The QSA Q / K
 //! norms and the Gated DeltaNet output norm are family kernels
 //! ([`super::engine_exec`]); every `1 + w` gain is applied in a kernel
 //! from the stored bf16 value.
@@ -59,8 +85,6 @@
 //! - Layer ranges (`OpenConfig::layer_range` other than the whole
 //!   model) and `eval_stage` with hidden rows: the residual crossing a
 //!   stage boundary is `hc · H` wide here. `RsCtx` rejects them.
-//! - Speculative expert prefetch (the decode path reads the routed
-//!   experts on demand; the hot tier still serves hits).
 //! - Rewinding (`memory_seq_rm` to a middle position): the linear
 //!   attention and PLE conv states cannot be truncated. Checkpoints
 //!   (`state_save` / `state_load`) work.
@@ -80,6 +104,7 @@ use super::engine_exec::{retag, run_steps, FBuf, FamOp, Q38Exec, Step};
 use super::ngram::{NgramConfig, NgramTable};
 use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
 use super::qsa::gpu::qsa_select_rows;
+use super::ple_gpu::PleOp;
 use super::qsa::{
     push_qsa_o_proj, push_qsa_pre_sdpa, push_qsa_sdpa, qsa_indexer_step, qsa_needs_sparse,
     QsaGraphBufs, QsaIndexerCache, QsaLayerWeights, QsaMode, QsaShape,
@@ -89,6 +114,9 @@ use crate::riir::backend::buftype::Buf;
 use crate::riir::backend::{BufId, BufferPool, Graph, GraphError, Op, WeightRef};
 use crate::riir::io::embedding::{bf16_to_f32, embed_lookup};
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
+use crate::riir::io::io_stats::{guess_overlap, Guesser};
+use crate::riir::io::prefetch::{mask_hot, PrefetchState};
+use crate::riir::moe::expert_forward::MAX_K;
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu_with, ExpertBuckets};
 use crate::riir::variants::{MROPE_SECTION, RMS_NORM_EPS, ROPE_THETA, VARIANT};
@@ -385,7 +413,8 @@ pub struct Q38PlanBytes {
     pub kv: u64,
     /// Gated DeltaNet conv + recurrence state (GPU).
     pub linear_state: u64,
-    /// The K-expert staging buffer (`top_k` blobs).
+    /// The expert staging buffer: `top_k` demand slots plus two
+    /// prefetch sets of `min(prefetch_experts, top_k)`.
     pub expert_slots: u64,
     /// Per-token scratch at [`prefill_chunk`] rows: the `hc · H`
     /// residual and Gated Residual buffers, projection / MoE scratch;
@@ -402,8 +431,20 @@ impl Q38PlanBytes {
     }
 }
 
-/// The plan for `n_ctx` tokens and `expert_size`-byte experts.
+/// The plan for `n_ctx` tokens and `expert_size`-byte experts, prefetch
+/// off.
 pub fn plan_bytes(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64) -> Q38PlanBytes {
+    plan_bytes_with(n_ctx, expert_size, ngram_cache_bytes, 0)
+}
+
+/// Prefetch slots per set for `prefetch_experts` experts per layer.
+pub fn prefetch_slots(prefetch_experts: usize) -> usize {
+    prefetch_experts.min(q38_config().top_k).min(MAX_K)
+}
+
+/// [`plan_bytes`] with speculative prefetch reading `prefetch_experts`
+/// experts per layer (two sets of [`prefetch_slots`] staging slots).
+pub fn plan_bytes_with(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64, prefetch_experts: usize) -> Q38PlanBytes {
     let c = q38_config();
     let s = qsa_shape();
     let n_qsa = (0..c.num_layers).filter(|&l| c.layer_kind(l) == Q38LayerKind::Qsa).count() as u64;
@@ -414,7 +455,7 @@ pub fn plan_bytes(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64) -> Q
         ((c.conv_kernel - 1) * c.linear_conv_dim() + c.linear_v_heads * c.linear_value_dim * c.linear_key_dim) as u64;
     let linear_state = n_lin * lin_state * f;
     let k = c.top_k as u64;
-    let expert_slots = k * expert_size as u64;
+    let expert_slots = (k + 2 * prefetch_slots(prefetch_experts) as u64) * expert_size as u64;
     let (h, hc) = (c.hidden as u64, c.hc_hidden() as u64);
     let vt = (c.linear_v_heads * c.linear_value_dim) as u64;
     let rows = prefill_chunk(n_ctx) as u64;
@@ -427,9 +468,12 @@ pub fn plan_bytes(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64) -> Q
             + k * (2 * h + 3 * c.moe_intermediate as u64 + 3))
             + c.vocab as u64);
     let pc = ple_config();
+    // GPU PLE: the n-gram embedding, k, v, norm_conv rows (one token).
+    let scratch = scratch + f * (pc.embed_dim + 2 * pc.hc_hidden() + pc.hidden) as u64;
+    // PLE conv state: the GPU copy and the host one (snapshots).
     let family_state = n_qsa * (n_ctx * s.idx_head_dim) as u64 * f * 5 / 4
         + n_qsa * (n_ctx * 12) as u64
-        + (pc.conv_state_rows() * pc.hc_hidden()) as u64 * f
+        + 2 * (pc.conv_state_rows() * pc.hc_hidden()) as u64 * f
         + ngram_cache_bytes;
     Q38PlanBytes { kv, linear_state, expert_slots, scratch, family_state }
 }
@@ -487,6 +531,31 @@ struct Bufs {
     logits: FBuf,
 }
 
+/// The PLE on the GPU ([`super::ple_gpu`]): weight offsets, buffers
+/// for one token, and the conv state (the state of record; the host
+/// [`PleState::conv`] is only a snapshot staging copy).
+struct PleGpu {
+    key: WeightRef,
+    value: WeightRef,
+    norm_key_off: u64,
+    norm_query_off: u64,
+    norm_conv_off: u64,
+    conv_off: u64,
+    /// `[embed]`, `[hc·H]`, `[H]`, `[hc·H]`.
+    e: FBuf,
+    k: FBuf,
+    v: FBuf,
+    n: FBuf,
+    /// `[(K-1)·D, hc·H]`.
+    state: FBuf,
+}
+
+/// `STREAMMOE_Q38_PLE=host`: run the PLE on the host (the older path:
+/// residual read back, [`PleLayer::forward`], GPU add).
+fn ple_on_host_from_env() -> bool {
+    std::env::var("STREAMMOE_Q38_PLE").is_ok_and(|v| v == "host")
+}
+
 /// Per-layer GPU state.
 enum LayerBufs {
     Gdn { conv: FBuf, delta: FBuf, conv_len: usize, delta_len: usize },
@@ -532,6 +601,10 @@ pub struct Q38Engine<B: Q38Exec> {
     indexer: Vec<Option<QsaIndexerCache>>,
     /// `(decoder layer, layer, state)` of the PLE.
     ple: Option<(usize, PleLayer, PleState)>,
+    /// The PLE's GPU weights and buffers (with a PLE layer).
+    ple_gpu: Option<PleGpu>,
+    /// Run the PLE on the host instead ([`Self::set_ple_on_host`]).
+    ple_host: bool,
     n_ctx: usize,
     expert_size: usize,
     /// Rows of the per-token buffers ([`prefill_chunk`]).
@@ -545,14 +618,39 @@ pub struct Q38Engine<B: Q38Exec> {
     pending_index: Option<(usize, usize, usize)>,
     /// Command buffers submitted so far ([`Self::submits`]).
     submits: std::sync::atomic::AtomicU64,
+    /// Speculative expert prefetch (`None`: off).
+    pf: Option<PrefetchState>,
+    /// Staging slots per prefetch set ([`prefetch_slots`]; 0 = off).
+    pf_slots: usize,
+    /// Host address of `bufs.expert_base` (shared storage / the CPU
+    /// backend's vector: allocated once, never moved). Slots are
+    /// handed out as disjoint slices of it ([`Self::slot`]), so
+    /// prefetch workers and demand reads never alias.
+    staging_addr: usize,
 }
 
 impl<B: Q38Exec> Q38Engine<B> {
     /// Build the engine on `b`: weight offsets from `wf`, the n-gram
     /// table from `root/ngram.mfng`, buffers for `n_ctx` tokens and
     /// `expert_size`-byte experts. Allocates and zeroes everything
-    /// now.
+    /// now. No speculative prefetch ([`Self::with_prefetch`]).
     pub fn new(b: &mut B, wf: &WeightFile, root: &Path, n_ctx: usize, expert_size: usize) -> Result<Self> {
+        Self::with_prefetch(b, wf, root, n_ctx, expert_size, None)
+    }
+
+    /// [`Self::new`] with speculative expert prefetch driven by `pf`
+    /// (its `max_experts` and `lookahead` settings; the cross-layer
+    /// guesser is not used here). `None` or `max_experts() == 0`: off.
+    pub fn with_prefetch(
+        b: &mut B,
+        wf: &WeightFile,
+        root: &Path,
+        n_ctx: usize,
+        expert_size: usize,
+        pf: Option<PrefetchState>,
+    ) -> Result<Self> {
+        let pf_slots = pf.as_ref().map_or(0, |p| prefetch_slots(p.max_experts()));
+        let pf = pf.filter(|_| pf_slots > 0);
         let cfg = q38_config();
         let qsa = qsa_shape();
         let w = Q38Weights::load(wf)?;
@@ -597,7 +695,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             s_down: alloc(b, ch * h, "q38.shared_down")?,
             zeros: alloc(b, ch * h, "q38.zeros")?,
             out_sum: alloc(b, ch * h, "q38.out_sum")?,
-            expert_base: alloc(b, k * expert_size / 4 + 1, "q38.expert_staging")?,
+            expert_base: alloc(b, (k + 2 * pf_slots) * expert_size / 4 + 1, "q38.expert_staging")?,
             expert_indices: alloc(b, ch * k, "q38.expert_indices")?,
             bucket_input: alloc(b, ch * k * h, "q38.bucket_input")?,
             bucket_gate: alloc(b, ch * k * cfg.moe_intermediate, "q38.bucket_gate")?,
@@ -609,6 +707,10 @@ impl<B: Q38Exec> Q38Engine<B> {
             logits: alloc(b, cfg.vocab, "q38.logits")?,
         };
         upload(b, bufs.inv_freq, &qsa.inv_freq())?;
+        let staging_addr = b
+            .pool_mut()
+            .with_bytes_mut(bufs.expert_base, |s: &mut [u8]| s.as_mut_ptr() as usize)
+            .map_err(|e| Q38EngineError::Other(format!("staging: {e}")))?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         let mut indexer = Vec::with_capacity(cfg.num_layers);
         for (l, lr) in w.layers.iter().enumerate() {
@@ -644,6 +746,28 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
             None => None,
         };
+        let ple_gpu = match cfg.ple_layers.first() {
+            Some(&pl) => {
+                let pc = ple_config();
+                let p = format!("model.layers.{pl}.ple");
+                let state = alloc(b, pc.conv_state_rows() * pc.hc_hidden(), "q38.ple_conv_state")?;
+                upload(b, state, &vec![0.0f32; pc.conv_state_rows() * pc.hc_hidden()])?;
+                Some(PleGpu {
+                    key: qref(wf, &format!("{p}.key_proj"))?,
+                    value: qref(wf, &format!("{p}.value_proj"))?,
+                    norm_key_off: off(wf, &format!("{p}.norm_key.weight"))?,
+                    norm_query_off: off(wf, &format!("{p}.norm_query.weight"))?,
+                    norm_conv_off: off(wf, &format!("{p}.norm_conv.weight"))?,
+                    conv_off: off(wf, &format!("{p}.conv1d.weight"))?,
+                    e: alloc(b, ch * pc.embed_dim, "q38.ple_e")?,
+                    k: alloc(b, ch * pc.hc_hidden(), "q38.ple_k")?,
+                    v: alloc(b, ch * pc.hidden, "q38.ple_v")?,
+                    n: alloc(b, ch * pc.hc_hidden(), "q38.ple_n")?,
+                    state,
+                })
+            }
+            _ => None,
+        };
         Ok(Self {
             fam,
             cfg,
@@ -654,6 +778,8 @@ impl<B: Q38Exec> Q38Engine<B> {
             layers,
             indexer,
             ple,
+            ple_gpu,
+            ple_host: ple_on_host_from_env(),
             n_ctx,
             expert_size,
             max_chunk: ch,
@@ -661,6 +787,9 @@ impl<B: Q38Exec> Q38Engine<B> {
             pos: 0,
             pending_index: None,
             submits: std::sync::atomic::AtomicU64::new(0),
+            pf,
+            pf_slots,
+            staging_addr,
         })
     }
 
@@ -694,8 +823,79 @@ impl<B: Q38Exec> Q38Engine<B> {
         self.mode = mode;
     }
 
+    /// Speculative prefetch `(hits, misses)` in expert slots (hot-tier
+    /// hits count as neither), `(0, 0)` when off.
+    pub fn prefetch_stats(&self) -> (u64, u64) {
+        self.pf.as_ref().map_or((0, 0), |p| p.stats())
+    }
+
+    /// Zero [`Self::prefetch_stats`].
+    pub fn reset_prefetch_stats(&self) {
+        if let Some(p) = &self.pf {
+            p.reset_stats();
+        }
+    }
+
+    /// Staging slots per prefetch set (0: prefetch off).
+    pub fn prefetch_slots(&self) -> usize {
+        self.pf_slots
+    }
+
+    /// Wait for every prefetch read still in flight (a token that
+    /// failed midway can leave some). [`Self::step`] drains on success.
+    pub fn drain_prefetch(&mut self) {
+        if let Some(p) = self.pf.as_mut() {
+            p.drain();
+        }
+    }
+
+    /// Staging slot `i` (`expert_size` bytes).
+    ///
+    /// # Safety
+    /// No other live slice of slot `i` (each read or prefetch task gets
+    /// its own slot), and no GPU work reading it in flight.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slot(&self, i: usize) -> &mut [u8] {
+        debug_assert!(i < self.cfg.top_k + 2 * self.pf_slots);
+        // SAFETY: forwarded.
+        unsafe { slot_at(self.staging_addr, self.expert_size, i) }
+    }
+
+    /// First staging slot of `layer`'s prefetch set.
+    fn pf_first_slot(&self, layer: usize) -> usize {
+        self.cfg.top_k + (layer % 2) * self.pf_slots
+    }
+
+    /// Issue `layer`'s speculative reads (previous-token guess, hot-tier
+    /// experts masked) into its prefetch set, unless already in flight
+    /// or there is no guess yet. Set `layer % 2` was last bound by
+    /// layer `layer - 2`'s experts, complete by now (module docs).
+    fn prefetch_dispatch(&mut self, layer: usize, experts: &ExpertFiles, io_pool: &rayon::ThreadPool) {
+        let p = self.pf_slots;
+        let first = self.pf_first_slot(layer);
+        let (addr, es) = (self.staging_addr, self.expert_size);
+        let Some(pf) = self.pf.as_mut() else { return };
+        if layer >= self.cfg.num_layers || pf.in_flight_for(layer) {
+            return;
+        }
+        let Some(mut predicted) = pf.predict_for(layer) else { return };
+        mask_hot(experts.hot_tier(), layer, &mut predicted[..p]);
+        let mut spare = [0u8; MAX_K];
+        let mut spare = spare.chunks_mut(1);
+        // SAFETY: the set's slots are disjoint from each other and from
+        // the demand slots; the set's previous prefetch is drained by
+        // `dispatch` before it writes, and its last GPU reader is done.
+        let dsts: [&mut [u8]; MAX_K] = std::array::from_fn(|i| {
+            if i < p { unsafe { slot_at(addr, es, first + i) } } else { spare.next().expect("MAX_K spares") }
+        });
+        pf.dispatch(layer, predicted, p, dsts, io_pool, experts);
+    }
+
     /// Back to an empty sequence.
     pub fn reset(&mut self, b: &mut B) -> Result<()> {
+        if let Some(p) = self.pf.as_mut() {
+            p.invalidate_all();
+        }
         for lb in &self.layers {
             if let LayerBufs::Gdn { conv, delta, conv_len, delta_len } = *lb {
                 upload(b, conv, &vec![0.0f32; conv_len])?;
@@ -707,9 +907,110 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         if let Some((_, _, st)) = self.ple.as_mut() {
             st.reset();
+            if let Some(g) = &self.ple_gpu {
+                upload(b, g.state, &st.conv)?;
+            }
         }
         self.pending_index = None;
         self.pos = 0;
+        Ok(())
+    }
+
+    /// `true` if the PLE runs on the host (`STREAMMOE_Q38_PLE=host` or
+    /// [`Self::set_ple_on_host`]).
+    pub fn ple_on_host(&self) -> bool {
+        self.ple_host
+    }
+
+    /// Run the PLE on the host (`true`) or the backend (`false`, the
+    /// default); the conv state moves with it.
+    pub fn set_ple_on_host(&mut self, b: &mut B, on: bool) -> Result<()> {
+        if on == self.ple_host {
+            return Ok(());
+        }
+        if let (Some((_, _, st)), Some(g)) = (self.ple.as_mut(), &self.ple_gpu) {
+            if on {
+                st.conv = download(b, g.state, st.conv.len())?;
+            } else {
+                upload(b, g.state, &st.conv)?;
+            }
+        }
+        self.ple_host = on;
+        Ok(())
+    }
+
+    /// The PLE inject for `tokens` at the PLE layer: `hyper += ple(…)`.
+    ///
+    /// GPU (default): the n-gram rows are looked up on the host and
+    /// uploaded; `key_proj` / `value_proj` (graph matvecs) and the
+    /// gate / conv ([`PleOp`]) are queued on `steps` — no readback.
+    /// The upload is safe while `steps` is pending: only these steps
+    /// read `ple_e`, and the previous chunk's are complete. A chunk of
+    /// `T` tokens is the same ops at `T` rows (the buffers hold a
+    /// prefill chunk). The host path: flush, read the residual back, [`PleLayer::forward`] on the host (the conv
+    /// state moved down and back), GPU add.
+    fn ple_layer(
+        &mut self,
+        b: &mut B,
+        wf: &WeightFile,
+        io_pool: &rayon::ThreadPool,
+        tokens: &[i32],
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
+        let pc = ple_config();
+        let (hh, t_n) = (pc.hc_hidden(), tokens.len());
+        let (_, layer, state) = self.ple.as_mut().expect("PLE layer");
+        let gpu_state = self.ple_gpu.as_ref().filter(|_| !self.ple_host);
+        if let Some(g) = gpu_state {
+            let e = layer.embedding(state, tokens, Some(io_pool))?;
+            upload(b, g.e, &e)?;
+            let (ed, h) = (pc.embed_dim as u32, pc.hidden as u32);
+            let tn = t_n as u32;
+            steps.push(matvec_n("q38.ple.key_proj", g.key, g.e, g.k, ed, hh as u32, tn));
+            steps.push(matvec_n("q38.ple.value_proj", g.value, g.e, g.v, ed, h, tn));
+            steps.push(Step::F(FamOp::Ple(PleOp::Gate {
+                k: g.k,
+                x: self.bufs.hyper,
+                v: g.v,
+                u: self.bufs.ple_out,
+                norm_key_off: g.norm_key_off,
+                norm_query_off: g.norm_query_off,
+                hidden: h,
+                hc: pc.hc as u32,
+                n_tokens: tn,
+                eps: pc.eps,
+            })));
+            steps.push(Step::F(FamOp::Ple(PleOp::Conv {
+                u: self.bufs.ple_out,
+                n: g.n,
+                state: g.state,
+                x: self.bufs.hyper,
+                norm_conv_off: g.norm_conv_off,
+                conv_off: g.conv_off,
+                hidden: h,
+                hc: pc.hc as u32,
+                kernel: pc.conv_kernel as u32,
+                dilation: pc.conv_dilation as u32,
+                n_tokens: tn,
+                eps: pc.eps,
+            })));
+            return Ok(());
+        }
+        self.flush(b, steps, "q38.layer")?;
+        let hyper = download(b, self.bufs.hyper, t_n * hh)?;
+        let mut out = vec![0.0f32; t_n * hh];
+        let (pl, layer, state) = self.ple.as_mut().expect("PLE layer");
+        let gpu_state = self.ple_gpu.as_ref().filter(|_| !self.ple_host);
+        if let Some(g) = gpu_state {
+            state.conv = download(b, g.state, state.conv.len())?;
+        }
+        let w = ple_weights(wf, *pl)?;
+        layer.forward(&w, state, tokens, &hyper, &mut out, Some(io_pool))?;
+        if let Some(g) = gpu_state {
+            upload(b, g.state, &state.conv)?;
+        }
+        upload(b, self.bufs.ple_out, &out)?;
+        steps.push(Step::F(FamOp::Add { dst: self.bufs.hyper, src: self.bufs.ple_out, n: (t_n * hh) as u32 }));
         Ok(())
     }
 
@@ -982,23 +1283,35 @@ impl<B: Q38Exec> Q38Engine<B> {
             experts.record_pick(l, buckets.expert_ids[bi] as usize, cnt);
         }
         steps.push(Step::G(Op::ZeroBuffer { label: "q38.moe.out_sum_zero", buf: t(bu.out_sum), n_bytes: nt * h * 4 }));
+        if let Some(pf) = self.pf.as_mut() {
+            // The next decode token's guess: the chunk's last token's
+            // picks, strongest first.
+            let (li, lw) = (&idx[(n - 1) * k..], &wts[(n - 1) * k..]);
+            let mut order: Vec<usize> = (0..k).collect();
+            order.sort_by(|&a, &b| lw[b].total_cmp(&lw[a]));
+            let mut actual = [0i32; MAX_K];
+            for (d, &i) in actual.iter_mut().zip(&order) {
+                *d = li[i];
+            }
+            pf.record_actual(l, actual);
+        }
         let es = self.expert_size;
         let mut start = 0;
         while start < nb {
             let end = (start + k).min(nb);
             let ids = &buckets.expert_ids[start..end];
-            let read = b
-                .pool_mut()
-                .with_bytes_mut(bu.expert_base, |staging: &mut [u8]| {
-                    io_pool.install(|| {
-                        staging[..ids.len() * es]
-                            .par_chunks_mut(es)
-                            .zip(ids.par_iter())
-                            .try_for_each(|(dst, &e)| experts.read_expert(l, e as usize, dst))
-                    })
-                })
-                .map_err(|e| Q38EngineError::Other(format!("staging: {e}")))?;
-            read?;
+            {
+                let this = &*self;
+                // SAFETY: slot `i` (< top_k) for the group's bucket `i`
+                // only; no GPU work is in flight (the router flush or the
+                // previous group's flush waited), and prefill issues no
+                // prefetch into the demand slots.
+                let dsts: Vec<&mut [u8]> = (0..ids.len()).map(|i| unsafe { this.slot(i) }).collect();
+                io_pool.install(|| {
+                    dsts.into_par_iter().zip(ids.par_iter()).try_for_each(|(dst, &e)| experts.read_expert(l, e as usize, dst))
+                })?;
+            }
+            let bu = &self.bufs;
             let (a0, a1) = (buckets.offsets[start] as usize, buckets.offsets[end] as usize);
             let group = ExpertBuckets {
                 expert_ids: ids.to_vec(),
@@ -1083,6 +1396,12 @@ impl<B: Q38Exec> Q38Engine<B> {
         }));
         steps.push(matvec("q38.moe.shared_down_proj", m.down, bu.s_act, bu.s_down, si, h));
         self.flush(b, steps, "q38.layer")?;
+        if self.pf.as_ref().is_some_and(|p| p.lookahead()) {
+            // Layer l+1's set was last bound by layer l-1's experts,
+            // which the flush above completed.
+            self.prefetch_dispatch(l + 1, experts, io_pool);
+        }
+        let bu = &self.bufs;
 
         // Router (host): softmax, top-k, renormalized.
         let mut scores = download(b, bu.router_logits, c.num_experts)?;
@@ -1091,31 +1410,78 @@ impl<B: Q38Exec> Q38Engine<B> {
         moe_router_cpu_with(&mut scores, k, c.norm_topk_prob, &mut idx, &mut wts)?;
         let buckets = build_expert_buckets(&idx, &wts, 1, k, c.num_experts);
 
-        // Routed experts: bucket i's expert in staging slot i (hot tier
-        // or pread).
-        let es = self.expert_size;
+        // Routed experts: bucket i's expert from the hot tier or disk
+        // into staging slot i, or bound in place from the layer's
+        // prefetch set.
         let ids = buckets.expert_ids.clone();
         for &e in &ids {
             experts.record_pick(l, e as usize, 1);
         }
-        let read = b
-            .pool_mut()
-            .with_bytes_mut(bu.expert_base, |staging: &mut [u8]| {
-                io_pool.install(|| {
-                    staging[..ids.len() * es]
-                        .par_chunks_mut(es)
-                        .zip(ids.par_iter())
-                        .try_for_each(|(dst, &e)| experts.read_expert(l, e as usize, dst))
+        let io_t0 = std::time::Instant::now();
+        let first_pf = self.pf_first_slot(l);
+        let status = self.pf.as_mut().and_then(|p| p.begin_layer(l));
+        let hot = experts.hot_tier();
+        let mut expert_slots: Vec<u32> = (0..ids.len() as u32).collect();
+        let mut pf_buf: Vec<Option<usize>> = vec![None; ids.len()];
+        let (mut hot_n, mut hit_n) = (0u64, 0u64);
+        for (bi, &e) in ids.iter().enumerate() {
+            if hot.is_some_and(|h| h.contains(l, e as usize)) {
+                hot_n += 1;
+                continue;
+            }
+            if let Some(st) = &status {
+                if let Some(j) = st.loaded_indices[..st.k].iter().position(|&x| x == e) {
+                    pf_buf[bi] = Some(j);
+                    expert_slots[bi] = (first_pf + j) as u32;
+                    hit_n += 1;
+                }
+            }
+        }
+        {
+            let this = &*self;
+            // SAFETY: slot `bi` (< top_k) for bucket `bi` only; no GPU
+            // work is in flight (the flush above waited).
+            let dsts: Vec<&mut [u8]> = (0..ids.len()).map(|bi| unsafe { this.slot(bi) }).collect();
+            io_pool.install(|| {
+                dsts.into_par_iter().zip(ids.par_iter()).zip(pf_buf.par_iter()).try_for_each(|((dst, &e), pb)| {
+                    if pb.is_none() { experts.read_expert(l, e as usize, dst) } else { Ok(()) }
                 })
-            })
-            .map_err(|e| Q38EngineError::Other(format!("staging: {e}")))?;
-        read?;
+            })?;
+        }
+        for bi in 0..ids.len() {
+            let Some(j) = pf_buf[bi] else { continue };
+            let ok = self.pf.as_mut().is_some_and(|p| p.wait_slot(l, j));
+            if !ok {
+                // SAFETY: as above.
+                experts.read_expert_disk(l, ids[bi] as usize, unsafe { self.slot(bi) })?;
+                expert_slots[bi] = bi as u32;
+                hit_n -= 1;
+            }
+        }
+        experts.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
+        if let Some(pf) = self.pf.as_mut() {
+            let n = ids.len() as u64;
+            pf.record_outcome(hit_n, n - hit_n - hot_n);
+            experts.counters().record_decode_layer(l, hot_n, hit_n);
+            if let Some(prev) = pf.predict_for(l) {
+                experts.counters().record_guess(Guesser::PrevToken, k as u64, guess_overlap(&prev[..k], &idx));
+            }
+            // Strongest pick first: a prefetch of the top few reads the
+            // likeliest repeats.
+            let mut order: Vec<usize> = (0..k).collect();
+            order.sort_by(|&a, &b| wts[b].total_cmp(&wts[a]));
+            let mut actual = [0i32; MAX_K];
+            for (d, &i) in actual.iter_mut().zip(&order) {
+                *d = idx[i];
+            }
+            pf.record_actual(l, actual);
+        }
+        let bu = &self.bufs;
         let n_assign = buckets.token_idx.len();
-        let expert_slots: Vec<u32> = (0..ids.len() as u32).collect();
         let mut expert_indices = vec![0u32; n_assign];
         for bi in 0..ids.len() {
             let (s, e) = (buckets.offsets[bi] as usize, buckets.offsets[bi + 1] as usize);
-            expert_indices[s..e].fill(bi as u32);
+            expert_indices[s..e].fill(expert_slots[bi]);
         }
         upload(b, bu.bucket_token_idx, &buckets.token_idx)?;
         upload(b, bu.bucket_weights, &buckets.weights)?;
@@ -1132,7 +1498,7 @@ impl<B: Q38Exec> Q38Engine<B> {
         steps.push(Step::G(Op::MoeBatchedPermuteFuse {
             label: "q38.moe.permute_fuse",
             expert_base: t(bu.expert_base),
-            expert_stride: es as u64,
+            expert_stride: self.expert_size as u64,
             expert_indices: t(bu.expert_indices),
             expert_slots,
             bucket_input: t(bu.bucket_input),
@@ -1213,19 +1579,13 @@ impl<B: Q38Exec> Q38Engine<B> {
             n_tokens: nt,
         }));
         for l in 0..c.num_layers {
+            if n == 1 {
+                // Speculative reads are a decode thing: a chunk reads
+                // every expert it routes to anyway.
+                self.prefetch_dispatch(l, experts, io_pool);
+            }
             if self.ple.as_ref().is_some_and(|p| p.0 == l) {
-                self.flush(b, &mut steps, "q38.layer")?;
-                let hyper = download(b, self.bufs.hyper, n * c.hc_hidden())?;
-                let mut out = vec![0.0f32; n * c.hc_hidden()];
-                let (pl, layer, state) = self.ple.as_mut().expect("checked");
-                let w = ple_weights(wf, *pl)?;
-                layer.forward(&w, state, tokens, &hyper, &mut out, Some(io_pool))?;
-                upload(b, self.bufs.ple_out, &out)?;
-                steps.push(Step::F(FamOp::Add {
-                    dst: self.bufs.hyper,
-                    src: self.bufs.ple_out,
-                    n: (n * c.hc_hidden()) as u32,
-                }));
+                self.ple_layer(b, wf, io_pool, tokens, &mut steps)?;
             }
             let lr = self.w.layers[l].clone();
             self.hc_steps(&lr.attn_hc, nt, &mut steps);
@@ -1261,6 +1621,7 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         self.flush(b, &mut steps, "q38.tail")?;
         self.drain_pending_index(b)?;
+        self.drain_prefetch();
         if let Some(out) = logits {
             let v = download(b, self.bufs.logits, c.vocab)?;
             out.copy_from_slice(&v);
@@ -1335,7 +1696,14 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         if let Some((_, _, st)) = &self.ple {
             let mut ps = Vec::new();
-            st.save(&mut ps);
+            match self.ple_gpu.as_ref().filter(|_| !self.ple_host) {
+                Some(g) => {
+                    let mut st = st.clone();
+                    st.conv = download(b, g.state, st.conv.len())?;
+                    st.save(&mut ps);
+                }
+                None => st.save(&mut ps),
+            }
             out.extend_from_slice(&(ps.len() as u64).to_le_bytes());
             out.extend_from_slice(&ps);
         }
@@ -1399,6 +1767,9 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
             // Fixed size and inside `need`: cannot fail after the checks.
             st.load(&buf[o + 8..o + 8 + n])?;
+            if let Some(g) = &self.ple_gpu {
+                upload(b, g.state, &st.conv)?;
+            }
         }
         for (l, (lb, (a, bb, ix))) in self.layers.iter().zip(layer_data).enumerate() {
             match *lb {
@@ -1416,6 +1787,13 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         self.pos = pos;
         Ok(())
+    }
+}
+
+impl<B: Q38Exec> Drop for Q38Engine<B> {
+    fn drop(&mut self) {
+        // No prefetch worker may outlive the staging it writes.
+        self.drain_prefetch();
     }
 }
 
@@ -1443,6 +1821,17 @@ pub fn state_size_at(pos: usize) -> usize {
 /// `Q38S` little-endian.
 pub const Q38_STATE_MAGIC: u32 = u32::from_le_bytes(*b"Q38S");
 pub const Q38_STATE_VERSION: u32 = 1;
+
+/// Staging slot `i` of `es` bytes at host address `addr`.
+///
+/// # Safety
+/// `addr` is the start of the engine's staging buffer (alive, never
+/// moved, at least `(i + 1) · es` bytes); no other live slice of slot
+/// `i` and no GPU work reading it in flight.
+unsafe fn slot_at<'a>(addr: usize, es: usize, i: usize) -> &'a mut [u8] {
+    // SAFETY: the caller's contract.
+    unsafe { std::slice::from_raw_parts_mut((addr + i * es) as *mut u8, es) }
+}
 
 /// A one-token matvec step.
 fn matvec(label: &'static str, w: WeightRef, input: FBuf, output: FBuf, in_dim: u32, out_dim: u32) -> Step {
