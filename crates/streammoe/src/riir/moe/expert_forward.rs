@@ -1742,6 +1742,7 @@ fn encode_moe_gather(
                     packed_offset: w_off,
                     scales_offset: s_off,
                     biases_offset: b_off,
+                    group_size: GROUP_SIZE as u32,
                 },
                 input,
                 input_offset: 0,
@@ -1937,7 +1938,7 @@ pub fn encode_moe_gather_id_fuse(
                 ne11,
                 nb02: expert_stride,
                 nb01_w: lay.row_bytes(k_in as usize) as u64,
-                nb01_s: (k_in / 32) as u64, // (K/64)*2 bytes
+                nb01_s: (k_in as usize / GROUP_SIZE * 2) as u64,
                 packed_off,
                 scales_off,
                 biases_off,
@@ -1945,6 +1946,7 @@ pub fn encode_moe_gather_id_fuse(
                 nb11,
                 nb12,
                 bits: lay.bits,
+                group_size: GROUP_SIZE as u32,
             },
         );
     };

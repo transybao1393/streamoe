@@ -494,10 +494,40 @@ impl ExpertLayout {
 pub const RMS_NORM_EPS: f32 = 1e-6;
 #[cfg(feature = "model-olmoe-1b-7b")]
 pub const RMS_NORM_EPS: f32 = 1e-5;
-/// Quantization group size — 64 weights share one BF16 scale.
+/// Quantization group size of the variant's 4-bit (and packed 3-bit)
+/// weights: experts, projections, embedding, LM head. Per-variant:
+/// 64 for every MLX build so far, 32 for Qwen3.8-Flash-Next (its MLX
+/// 4-bit build uses `group_size = 32`). Scales and biases are
+/// `[out_dim, in_dim / GROUP_SIZE]` bf16.
+#[cfg(not(feature = "model-qwen3-8-flash-next"))]
 pub const GROUP_SIZE: usize = 64;
-/// 4-bit weight quantization (fixed for the qwen3_5_moe and
-/// DeepSeek-V3 families; both use MLX 4-bit `group_size = 64`).
+#[cfg(feature = "model-qwen3-8-flash-next")]
+pub const GROUP_SIZE: usize = 32;
+/// Quantization group size of 8-bit weights (the MoE router gate and
+/// `shared_expert_gate`). 64 for every variant; differs from
+/// [`GROUP_SIZE`] on Qwen3.8-Flash-Next.
+pub const GROUP_SIZE_8BIT: usize = 64;
+
+/// Group size of a quantized tensor with `bits` bits per weight: 8-bit
+/// tensors use [`GROUP_SIZE_8BIT`], 4-bit and 3-bit ones [`GROUP_SIZE`].
+/// The one rule every matvec, GEMM and CPU reference applies, so a
+/// [`crate::riir::backend::WeightRef`]'s `bits` alone picks the group.
+pub const fn group_size_for_bits(bits: u32) -> usize {
+    if bits == 8 { GROUP_SIZE_8BIT } else { GROUP_SIZE }
+}
+
+/// Bytes of one packed expert (`[gate | up | down]`, each block
+/// `[weights | bf16 scales | bf16 biases]`) for any shape, width and
+/// group size — what [`ExpertLayout::expert_size`] gives for the
+/// active variant (`group = GROUP_SIZE`). For converters and budgets
+/// that size a model other than the compiled one.
+pub const fn expert_bytes(hidden: usize, inter: usize, bits: usize, group: usize) -> usize {
+    let weights = inter * hidden * bits / 8;
+    let scales = inter * (hidden / group) * 2;
+    3 * (weights + 2 * scales)
+}
+/// 4-bit weight quantization (every variant's experts and projections;
+/// the group size is [`GROUP_SIZE`]).
 pub const BITS: usize = 4;
 
 /// RoPE base frequency. Per-variant: Qwen3 family uses 1e7 (much
@@ -887,6 +917,16 @@ const _: () = {
         VARIANT.hidden_dim % GROUP_SIZE == 0,
         "HIDDEN_DIM must be a multiple of GROUP_SIZE"
     );
+    // The qmv decode matvec, the MoE gather-id matmul (NK = 32) and
+    // MLX's qmm (BK = 32) read 32-weight chunks inside one group.
+    assert!(
+        GROUP_SIZE % 32 == 0 && GROUP_SIZE_8BIT % 32 == 0,
+        "group sizes must be multiples of 32"
+    );
+    assert!(
+        VARIANT.moe_intermediate % GROUP_SIZE == 0,
+        "moe_intermediate must be a multiple of GROUP_SIZE (down_proj groups)"
+    );
     assert!(
         VARIANT.num_experts_per_tok <= VARIANT.num_experts,
         "num_experts_per_tok must be ≤ num_experts"
@@ -1011,6 +1051,14 @@ mod tests {
         assert_eq!(ExpertLayout::from_expert_size(q3.expert_size() as u64), Some(q3));
         assert_eq!(ExpertLayout::from_expert_size(q4.expert_size() as u64), Some(q4));
         assert_eq!(ExpertLayout::from_expert_size(1), None);
+        assert_eq!(
+            q4.expert_size(),
+            expert_bytes(v.hidden_dim, v.moe_intermediate, 4, GROUP_SIZE)
+        );
+        assert_eq!(
+            q3.expert_size(),
+            expert_bytes(v.hidden_dim, v.moe_intermediate, 3, GROUP_SIZE)
+        );
         // GQA: heads must group cleanly.
         if matches!(v.attn_kind, AttnKind::Gqa) {
             assert_eq!(v.num_attn_heads % v.num_kv_heads, 0);
@@ -1018,6 +1066,32 @@ mod tests {
         if v.has_linear_attn() {
             assert!(v.linear_conv_dim() > 0);
         }
+    }
+
+    /// The per-bits group rule, and expert sizes at Qwen3.8-Flash-Next's
+    /// shape (hidden 2560, intermediate 640): group 32 doubles the
+    /// scales and biases, +11.1% per expert over group 64.
+    #[cfg(any(
+        feature = "model-qwen3-5-a17b",
+        feature = "model-qwen3-6-35b-a3b",
+        feature = "model-qwen3-8-flash-next",
+    ))]
+    #[test]
+    fn group_sizes_and_expert_bytes() {
+        assert_eq!(group_size_for_bits(8), GROUP_SIZE_8BIT);
+        assert_eq!(group_size_for_bits(4), GROUP_SIZE);
+        assert_eq!(group_size_for_bits(3), GROUP_SIZE);
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
+        assert_eq!(GROUP_SIZE, 64);
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        assert_eq!(GROUP_SIZE, 32);
+        assert_eq!(expert_bytes(2560, 640, 4, 64), 2_764_800);
+        assert_eq!(expert_bytes(2560, 640, 4, 32), 3_072_000);
+        assert_eq!(expert_bytes(2560, 640, 3, 32), 2_457_600);
+        assert_eq!(expert_bytes(2560, 640, 3, 64), 2_150_400);
+        // a3b at group 64: the 1.77 MB 4-bit / 1.38 MB packed 3-bit experts.
+        assert_eq!(expert_bytes(2048, 512, 4, 64), 1_769_472);
+        assert_eq!(expert_bytes(2048, 512, 3, 64), 1_376_256);
     }
 
     /// The qwen3_5_moe attention shape: gated q_proj, per-head Q/K

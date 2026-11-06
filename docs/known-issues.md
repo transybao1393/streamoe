@@ -295,6 +295,15 @@ history of `.claude/memory/`, which is no longer tracked.
   `STREAMMOE_MOE_GATHER_ID=0` fallbacks and the per-expert decode
   fallback (hidden > 4096, Cogito) have 4-bit kernels only. Every
   layer file must hold the same layout (`ExpertIoError::MixedLayouts`).
+- **Quantization group size is compile-time, per variant and per
+  bits** (`variants::group_size_for_bits`): 4-bit / packed 3-bit use
+  `GROUP_SIZE` (64; 32 under `model-qwen3-8-flash-next`), 8-bit use
+  `GROUP_SIZE_8BIT` (64). Every kernel takes `group_size` at runtime;
+  the MLX GEMMs (`QmmCall` / `GatherQmmCall`) are instantiated for 64
+  and 32 only, and group 32 has only the default BM=32 gather tile
+  (`STREAMMOE_GATHER_QMM_TILE` is ignored there). A model converted at
+  another group size gives wrong output, not an error — nothing checks
+  the manifest's scale shapes against it yet.
 - Bounded prefill staging (`prefill_staging_experts` below the expert
   count, or the capped fallback) always uses `MoeGatherIdFuse`;
   `STREAMMOE_MOE_GATHER_ID=0` is ignored there.
