@@ -87,6 +87,9 @@ pub enum FamOp {
     GatedRmsNormSigmoid { values: FBuf, z: FBuf, weight_off: u64, out: FBuf, dim: u32, n_groups: u32, eps: f32 },
     /// `dst[i] += src[i]`, `n` values.
     Add { dst: FBuf, src: FBuf, n: u32 },
+    /// `dst[r, :] = src[idx[r], :]` for `n_rows` rows of `width` (`idx`
+    /// i32: the MoE assignment rows from the token rows, on the GPU).
+    GatherRows { src: FBuf, idx: FBuf, dst: FBuf, width: u32, n_rows: u32 },
 }
 
 /// One entry of a pass.
@@ -193,6 +196,20 @@ kernel void q38e_add(
 {
     if (i < n) dst[i] += src[i];
 }
+
+// dst[r, :] = src[idx[r], :] over total = n_rows * width.
+kernel void q38e_gather_rows(
+    device const float* src   [[buffer(0)]],
+    device const int*   idx   [[buffer(1)]],
+    device float*       dst   [[buffer(2)]],
+    constant uint&      width [[buffer(3)]],
+    constant uint&      total [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= total) return;
+    uint r = i / width;
+    dst[i] = src[(ulong)idx[r] * width + (i - r * width)];
+}
 "#;
 
 /// Encoders of the kernels in [`Q38_ENGINE_SHADERS`]: the one place
@@ -201,6 +218,7 @@ pub struct Q38EngineKernels {
     pub head_norm: ComputePipelineState,
     pub gated_norm_sigmoid: ComputePipelineState,
     pub add: ComputePipelineState,
+    pub gather_rows: ComputePipelineState,
 }
 
 fn grid1(n: u32, tg: u32) -> (MTLSize, MTLSize) {
@@ -230,6 +248,7 @@ impl Q38EngineKernels {
             head_norm: p("q38e_head_norm_one_plus")?,
             gated_norm_sigmoid: p("q38e_gated_rms_norm_sigmoid")?,
             add: p("q38e_add")?,
+            gather_rows: p("q38e_gather_rows")?,
         })
     }
 
@@ -303,6 +322,33 @@ impl Q38EngineKernels {
         enc.dispatch_thread_groups(g, t);
         enc.end_encoding();
     }
+
+    /// `dst[r, :] = src[idx[r], :]`, `n_rows` rows of `width` (`idx` i32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gather_rows(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        src: &BufferRef,
+        idx: &BufferRef,
+        dst: &BufferRef,
+        width: u32,
+        n_rows: u32,
+    ) {
+        let total = width * n_rows;
+        if total == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.gather_rows);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(idx), 0);
+        enc.set_buffer(2, Some(dst), 0);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, total);
+        let (g, t) = grid1(total, 256);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
+    }
 }
 
 /// The family's Metal pipelines.
@@ -347,6 +393,9 @@ impl Q38Exec for MetalBackend {
                 fam.eng.encode_gated_rms_norm_sigmoid(cmd, h(values), h(z), wbuf, weight_off, h(out), dim, n_groups, eps)
             }
             FamOp::Add { dst, src, n } => fam.eng.encode_add(cmd, h(dst), h(src), n),
+            FamOp::GatherRows { src, idx, dst, width, n_rows } => {
+                fam.eng.encode_gather_rows(cmd, h(src), h(idx), h(dst), width, n_rows)
+            }
         }
     }
 }
@@ -473,6 +522,16 @@ impl Q38Exec for CpuBackend {
                 let mut dv = f32s_mut(pool.handle(dst));
                 for (d, s) in dv.iter_mut().zip(&sv) {
                     *d += s;
+                }
+            }
+            FamOp::GatherRows { src, idx, dst, width, n_rows } => {
+                let w = width as usize;
+                let sv = f32s(pool.handle(src));
+                let iv = std::cell::Ref::map(pool.handle(idx).borrow(), |v| bytemuck::cast_slice::<u8, i32>(v.as_slice()));
+                let mut dv = f32s_mut(pool.handle(dst));
+                for (r, row) in dv[..w * n_rows as usize].chunks_mut(w).enumerate() {
+                    let s = iv[r] as usize;
+                    row.copy_from_slice(&sv[s * w..(s + 1) * w]);
                 }
             }
         }

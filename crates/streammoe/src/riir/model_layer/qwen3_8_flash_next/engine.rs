@@ -512,6 +512,9 @@ pub struct Q38Engine<B: Q38Exec> {
     expert_size: usize,
     /// Tokens consumed (the next token's position).
     pos: usize,
+    /// A dense QSA layer's indexer step not run yet: `(layer, pos,
+    /// n_tokens)` ([`Self::drain_pending_index`]).
+    pending_index: Option<(usize, usize, usize)>,
     /// Command buffers submitted so far ([`Self::submits`]).
     submits: std::sync::atomic::AtomicU64,
 }
@@ -624,6 +627,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             n_ctx,
             expert_size,
             pos: 0,
+            pending_index: None,
             submits: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -662,6 +666,7 @@ impl<B: Q38Exec> Q38Engine<B> {
         if let Some((_, _, st)) = self.ple.as_mut() {
             st.reset();
         }
+        self.pending_index = None;
         self.pos = 0;
         Ok(())
     }
@@ -800,8 +805,24 @@ impl<B: Q38Exec> Q38Engine<B> {
         Ok(())
     }
 
+    /// Run the QSA indexer step a dense QSA layer left for later
+    /// ([`Self::pending_index`]): read its `idx_qk` rows back (the
+    /// submit that computed them has completed) and cache the raw
+    /// keys.
+    fn drain_pending_index(&mut self, b: &B) -> Result<()> {
+        let Some((l, pos, n)) = self.pending_index.take() else { return Ok(()) };
+        let AttnRefs::Qsa(q) = &self.w.layers[l].attn else { unreachable!() };
+        let shape = self.qsa;
+        let idx_qk = download(b, self.bufs.idx_qk, n * shape.idx_proj_dim())?;
+        let positions: Vec<[i32; 3]> = (pos..pos + n).map(|p| [p as i32; 3]).collect();
+        let cache = self.indexer[l].as_mut().expect("QSA layer has an indexer cache");
+        qsa_indexer_step(&shape, &idx_qk, &positions, &q.idx_q_norm, cache);
+        Ok(())
+    }
+
     /// QSA on `mixed` into `block_out` for the token at `self.pos`.
     fn qsa_layer(&mut self, b: &mut B, l: usize, steps: &mut Vec<Step>) -> Result<()> {
+        self.drain_pending_index(b)?;
         let AttnRefs::Qsa(q) = &self.w.layers[l].attn else { unreachable!() };
         let qw = q.w;
         let idx_q_norm = q.idx_q_norm.clone();
@@ -825,6 +846,19 @@ impl<B: Q38Exec> Q38Engine<B> {
                 }
                 op => steps.push(Step::G(op)),
             }
+        }
+        if !qsa_needs_sparse(&shape, self.mode, pos + 1) {
+            // Dense is exact: the indexer only has to cache this
+            // token's raw key, which can wait for the router's submit
+            // (no extra command buffer).
+            let mut g = Graph::new();
+            push_qsa_sdpa(&mut g, &shape, &bufs, 1, pos);
+            steps.extend(g.ops.drain(..).map(Step::G));
+            self.pending_index = Some((l, pos, 1));
+            let mut g = Graph::new();
+            push_qsa_o_proj(&mut g, &shape, &qw, &bufs, 1);
+            steps.extend(g.ops.drain(..).map(Step::G));
+            return Ok(());
         }
         self.flush(b, steps, "q38.qsa_pre")?;
         // Indexer (host), every token: the raw keys must be cached
@@ -892,7 +926,6 @@ impl<B: Q38Exec> Q38Engine<B> {
         let mut wts = vec![0.0f32; k];
         moe_router_cpu_with(&mut scores, k, c.norm_topk_prob, &mut idx, &mut wts)?;
         let buckets = build_expert_buckets(&idx, &wts, 1, k, c.num_experts);
-        let mixed = download(b, bu.mixed, c.hidden)?;
 
         // Routed experts: bucket i's expert in staging slot i (hot tier
         // or pread).
@@ -920,14 +953,17 @@ impl<B: Q38Exec> Q38Engine<B> {
             let (s, e) = (buckets.offsets[bi] as usize, buckets.offsets[bi + 1] as usize);
             expert_indices[s..e].fill(bi as u32);
         }
-        let mut bucket_input = vec![0.0f32; n_assign * c.hidden];
-        for row in bucket_input.chunks_mut(c.hidden) {
-            row.copy_from_slice(&mixed);
-        }
-        upload(b, bu.bucket_input, &bucket_input)?;
         upload(b, bu.bucket_token_idx, &buckets.token_idx)?;
         upload(b, bu.bucket_weights, &buckets.weights)?;
         upload(b, bu.expert_indices, &expert_indices)?;
+        // Each assignment row gets its token's MoE input, on the GPU.
+        steps.push(Step::F(FamOp::GatherRows {
+            src: bu.mixed,
+            idx: bu.bucket_token_idx,
+            dst: bu.bucket_input,
+            width: h,
+            n_rows: n_assign as u32,
+        }));
         steps.push(Step::G(Op::ZeroBuffer { label: "q38.moe.out_sum_zero", buf: t(bu.out_sum), n_bytes: h * 4 }));
         steps.push(Step::G(Op::MoeBatchedPermuteFuse {
             label: "q38.moe.permute_fuse",
@@ -1026,6 +1062,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             ));
         }
         self.flush(b, &mut steps, "q38.tail")?;
+        self.drain_pending_index(b)?;
         if let Some(out) = logits {
             let v = download(b, self.bufs.logits, c.vocab)?;
             out.copy_from_slice(&v);
