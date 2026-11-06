@@ -172,6 +172,68 @@ fn ctx_checkpoints_round_trip() {
     assert_eq!(ctx.memory_seq_pos_max(0), -1);
 }
 
+/// The default prefill settings through the context under a cap: a
+/// 560-token prompt runs as a 512-token chunk plus 48 (prefill staging
+/// at the padded stride, whole-layer reads, reads overlapping the GPU),
+/// matches `eval_token` row by row on its last row within the Metal
+/// tolerance, and the footprint stays under the cap; with the hot
+/// tier, bit for bit the same logits as without.
+#[test]
+fn ctx_long_prompt_default_prefill_under_cap() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38_engine] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let m = dir.join("streammoe");
+    let a = m.join("artifacts");
+    let cap = 2 * GIB;
+    let open = |hot: Option<u64>| {
+        let cfg = OpenConfig { n_ctx: 576, mem_cap: Some(cap), hot_tier_bytes: hot, ..OpenConfig::default() };
+        Ctx::open_with(
+            &a.join("model_weights.bin"),
+            &a.join("model_weights.json"),
+            &a.join("vocab.bin"),
+            &m.join("root"),
+            false,
+            &cfg,
+        )
+        .expect("open the tiny model")
+    };
+    let mut ctx = open(Some(0));
+    let v = ctx.n_vocab();
+    let prompt: Vec<i32> = (0..560).map(|i| ((i * 37 + 5) % v) as i32).collect();
+    let mut per_token = vec![0.0f32; v];
+    for (i, &t) in prompt.iter().enumerate() {
+        ctx.eval_token(t, i, 0, &mut per_token).unwrap();
+    }
+    ctx.memory_clear();
+    let mut batched = vec![0.0f32; v];
+    ctx.eval_prompt(&prompt, 0, 0, &mut batched).unwrap();
+    let e = rel_err(&batched, &per_token);
+    let st = ctx.expert_io_stats();
+    let fp = ctx.footprint().expect("footprint");
+    eprintln!(
+        "[q38_engine] 560-token prompt: eval_prompt vs eval_token rel err {e:.3e}; prefill reads {} ({} B); \
+         footprint {:.1} MiB of cap {} MiB",
+        st.prefill.reads,
+        st.prefill.bytes,
+        fp.current as f64 / (1u64 << 20) as f64,
+        cap >> 20
+    );
+    assert!(e <= 1e-3, "eval_prompt vs eval_token: {e}");
+    assert!(st.prefill.reads > 0, "the prompt read its experts as prefill");
+    assert!(fp.current <= cap, "footprint over the cap");
+    // The hot tier takes the rest of the cap: same logits.
+    let mut ctx = open(None);
+    let mut hot = vec![0.0f32; v];
+    ctx.eval_prompt(&prompt, 0, 0, &mut hot).unwrap();
+    ctx.memory_clear();
+    ctx.eval_prompt(&prompt, 0, 0, &mut hot).unwrap();
+    assert!(ctx.expert_io_stats().hot.unwrap_or_default().hits > 0, "no hot-tier hits");
+    assert!(hot.iter().zip(&batched).all(|(x, y)| x.to_bits() == y.to_bits()), "hot tier changed the logits");
+    assert!(ctx.footprint().expect("footprint").current <= cap);
+}
+
 /// What the family does not support is refused at open.
 #[test]
 fn ctx_rejects_unsupported_config() {

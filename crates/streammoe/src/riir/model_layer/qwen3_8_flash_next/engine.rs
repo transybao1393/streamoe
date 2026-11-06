@@ -26,7 +26,8 @@
 //!   router (host softmax top-k), shared expert + sigmoid gate (graph)
 //!   routed experts: read (hot tier / pread) into the top_k staging
 //!     slots, rows gathered on the GPU, Op::MoeBatchedPermuteFuse
-//!     (a chunk: tokens grouped by expert, top_k experts per group)
+//!     (a chunk: tokens grouped by expert, batches of the prefill
+//!     staging's half, reads overlapping the previous batch's GPU work)
 //!   y = experts + sigmoid(g) · shared                  combine against zero (no residual)
 //!   hyper += y ⊗ inj
 //! x = gated_residual(mixer, hyper) → lm_head           last row; no final norm
@@ -62,8 +63,9 @@
 //! **Command buffers.** One per layer: everything from the previous
 //! layer's experts to this layer's router logits, which the host reads
 //! to pick the experts to load. On top of that: a QSA layer past the budget (the host
-//! scores blocks from the chunk's indexer projection), each extra
-//! expert group of a chunk, and the tail. A QSA layer within the budget
+//! scores blocks from the chunk's indexer projection), each expert
+//! batch of a chunk (committed without waiting when the staging has two
+//! halves), and the tail. A QSA layer within the budget
 //! adds none: its indexer keys are read back after the router's submit
 //! (`drain_pending_index`). Tiny model, decode: 5 per token
 //! within the budget, 6 past it ([`Q38Engine::submits`]). The QSA Q / K
@@ -74,11 +76,19 @@
 //! ## Prefill
 //!
 //! [`Q38Engine::eval`] runs the prompt in chunks of
-//! [`Q38Engine::prefill_chunk`] tokens through the same ops at `T`
-//! rows ([`Q38Engine::forward_chunk`]; a token is `T = 1`). Within f32
-//! rounding of a step per token (bit-identical on the CPU backend);
-//! `batched_prefill_matches_per_token` checks logits, state and the
-//! decode after it on both backends, past the QSA budget.
+//! [`Q38Engine::prefill_chunk`] tokens (default 512) through the same
+//! ops at `T` rows ([`Q38Engine::forward_chunk`]; a token is `T = 1`).
+//! Within f32 rounding of a step per token (bit-identical on the CPU
+//! backend); `batched_prefill_matches_per_token` and `prefill_io_tests`
+//! check logits, state and the decode after it on both backends, past
+//! the QSA budget.
+//!
+//! A chunk's experts go through their own staging
+//! ([`Q38PrefillIo`], [`super::prefill_io`]): slots at the files' padded
+//! stride, so a run of experts is one pread; a layer that needs most of
+//! its experts is read whole in large preads; the slots split in two
+//! halves so one batch's reads run while the GPU computes the previous
+//! batch (committed without waiting).
 //!
 //! ## Not supported yet
 //!
@@ -1569,10 +1579,14 @@ impl<B: Q38Exec> Q38Engine<B> {
     /// then inject. The routing reads back every token's router logits
     /// (one submit), then groups the tokens by expert like the batched
     /// prefill of the other families (`build_expert_buckets`, one
-    /// `Op::MoeBatchedPermuteFuse` per group): the experts the chunk
-    /// picked are read into the `top_k` staging slots `top_k` at a time,
-    /// each group adding its buckets into `out_sum`. Every group but
-    /// the last is one more submit (the staging slots are reused).
+    /// `Op::MoeBatchedPermuteFuse` per batch): the experts the chunk
+    /// picked go into the prefill staging batch by batch
+    /// ([`plan_prefill_batches`]: hot-tier copies, runs of adjacent
+    /// experts in one pread, the whole layer when most of it is
+    /// needed), each batch adding its buckets into `out_sum` in
+    /// ascending expert order. With two or more staging slots, batch i
+    /// uses half i % 2 and its pass is committed without waiting, so
+    /// batch i + 1's reads run under it.
     fn moe_layer_n(
         &mut self,
         b: &mut B,

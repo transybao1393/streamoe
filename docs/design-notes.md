@@ -506,8 +506,8 @@ waits for every earlier command buffer (the prefetch's set reuse
 relies on it).
 
 **Batched prefill** (`Q38Engine::eval` → `forward_chunk`). The prompt
-runs in chunks of `STREAMMOE_Q38_CHUNK` tokens (default 64, at most
-`n_ctx`), the same ops at T rows: the Gated Residual ops and matvecs
+runs in chunks of `STREAMMOE_Q38_CHUNK` tokens (default 512, at most
+`n_ctx`; 64 before q38-prefill-io), the same ops at T rows: the Gated Residual ops and matvecs
 (MLX `qmm` at T > 1), the Gated DeltaNet conv / recurrence ops (they
 walk the chunk in order, so no chunked GDN kernel is needed),
 `push_qsa_pre_sdpa` over the chunk then dense SDPA, or past the budget
@@ -515,11 +515,12 @@ host block selection (`qsa_select_rows`) and the GPU sparse-rows kernel,
 so no K / V copies to the host in prefill or decode. The MoE groups the
 chunk's tokens by expert (`build_expert_buckets`, as the other
 families' batched prefill does) and runs `MoeBatchedPermuteFuse` per
-group of `top_k` experts through the demand slots; each extra group is
-one more submit. The final mixer and LM head run on the last row and
-only when logits are wanted. The per-token buffers hold a chunk; the
-plan's `PrefillScratch` counts them (~50 MB at 64 rows on the real
-model).
+batch of experts in the prefill staging (below). The final mixer and
+LM head run on the last row and only when logits are wanted. The
+per-token buffers hold a chunk; the plan's `PrefillScratch` counts
+them, the QSA row lists (allocated at build to their bound,
+`chunk · min(n_ctx, budget + 3)` rows) and the host copies a chunk
+makes: ~490 MB at 512 rows on the real model (~62 MB at 64).
 
 Tiny model (debug build, Metal, 48-token prompt, indicative): 336 → 14
 command buffers, ~350 → ~5,600 tok/s. Batched vs a step per token
@@ -527,6 +528,77 @@ command buffers, ~350 → ~5,600 tok/s. Batched vs a step per token
 8-token budget): logits 1.3e-6, state ~1e-17, the next decode tokens
 1.1e-6 on Metal; bit-identical on the CPU backend.
 
-On the real model a 64-token chunk routes to ~300 distinct experts per
-layer, read 10 at a time with the GPU idle meanwhile; overlapping the
-reads of the next group with the GPU work of this one is the next step.
+### Prefill expert reads in the engine
+
+`prefill_io.rs`, `Q38Engine::moe_layer_n`. A chunk's experts no longer
+go through the `top_k` decode slots: they have their own staging,
+`Q38PrefillIo::slots` slots (`STREAMMOE_Q38_PREFILL_SLOTS`, default
+64) at the expert files' padded stride, so experts `a..b` of a layer
+are one contiguous pread into consecutive slots
+(`ExpertFiles::read_span_disk`; the permute-fuse kernels take any
+stride ≥ the 4-bit expert size). The plan counts it as
+`PrefillStaging` (197 MB on the real model).
+
+**Whole-layer read.** With `N` of a layer's `E` experts to read, `N`
+separate reads cost `N · (size / BW + c)`, one sequential read of the
+layer `E · stride / BW`; the layer read wins once
+`N / E ≥ stride / (size + c · BW)`. With `c · BW` = 512 KiB (~0.3 ms
+at 1.7 GB/s) that is 0.86 on the real model and 0.06 on the tiny one
+(`STREAMMOE_Q38_LAYER_READ_FRAC`: 0 forces it, above 1 turns it off).
+Then every gap between the experts to read is read through, in preads
+of up to `STREAMMOE_Q38_MAX_READ` (16, ~47 MiB) experts; otherwise only
+adjacent experts share a pread. Hot-tier experts are copied unless they
+fall inside a read range (then read with it).
+
+**Batches and overlap.** `plan_prefill_batches` cuts the buckets into
+batches whose experts fit half the staging (32 experts by default);
+each batch is one permute-fuse, all its preads and hot copies in flight
+at once on the IO pool. Batch i uses half i % 2 and a metadata set
+(bucket token indices, weights, row → slot) of its own; its pass is
+committed without waiting (`Backend::submit_nowait`), so batch i + 1's
+reads run while the GPU computes batch i. Before a half is rewritten
+the engine waits for the pass two batches back; every synchronous
+flush waits for all passes in flight. One slot: one batch at a time,
+no overlap. The bucket scratch is shared (the GPU runs passes in
+order); the experts are added into `out_sum` in ascending expert order
+whatever the batching, so the CPU backend is bit-identical to a step
+per token, and on Metal every arm gave the same bits.
+
+**Memory.** Under a cap `q38_ctx::plan` builds the plan with the
+environment's settings and, while it does not fit, halves the staging
+down to 16 slots, then the chunk down to 64, then the staging down to
+2 (`Q38PrefillIo::shrink`); the engine is built with what fits.
+
+**Counters** (`Q38Engine::prefill_io_stats`, per chunk
+`last_chunk_io_stats`, `STREAMMOE_Q38_IO_TRACE=1` prints each chunk):
+layers read whole, routed experts, hot copies, experts read and read
+through, preads, bytes, batches, host time waiting on reads and on the
+GPU. Tiny model (4 layers × 8 experts, top 3, 30,720 B experts at a
+32,768 B stride; 560-token prompt; Metal, debug build):
+
+| Arm | Preads | Avg read | Batches | Submits |
+| --- | --- | --- | --- | --- |
+| Chunk 512, layer read, 64 slots | 8 | 256 KiB | 8 | 38 |
+| Chunk 512, one expert per pread, 1 slot | 64 | 32 KiB | 64 | 86 |
+| Chunk 512, expert reads, 6 slots | 24 | 85 KiB | 24 | 54 |
+| Chunk 64, layer read | 36 | 256 KiB | 36 | 108 |
+| Chunk 5, expert reads, 4 slots | 1,773 | 58 KiB | 1,760 | 2,448 |
+
+A 512-token chunk reads each layer once (8 experts, one 256 KiB pread);
+at 5 tokens the same prompt reads 3,228 experts. Tiny reads come from
+the page cache, so the times say nothing about the real model.
+
+**Estimate, real model** (external SSD ~1.7 GB/s, no hot tier). A
+64-token chunk routes to ~368 of 512 experts per layer — what uniform
+routing gives, `512 · (1 − e^(−640/512))` = 365 — so 512 tokens
+(5,120 picks) reach essentially all of them, `512 · (1 − e^(−10))`.
+That is a whole-layer read: 512 × 3,080,192 B = 1.58 GB per layer,
+75.7 GB per chunk over 48 layers, 44.5 s at 1.7 GB/s, ~148 MB per
+token (64-token chunks: 368 × 3.07 MB × 48 / 64 = ~850 MB per token).
+The GPU work of a 512-token chunk (~6 TFLOP of active weights) runs
+under the reads except each layer's attention and router, which the
+reads wait for: **~11 tok/s** prefill, against ~2 tok/s for the same
+arithmetic at 64 (5.7× fewer bytes per token). Only for prompts of
+~512 tokens or more: a 100-token prompt still reaches ~440 experts per
+layer (~2.6 tok/s). Next: start a whole-layer read before the router
+(it does not depend on the routing).
