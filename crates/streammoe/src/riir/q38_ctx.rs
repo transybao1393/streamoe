@@ -16,13 +16,14 @@
 //! - M-RoPE positions (`eval_stage_mrope`).
 //!
 //! Prefill runs in chunks of `STREAMMOE_Q38_CHUNK` tokens (default
-//! 64; [`engine::prefill_chunk`]) through [`Q38Engine::eval`].
+//! 512; [`engine::prefill_chunk`]) through [`Q38Engine::eval`]; under a
+//! cap [`plan`] may pick a smaller chunk ([`Q38PrefillIo`]).
 
 use std::path::PathBuf;
 
 use super::budget::{Account, BudgetPlan};
 use super::config::OpenConfig;
-use super::model_layer::qwen3_8_flash_next::engine::{self, Q38Engine, Q38EngineError, Q38PlanBytes};
+use super::model_layer::qwen3_8_flash_next::engine::{self, Q38Engine, Q38EngineError, Q38PlanBytes, Q38PrefillIo};
 use super::snapshot::state_snapshot::StateSnapshotError;
 use super::io::expert_io_mode::ExpertIoMode;
 use super::{KvFormat, MetalBackend, PrefetchState, RsCtx, RsError, StageInput, StageOutput};
@@ -32,11 +33,14 @@ pub(crate) struct Q38Slot {
     /// `experts_dir` (holds `ngram.mfng` and `packed_experts/`).
     pub root: PathBuf,
     pub engine: Option<Q38Engine<MetalBackend>>,
+    /// Prefill settings the budget plan fitted to the cap (`None`
+    /// uncapped: [`Q38PrefillIo::for_root`]).
+    pub io: Option<Q38PrefillIo>,
 }
 
 impl Q38Slot {
-    pub fn new(root: &std::path::Path) -> Self {
-        Self { root: root.to_path_buf(), engine: None }
+    pub fn new(root: &std::path::Path, io: Option<Q38PrefillIo>) -> Self {
+        Self { root: root.to_path_buf(), engine: None, io }
     }
 }
 
@@ -64,31 +68,47 @@ pub(crate) fn check_config(config: &OpenConfig) -> Result<(), RsError> {
 /// The engine's buffers in the budget plan, on the existing accounts:
 /// QSA K / V → `Kv`; Gated DeltaNet state plus the host family state
 /// (indexer keys, PLE state, n-gram row cache) → `LinearState`; the
-/// expert staging (K demand slots + two prefetch sets) → `ExpertSlots`;
-/// per-token scratch at the prefill chunk's rows → `PrefillScratch`. No
-/// prefill staging (a chunk's experts go through the `top_k` demand
-/// slots, `top_k` at a time), no KV scratch, no multi-decode buffers.
+/// decode expert staging (K demand slots + two prefetch sets) →
+/// `ExpertSlots`; everything sized by the prefill chunk →
+/// `PrefillScratch`. No KV scratch, no multi-decode buffers.
+///
+/// Returns the prefill settings the engine must be built with: the
+/// environment's ([`Q38PrefillIo::for_root`]), shrunk while the plan
+/// does not fit `cap` (the chunk halved down to 64 tokens), so the
+/// hot tier is what gives way last.
 pub(crate) fn plan(
     plan: &mut BudgetPlan,
     n_ctx: usize,
     expert_size: u64,
     root: &std::path::Path,
     prefetch_experts: usize,
-) -> Result<Q38PlanBytes, RsError> {
+    cap: u64,
+) -> Result<Q38PrefillIo, RsError> {
     let ngram = super::model_layer::qwen3_8_flash_next::ngram::NgramTable::open(
         &engine::ngram_path(root),
         engine::ngram_cache_rows(),
     )
     .map_err(|e| unsupported(&format!("n-gram table: {e}")))?;
-    let p = engine::plan_bytes_with(n_ctx, expert_size as usize, ngram.cache_bytes(), prefetch_experts);
-    plan.set(Account::Kv, p.kv);
-    plan.set(Account::KvScratch, 0);
-    plan.set(Account::LinearState, p.linear_state + p.family_state);
-    plan.set(Account::ExpertSlots, p.expert_slots);
-    plan.set(Account::PrefillStaging, 0);
-    plan.set(Account::PrefillScratch, p.scratch);
-    plan.set(Account::MultiDecode, 0);
-    Ok(p)
+    let mut io = Q38PrefillIo::for_root(root, n_ctx, expert_size as usize);
+    let want = io;
+    loop {
+        let p: Q38PlanBytes =
+            engine::plan_bytes_io(n_ctx, expert_size as usize, ngram.cache_bytes(), prefetch_experts, &io);
+        plan.set(Account::Kv, p.kv);
+        plan.set(Account::KvScratch, 0);
+        plan.set(Account::LinearState, p.linear_state + p.family_state);
+        plan.set(Account::ExpertSlots, p.expert_slots);
+        plan.set(Account::PrefillStaging, 0);
+        plan.set(Account::PrefillScratch, p.scratch);
+        plan.set(Account::MultiDecode, 0);
+        if plan.check(cap).is_ok() || !io.shrink() {
+            break;
+        }
+    }
+    if io != want {
+        eprintln!("[q38] prefill settings {want:?} do not fit the cap; using {io:?}");
+    }
+    Ok(io)
 }
 
 fn eval_err(e: Q38EngineError) -> RsError {
@@ -123,7 +143,8 @@ impl RsCtx<MetalBackend> {
         pf.set_lookahead(self.prefetch.lookahead());
         let Self { backend, wf, q38, n_ctx, .. } = self;
         let b = backend.as_mut().expect("just built");
-        let e = Q38Engine::with_prefetch(b, wf, &q38.root, *n_ctx, es, Some(pf)).map_err(|e| {
+        let io = q38.io.unwrap_or_else(|| Q38PrefillIo::for_root(&q38.root, *n_ctx, es));
+        let e = Q38Engine::with_options(b, wf, &q38.root, *n_ctx, es, Some(pf), io).map_err(|e| {
             eprintln!("[q38] engine init failed: {e}");
             RsError::InitFailed
         })?;

@@ -691,6 +691,9 @@ impl RsCtx<MetalBackend> {
         let mut prefill_staging_experts =
             budget::staging_experts(config.prefill_staging_experts.unwrap_or(VARIANT.num_experts));
         let mut planned_exact = None;
+        // The family engine's prefill settings, fitted to the cap.
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        let mut q38_io = None;
         if let Some(cap) = config.mem_cap {
             let weights_bytes = io::weight_file::filtered_bytes(weights, manifest, keep)
                 .map_err(|_| RsError::InitFailed)?;
@@ -733,8 +736,15 @@ impl RsCtx<MetalBackend> {
             // Staging every expert of a layer does not fit: bound it,
             // and let the batched MoE layer run in expert groups.
             #[cfg(feature = "model-qwen3-8-flash-next")]
-            q38_ctx::plan(&mut plan, n_ctx, expert_size, experts_dir, config.resolved_prefetch_experts())?;
-            if config.prefill_staging_experts.is_none() && plan.check(cap).is_err() {
+            {
+                let pf = config.resolved_prefetch_experts();
+                q38_io = Some(q38_ctx::plan(&mut plan, n_ctx, expert_size, experts_dir, pf, cap)?);
+            }
+            // (Qwen3.8-Flash-Next sizes its own prefill staging above.)
+            if !cfg!(feature = "model-qwen3-8-flash-next")
+                && config.prefill_staging_experts.is_none()
+                && plan.check(cap).is_err()
+            {
                 let bounded = budget::staging_experts(budget::BOUNDED_STAGING_EXPERTS);
                 if bounded < prefill_staging_experts && plan.get(budget::Account::PrefillStaging) > 0 {
                     prefill_staging_experts = bounded;
@@ -906,7 +916,7 @@ impl RsCtx<MetalBackend> {
             requests: requests::RequestTable::new(config.max_requests),
             parked,
             #[cfg(feature = "model-qwen3-8-flash-next")]
-            q38: q38_ctx::Q38Slot::new(experts_dir),
+            q38: q38_ctx::Q38Slot::new(experts_dir, q38_io),
         };
         if hot_tier_bytes >= expert_size {
             ctx.attach_hot_tier(hot_tier_bytes, config.hot_tier_profile.as_deref())?;

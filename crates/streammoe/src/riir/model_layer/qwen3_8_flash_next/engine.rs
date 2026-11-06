@@ -103,7 +103,7 @@ use super::config::{
 use super::engine_exec::{retag, run_steps, FBuf, FamOp, Q38Exec, Step};
 use super::ngram::{NgramConfig, NgramTable};
 use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
-use super::qsa::gpu::qsa_select_rows;
+use super::qsa::gpu::{qsa_select_rows, QsaRowLists};
 use super::ple_gpu::PleOp;
 use super::qsa::{
     push_qsa_o_proj, push_qsa_pre_sdpa, push_qsa_sdpa, qsa_indexer_step, qsa_needs_sparse,
@@ -211,16 +211,32 @@ pub fn ngram_cache_rows() -> usize {
         .unwrap_or(16384)
 }
 
+/// Default tokens per prefill chunk. A 512-token chunk routes to
+/// nearly every expert of a layer on the real model (64 tokens: ~368
+/// of 512), so each expert read serves ~10 tokens instead of ~1.7.
+pub const DEFAULT_PREFILL_CHUNK: usize = 512;
+
 /// Tokens per prefill chunk for an `n_ctx` context
-/// (`STREAMMOE_Q38_CHUNK`, default 64, at most `n_ctx`): the row count
-/// of every per-token buffer.
+/// (`STREAMMOE_Q38_CHUNK`, default [`DEFAULT_PREFILL_CHUNK`], at most
+/// `n_ctx`): the row count of every per-token buffer. Under a memory
+/// cap the context may pick a smaller one (`q38_ctx::plan`).
 pub fn prefill_chunk(n_ctx: usize) -> usize {
     std::env::var("STREAMMOE_Q38_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64usize)
+        .unwrap_or(DEFAULT_PREFILL_CHUNK)
         .min(n_ctx)
         .max(1)
+}
+
+/// Most rows one query of a chunk attends to through the QSA row lists
+/// ([`qsa_select_rows`]): a query within the budget sees all of its
+/// `<= budget + compress_ratio - 1` tokens, a sparse one `block_topk`
+/// blocks plus its partial block, the same bound; and never more than
+/// `n_ctx`.
+pub fn qsa_max_rows(n_ctx: usize) -> usize {
+    let s = qsa_shape();
+    n_ctx.min(s.budget + s.compress_ratio - 1).max(1)
 }
 
 /// The n-gram table file of a converted model (`root/ngram.mfng`).
@@ -406,6 +422,38 @@ fn ple_weights<'a>(wf: &'a WeightFile, layer: usize) -> Result<PleWeights<'a>> {
 
 // --- Memory plan -------------------------------------------------------------
 
+/// Prefill settings that size buffers: fixed when the engine is built
+/// ([`Q38Engine::with_options`]) and counted by [`plan_bytes_io`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Q38PrefillIo {
+    /// Tokens per prefill chunk: the rows of every per-token buffer.
+    pub chunk: usize,
+}
+
+impl Q38PrefillIo {
+    /// The settings from the environment for an `n_ctx` context:
+    /// [`prefill_chunk`].
+    pub fn from_env(n_ctx: usize) -> Self {
+        Self { chunk: prefill_chunk(n_ctx) }
+    }
+
+    /// [`Self::from_env`] for the converted model at `root` with
+    /// `expert_size`-byte experts.
+    pub fn for_root(_root: &Path, n_ctx: usize, _expert_size: usize) -> Self {
+        Self::from_env(n_ctx)
+    }
+
+    /// One step smaller, for a plan over the cap: halve the chunk down
+    /// to 64 tokens. `false` when nothing is left to shrink.
+    pub fn shrink(&mut self) -> bool {
+        if self.chunk > 64 {
+            self.chunk = (self.chunk / 2).max(64);
+            return true;
+        }
+        false
+    }
+}
+
 /// Bytes the family engine allocates, by account, for the budget plan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Q38PlanBytes {
@@ -416,9 +464,11 @@ pub struct Q38PlanBytes {
     /// The expert staging buffer: `top_k` demand slots plus two
     /// prefetch sets of `min(prefetch_experts, top_k)`.
     pub expert_slots: u64,
-    /// Per-token scratch at [`prefill_chunk`] rows: the `hc · H`
-    /// residual and Gated Residual buffers, projection / MoE scratch;
-    /// plus the logits.
+    /// Everything sized by the prefill chunk ([`Q38PrefillIo::chunk`]
+    /// rows): the `hc · H` residual and Gated Residual buffers,
+    /// projection / MoE / PLE scratch, the QSA row lists, the host
+    /// copies a chunk makes (embeddings, router logits, indexer rows,
+    /// buckets); plus the logits.
     pub scratch: u64,
     /// Host state: QSA indexer raw + block keys at `n_ctx`, PLE conv /
     /// history state, the n-gram row cache.
@@ -443,8 +493,20 @@ pub fn prefetch_slots(prefetch_experts: usize) -> usize {
 }
 
 /// [`plan_bytes`] with speculative prefetch reading `prefetch_experts`
-/// experts per layer (two sets of [`prefetch_slots`] staging slots).
+/// experts per layer (two sets of [`prefetch_slots`] staging slots),
+/// prefill settings from the environment ([`Q38PrefillIo::from_env`]).
 pub fn plan_bytes_with(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64, prefetch_experts: usize) -> Q38PlanBytes {
+    plan_bytes_io(n_ctx, expert_size, ngram_cache_bytes, prefetch_experts, &Q38PrefillIo::from_env(n_ctx))
+}
+
+/// [`plan_bytes_with`] for the prefill settings `io`.
+pub fn plan_bytes_io(
+    n_ctx: usize,
+    expert_size: usize,
+    ngram_cache_bytes: u64,
+    prefetch_experts: usize,
+    io: &Q38PrefillIo,
+) -> Q38PlanBytes {
     let c = q38_config();
     let s = qsa_shape();
     let n_qsa = (0..c.num_layers).filter(|&l| c.layer_kind(l) == Q38LayerKind::Qsa).count() as u64;
@@ -458,18 +520,31 @@ pub fn plan_bytes_with(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64,
     let expert_slots = (k + 2 * prefetch_slots(prefetch_experts) as u64) * expert_size as u64;
     let (h, hc) = (c.hidden as u64, c.hc_hidden() as u64);
     let vt = (c.linear_v_heads * c.linear_value_dim) as u64;
-    let rows = prefill_chunk(n_ctx) as u64;
+    let rows = io.chunk.min(n_ctx).max(1) as u64;
+    let pc = ple_config();
     let scratch = f
         * (rows * (4 * hc // hyper, ple_out, normed, mix
             + 4 * h + c.hc_lowrank as u64 + c.hc_count as u64 // emb, mixed, block_out, out_sum + low + inj
             + 2 * c.linear_conv_dim() as u64 + 3 * vt + 4 * c.linear_v_heads as u64
             + (s.q_proj_dim() + 3 * s.q_dim() + 2 * s.kv_dim() + s.idx_proj_dim() + s.rotary_dim) as u64
             + c.num_experts as u64 + 4 * c.shared_intermediate as u64 + 2 * h + 2
-            + k * (2 * h + 3 * c.moe_intermediate as u64 + 3))
+            + k * (2 * h + 3 * c.moe_intermediate as u64 + 3)
+            // GPU PLE: the n-gram embedding, k, v, norm_conv rows.
+            + (pc.embed_dim + 2 * pc.hc_hidden() + pc.hidden) as u64)
             + c.vocab as u64);
-    let pc = ple_config();
-    // GPU PLE: the n-gram embedding, k, v, norm_conv rows (one token).
-    let scratch = scratch + f * (pc.embed_dim + 2 * pc.hc_hidden() + pc.hidden) as u64;
+    // QSA row lists (`[rows, max_rows]` + counts): the backend's copy
+    // (allocated at build), the host lists and the per-query picks
+    // `qsa_select_rows` builds them from.
+    let qsa_rows = 3 * f * rows * (qsa_max_rows(n_ctx) as u64 + 1);
+    // Host copies a chunk makes: embeddings, router logits, indexer
+    // rows, the n-gram embedding, the routing (indices, weights, two
+    // bucket copies); and on the host-PLE path the residual and the
+    // PLE output.
+    let host = f
+        * rows
+        * (h + c.num_experts as u64 + s.idx_proj_dim() as u64 + pc.embed_dim as u64 + 6 * k
+            + if ple_on_host_from_env() { 2 * hc } else { 0 });
+    let scratch = scratch + qsa_rows + host;
     // PLE conv state: the GPU copy and the host one (snapshots).
     let family_state = n_qsa * (n_ctx * s.idx_head_dim) as u64 * f * 5 / 4
         + n_qsa * (n_ctx * 12) as u64
@@ -641,6 +716,7 @@ impl<B: Q38Exec> Q38Engine<B> {
     /// [`Self::new`] with speculative expert prefetch driven by `pf`
     /// (its `max_experts` and `lookahead` settings; the cross-layer
     /// guesser is not used here). `None` or `max_experts() == 0`: off.
+    /// Prefill settings from the environment ([`Q38PrefillIo::from_env`]).
     pub fn with_prefetch(
         b: &mut B,
         wf: &WeightFile,
@@ -649,16 +725,36 @@ impl<B: Q38Exec> Q38Engine<B> {
         expert_size: usize,
         pf: Option<PrefetchState>,
     ) -> Result<Self> {
+        Self::with_options(b, wf, root, n_ctx, expert_size, pf, Q38PrefillIo::from_env(n_ctx))
+    }
+
+    /// [`Self::with_prefetch`] with the prefill settings `io` (what
+    /// [`plan_bytes_io`] counted).
+    pub fn with_options(
+        b: &mut B,
+        wf: &WeightFile,
+        root: &Path,
+        n_ctx: usize,
+        expert_size: usize,
+        pf: Option<PrefetchState>,
+        io: Q38PrefillIo,
+    ) -> Result<Self> {
         let pf_slots = pf.as_ref().map_or(0, |p| prefetch_slots(p.max_experts()));
         let pf = pf.filter(|_| pf_slots > 0);
         let cfg = q38_config();
         let qsa = qsa_shape();
         let w = Q38Weights::load(wf)?;
-        let fam = b.fam_new(&qsa)?;
+        let mut fam = b.fam_new(&qsa)?;
         let (h, hc) = (cfg.hidden, cfg.hc_hidden());
         let k = cfg.top_k;
         // Rows of every per-token buffer: one prefill chunk.
-        let ch = prefill_chunk(n_ctx);
+        let ch = io.chunk.min(n_ctx).max(1);
+        // The QSA row lists at their largest, now (the plan counts them).
+        let mr = qsa_max_rows(n_ctx);
+        b.fam_set_rows(
+            &mut fam,
+            &QsaRowLists { n_tokens: ch, max_rows: mr, counts: vec![0; ch], rows: vec![0; ch * mr], n_sparse: 0 },
+        );
         let vt = cfg.linear_v_heads * cfg.linear_value_dim;
         let bufs = Bufs {
             hyper: alloc(b, ch * hc, "q38.hyper")?,
