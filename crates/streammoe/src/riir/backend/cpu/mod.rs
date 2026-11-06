@@ -823,7 +823,7 @@ impl Backend for CpuBackend {
             } => {
                 let mut x_buf = self.write_f32(*x);
                 rms_norm_qk_n_tokens_cpu(
-                    &mut x_buf,
+                    &mut x_buf[..(*per_token_total * *n_tokens) as usize],
                     *num_k_heads as usize,
                     *key_dim as usize,
                     *key_offset_per_token as usize,
@@ -935,7 +935,7 @@ impl Backend for CpuBackend {
                 let pos = positions.map(|p| self.read_i32(p));
                 let mut x_buf = self.write_f32(*x);
                 rope_n_tokens_cpu(
-                    &mut x_buf,
+                    &mut x_buf[..(*n_tokens * *num_heads * *head_dim) as usize],
                     &freq,
                     *n_tokens as usize,
                     *num_heads as usize,
@@ -1152,7 +1152,8 @@ impl Backend for CpuBackend {
                         &base[off..off + expert_size]
                     })
                     .collect();
-                moe_permute_fuse_cpu(&VARIANT, &blob_refs, &input_buf, buckets, &mut out_buf)
+                let rows = *buckets.offsets.last().unwrap_or(&0) as usize;
+                moe_permute_fuse_cpu(&VARIANT, &blob_refs, &input_buf[..rows * VARIANT.hidden_dim], buckets, &mut out_buf)
                     .expect("moe permute-fuse");
             }
             Op::MoeCombineResidualNTokens {
@@ -1170,12 +1171,15 @@ impl Backend for CpuBackend {
                 let shared_out_buf = self.read_f32(*shared_out);
                 let shared_gate_buf = self.read_f32(*shared_gate);
                 let mut hidden_out_buf = self.write_f32(*hidden_out);
+                // The first `n_tokens` rows (buffers may be sized for a
+                // larger chunk).
+                let nd = (*n_tokens * *dim) as usize;
                 moe_combine_residual_n_tokens_cpu(
-                    &h_mid_buf,
-                    &moe_sum_buf,
-                    &shared_out_buf,
-                    &shared_gate_buf,
-                    &mut hidden_out_buf,
+                    &h_mid_buf[..nd],
+                    &moe_sum_buf[..nd],
+                    &shared_out_buf[..nd],
+                    &shared_gate_buf[..*n_tokens as usize],
+                    &mut hidden_out_buf[..nd],
                     *n_tokens as usize,
                     *dim as usize,
                 );

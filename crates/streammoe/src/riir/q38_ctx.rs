@@ -15,7 +15,8 @@
 //!   and PLE conv state cannot be truncated — use checkpoints);
 //! - M-RoPE positions (`eval_stage_mrope`).
 //!
-//! Prefill is token at a time through the decode path.
+//! Prefill runs in chunks of `STREAMMOE_Q38_CHUNK` tokens (default
+//! 64; [`engine::prefill_chunk`]) through [`Q38Engine::eval`].
 
 use std::path::PathBuf;
 
@@ -62,9 +63,10 @@ pub(crate) fn check_config(config: &OpenConfig) -> Result<(), RsError> {
 /// The engine's buffers in the budget plan, on the existing accounts:
 /// QSA K / V → `Kv`; Gated DeltaNet state plus the host family state
 /// (indexer keys, PLE state, n-gram row cache) → `LinearState`; the
-/// K-expert staging → `ExpertSlots`; per-token scratch →
-/// `PrefillScratch`. No prefill staging (prefill streams per token),
-/// no KV scratch, no multi-decode buffers.
+/// K-expert staging → `ExpertSlots`; per-token scratch at the prefill
+/// chunk's rows → `PrefillScratch`. No prefill staging (a chunk's
+/// experts go through the same `top_k` slots, `top_k` at a time), no KV
+/// scratch, no multi-decode buffers.
 pub(crate) fn plan(plan: &mut BudgetPlan, n_ctx: usize, expert_size: u64, root: &std::path::Path) -> Result<Q38PlanBytes, RsError> {
     let ngram = super::model_layer::qwen3_8_flash_next::ngram::NgramTable::open(
         &engine::ngram_path(root),

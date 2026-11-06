@@ -9,41 +9,50 @@
 //! generic over the backend ([`Q38Exec`]), so the integration tests run
 //! the Metal and the CPU backends through the same code.
 //!
-//! ## One token
+//! ## One chunk (one token in decode, up to `prefill_chunk` in prefill)
 //!
 //! ```text
-//! hyper = expand(embed(token))                         [hc · H]
+//! hyper = expand(embed(tokens))                        [T, hc · H]
 //! per layer l:
-//!   if PLE layer: hyper += ple(hyper, token)           host (PleLayer), GPU add
+//!   if PLE layer: hyper += ple(hyper, tokens)          host (PleLayer), GPU add
 //!   x, inj = gated_residual(attn_hc, hyper)            FamOp + matvecs
-//!   y = gated_deltanet(x)                              graph ops, sigmoid-gated norm (FamOp)
-//!     | qsa(x)                                         push_qsa_pre_sdpa + dense SDPA, or the
-//!                                                      host indexer path over the budget
+//!   y = gated_deltanet(x)                              graph ops (the conv / recurrence walk
+//!                                                      the chunk in order), sigmoid-gated norm
+//!     | qsa(x)                                         push_qsa_pre_sdpa + dense SDPA, or over
+//!                                                      the budget: host block selection, GPU
+//!                                                      sparse rows (FamOp::SparseRows)
 //!   hyper += y ⊗ inj
 //!   x, inj = gated_residual(mlp_hc, hyper)
 //!   router (host softmax top-k), shared expert + sigmoid gate (graph)
-//!   routed experts: read (hot tier / pread) into a K-slot staging
-//!     buffer, Op::MoeBatchedPermuteFuse
+//!   routed experts: read (hot tier / pread) into the top_k staging
+//!     slots, rows gathered on the GPU, Op::MoeBatchedPermuteFuse
+//!     (a chunk: tokens grouped by expert, top_k experts per group)
 //!   y = experts + sigmoid(g) · shared                  combine against zero (no residual)
 //!   hyper += y ⊗ inj
-//! x = gated_residual(mixer, hyper) → lm_head           no final norm
+//! x = gated_residual(mixer, hyper) → lm_head           last row; no final norm
 //! ```
 //!
-//! Each layer is two command buffers (three on a QSA layer, whose
-//! indexer runs on the host after the projections): everything up to
-//! the router, then the experts. The QSA Q / K norms and the Gated
-//! DeltaNet output norm are family kernels ([`super::engine_exec`]);
-//! every `1 + w` gain is applied in a kernel from the stored bf16
-//! value.
+//! **Command buffers.** One per layer: everything from the previous
+//! layer's experts to this layer's router logits, which the host reads
+//! to pick the experts to load. On top of that: the PLE layer (the host
+//! PLE reads the residual), a QSA layer past the budget (the host
+//! scores blocks from the chunk's indexer projection), each extra
+//! expert group of a chunk, and the tail. A QSA layer within the budget
+//! adds none: its indexer keys are read back after the router's submit
+//! (`drain_pending_index`). Tiny model, decode: 6 per token
+//! within the budget, 7 past it ([`Q38Engine::submits`]). The QSA Q / K
+//! norms and the Gated DeltaNet output norm are family kernels
+//! ([`super::engine_exec`]); every `1 + w` gain is applied in a kernel
+//! from the stored bf16 value.
 //!
 //! ## Prefill
 //!
-//! Token at a time through the decode path. The batched (n-token)
-//! QSA / PLE / Gated Residual pieces are another branch's work
-//! (`AttnBlock::forward_n`, `PleHook::forward_n`, T-token Gated
-//! Residual encoders, a GPU sparse-rows SDPA); TODO: once they land,
-//! run `eval_prompt` chunks through them — the graph ops this path uses
-//! already take `n_tokens`.
+//! [`Q38Engine::eval`] runs the prompt in chunks of
+//! [`Q38Engine::prefill_chunk`] tokens through the same ops at `T`
+//! rows ([`Q38Engine::forward_chunk`]; a token is `T = 1`). Within f32
+//! rounding of a step per token (bit-identical on the CPU backend);
+//! `batched_prefill_matches_per_token` checks logits, state and the
+//! decode after it on both backends, past the QSA budget.
 //!
 //! ## Not supported yet
 //!
@@ -70,8 +79,9 @@ use super::config::{
 use super::engine_exec::{retag, run_steps, FBuf, FamOp, Q38Exec, Step};
 use super::ngram::{NgramConfig, NgramTable};
 use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
+use super::qsa::gpu::qsa_select_rows;
 use super::qsa::{
-    push_qsa_o_proj, push_qsa_pre_sdpa, push_qsa_sdpa, qsa_attend_rows, qsa_indexer_step, qsa_needs_sparse,
+    push_qsa_o_proj, push_qsa_pre_sdpa, push_qsa_sdpa, qsa_indexer_step, qsa_needs_sparse,
     QsaGraphBufs, QsaIndexerCache, QsaLayerWeights, QsaMode, QsaShape,
 };
 use super::weights::{final_mixer_names, gated_residual_names, GatedResidualNames, HcSite};
@@ -80,7 +90,7 @@ use crate::riir::backend::{BufId, BufferPool, Graph, GraphError, Op, WeightRef};
 use crate::riir::io::embedding::{bf16_to_f32, embed_lookup};
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
 use crate::riir::io::weight_file::WeightFile;
-use crate::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu_with};
+use crate::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu_with, ExpertBuckets};
 use crate::riir::variants::{MROPE_SECTION, RMS_NORM_EPS, ROPE_THETA, VARIANT};
 
 /// Errors of the family engine.
@@ -171,6 +181,18 @@ pub fn ngram_cache_rows() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16384)
+}
+
+/// Tokens per prefill chunk for an `n_ctx` context
+/// (`STREAMMOE_Q38_CHUNK`, default 64, at most `n_ctx`): the row count
+/// of every per-token buffer.
+pub fn prefill_chunk(n_ctx: usize) -> usize {
+    std::env::var("STREAMMOE_Q38_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64usize)
+        .min(n_ctx)
+        .max(1)
 }
 
 /// The n-gram table file of a converted model (`root/ngram.mfng`).
@@ -365,8 +387,9 @@ pub struct Q38PlanBytes {
     pub linear_state: u64,
     /// The K-expert staging buffer (`top_k` blobs).
     pub expert_slots: u64,
-    /// Per-token scratch: the `hc · H` residual and Gated Residual
-    /// buffers, projection / MoE scratch, logits.
+    /// Per-token scratch at [`prefill_chunk`] rows: the `hc · H`
+    /// residual and Gated Residual buffers, projection / MoE scratch;
+    /// plus the logits.
     pub scratch: u64,
     /// Host state: QSA indexer raw + block keys at `n_ctx`, PLE conv /
     /// history state, the n-gram row cache.
@@ -394,13 +417,14 @@ pub fn plan_bytes(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64) -> Q
     let expert_slots = k * expert_size as u64;
     let (h, hc) = (c.hidden as u64, c.hc_hidden() as u64);
     let vt = (c.linear_v_heads * c.linear_value_dim) as u64;
+    let rows = prefill_chunk(n_ctx) as u64;
     let scratch = f
-        * (4 * hc // hyper, ple_out, normed, mix
+        * (rows * (4 * hc // hyper, ple_out, normed, mix
             + 4 * h + c.hc_lowrank as u64 + c.hc_count as u64 // emb, mixed, block_out, out_sum + low + inj
             + 2 * c.linear_conv_dim() as u64 + 3 * vt + 4 * c.linear_v_heads as u64
             + (s.q_proj_dim() + 3 * s.q_dim() + 2 * s.kv_dim() + s.idx_proj_dim() + s.rotary_dim) as u64
             + c.num_experts as u64 + 4 * c.shared_intermediate as u64 + 2 * h + 2
-            + k * (2 * h + 3 * c.moe_intermediate as u64 + 3)
+            + k * (2 * h + 3 * c.moe_intermediate as u64 + 3))
             + c.vocab as u64);
     let pc = ple_config();
     let family_state = n_qsa * (n_ctx * s.idx_head_dim) as u64 * f * 5 / 4
@@ -510,6 +534,10 @@ pub struct Q38Engine<B: Q38Exec> {
     ple: Option<(usize, PleLayer, PleState)>,
     n_ctx: usize,
     expert_size: usize,
+    /// Rows of the per-token buffers ([`prefill_chunk`]).
+    max_chunk: usize,
+    /// Tokens per prefill chunk, `<= max_chunk` ([`Self::set_prefill_chunk`]).
+    chunk: usize,
     /// Tokens consumed (the next token's position).
     pos: usize,
     /// A dense QSA layer's indexer step not run yet: `(layer, pos,
@@ -528,54 +556,56 @@ impl<B: Q38Exec> Q38Engine<B> {
         let cfg = q38_config();
         let qsa = qsa_shape();
         let w = Q38Weights::load(wf)?;
-        let fam = b.fam_new()?;
+        let fam = b.fam_new(&qsa)?;
         let (h, hc) = (cfg.hidden, cfg.hc_hidden());
         let k = cfg.top_k;
+        // Rows of every per-token buffer: one prefill chunk.
+        let ch = prefill_chunk(n_ctx);
         let vt = cfg.linear_v_heads * cfg.linear_value_dim;
         let bufs = Bufs {
-            hyper: alloc(b, hc, "q38.hyper")?,
-            emb: alloc(b, h, "q38.emb")?,
-            ple_out: alloc(b, hc, "q38.ple_out")?,
-            normed: alloc(b, hc, "q38.hc_normed")?,
-            low: alloc(b, cfg.hc_lowrank, "q38.hc_low")?,
-            mix: alloc(b, hc, "q38.hc_mix")?,
-            mixed: alloc(b, h, "q38.mixed")?,
-            inj: alloc(b, cfg.hc_count, "q38.inj")?,
-            block_out: alloc(b, h, "q38.block_out")?,
-            qkv: alloc(b, cfg.linear_conv_dim(), "q38.qkv")?,
-            z: alloc(b, vt, "q38.z")?,
-            beta: alloc(b, cfg.linear_v_heads, "q38.beta")?,
-            alpha: alloc(b, cfg.linear_v_heads, "q38.alpha")?,
-            conv_out: alloc(b, cfg.linear_conv_dim(), "q38.conv_out")?,
-            g_decay: alloc(b, cfg.linear_v_heads, "q38.g_decay")?,
-            beta_gate: alloc(b, cfg.linear_v_heads, "q38.beta_gate")?,
-            delta_out: alloc(b, vt, "q38.delta_out")?,
-            value_out: alloc(b, vt, "q38.value_out")?,
-            q_proj: alloc(b, qsa.q_proj_dim(), "q38.q_proj")?,
-            k: alloc(b, qsa.kv_dim(), "q38.k")?,
-            v: alloc(b, qsa.kv_dim(), "q38.v")?,
-            idx_qk: alloc(b, qsa.idx_proj_dim(), "q38.idx_qk")?,
-            q: alloc(b, qsa.q_dim(), "q38.q")?,
-            gate: alloc(b, qsa.q_dim(), "q38.gate")?,
-            attn_out: alloc(b, qsa.q_dim(), "q38.attn_out")?,
+            hyper: alloc(b, ch * hc, "q38.hyper")?,
+            emb: alloc(b, ch * h, "q38.emb")?,
+            ple_out: alloc(b, ch * hc, "q38.ple_out")?,
+            normed: alloc(b, ch * hc, "q38.hc_normed")?,
+            low: alloc(b, ch * cfg.hc_lowrank, "q38.hc_low")?,
+            mix: alloc(b, ch * hc, "q38.hc_mix")?,
+            mixed: alloc(b, ch * h, "q38.mixed")?,
+            inj: alloc(b, ch * cfg.hc_count, "q38.inj")?,
+            block_out: alloc(b, ch * h, "q38.block_out")?,
+            qkv: alloc(b, ch * cfg.linear_conv_dim(), "q38.qkv")?,
+            z: alloc(b, ch * vt, "q38.z")?,
+            beta: alloc(b, ch * cfg.linear_v_heads, "q38.beta")?,
+            alpha: alloc(b, ch * cfg.linear_v_heads, "q38.alpha")?,
+            conv_out: alloc(b, ch * cfg.linear_conv_dim(), "q38.conv_out")?,
+            g_decay: alloc(b, ch * cfg.linear_v_heads, "q38.g_decay")?,
+            beta_gate: alloc(b, ch * cfg.linear_v_heads, "q38.beta_gate")?,
+            delta_out: alloc(b, ch * vt, "q38.delta_out")?,
+            value_out: alloc(b, ch * vt, "q38.value_out")?,
+            q_proj: alloc(b, ch * qsa.q_proj_dim(), "q38.q_proj")?,
+            k: alloc(b, ch * qsa.kv_dim(), "q38.k")?,
+            v: alloc(b, ch * qsa.kv_dim(), "q38.v")?,
+            idx_qk: alloc(b, ch * qsa.idx_proj_dim(), "q38.idx_qk")?,
+            q: alloc(b, ch * qsa.q_dim(), "q38.q")?,
+            gate: alloc(b, ch * qsa.q_dim(), "q38.gate")?,
+            attn_out: alloc(b, ch * qsa.q_dim(), "q38.attn_out")?,
             inv_freq: alloc(b, qsa.rotary_dim / 2, "q38.inv_freq")?,
-            router_logits: alloc(b, cfg.num_experts, "q38.router_logits")?,
-            shared_gate: alloc(b, 1, "q38.shared_gate")?,
-            s_gate: alloc(b, cfg.shared_intermediate, "q38.shared_gate_proj")?,
-            s_up: alloc(b, cfg.shared_intermediate, "q38.shared_up")?,
-            s_act: alloc(b, cfg.shared_intermediate, "q38.shared_act")?,
-            s_down: alloc(b, h, "q38.shared_down")?,
-            zeros: alloc(b, h, "q38.zeros")?,
-            out_sum: alloc(b, h, "q38.out_sum")?,
+            router_logits: alloc(b, ch * cfg.num_experts, "q38.router_logits")?,
+            shared_gate: alloc(b, ch, "q38.shared_gate")?,
+            s_gate: alloc(b, ch * cfg.shared_intermediate, "q38.shared_gate_proj")?,
+            s_up: alloc(b, ch * cfg.shared_intermediate, "q38.shared_up")?,
+            s_act: alloc(b, ch * cfg.shared_intermediate, "q38.shared_act")?,
+            s_down: alloc(b, ch * h, "q38.shared_down")?,
+            zeros: alloc(b, ch * h, "q38.zeros")?,
+            out_sum: alloc(b, ch * h, "q38.out_sum")?,
             expert_base: alloc(b, k * expert_size / 4 + 1, "q38.expert_staging")?,
-            expert_indices: alloc(b, k, "q38.expert_indices")?,
-            bucket_input: alloc(b, k * h, "q38.bucket_input")?,
-            bucket_gate: alloc(b, k * cfg.moe_intermediate, "q38.bucket_gate")?,
-            bucket_up: alloc(b, k * cfg.moe_intermediate, "q38.bucket_up")?,
-            bucket_act: alloc(b, k * cfg.moe_intermediate, "q38.bucket_act")?,
-            bucket_out: alloc(b, k * h, "q38.bucket_out")?,
-            bucket_token_idx: alloc(b, k, "q38.bucket_token_idx")?,
-            bucket_weights: alloc(b, k, "q38.bucket_weights")?,
+            expert_indices: alloc(b, ch * k, "q38.expert_indices")?,
+            bucket_input: alloc(b, ch * k * h, "q38.bucket_input")?,
+            bucket_gate: alloc(b, ch * k * cfg.moe_intermediate, "q38.bucket_gate")?,
+            bucket_up: alloc(b, ch * k * cfg.moe_intermediate, "q38.bucket_up")?,
+            bucket_act: alloc(b, ch * k * cfg.moe_intermediate, "q38.bucket_act")?,
+            bucket_out: alloc(b, ch * k * h, "q38.bucket_out")?,
+            bucket_token_idx: alloc(b, ch * k, "q38.bucket_token_idx")?,
+            bucket_weights: alloc(b, ch * k, "q38.bucket_weights")?,
             logits: alloc(b, cfg.vocab, "q38.logits")?,
         };
         upload(b, bufs.inv_freq, &qsa.inv_freq())?;
@@ -626,6 +656,8 @@ impl<B: Q38Exec> Q38Engine<B> {
             ple,
             n_ctx,
             expert_size,
+            max_chunk: ch,
+            chunk: ch,
             pos: 0,
             pending_index: None,
             submits: std::sync::atomic::AtomicU64::new(0),
@@ -645,6 +677,16 @@ impl<B: Q38Exec> Q38Engine<B> {
     /// engine was built.
     pub fn submits(&self) -> u64 {
         self.submits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Tokens per prefill chunk (clamped to `1..=` the buffers' rows,
+    /// [`prefill_chunk`] at build).
+    pub fn set_prefill_chunk(&mut self, n: usize) {
+        self.chunk = n.clamp(1, self.max_chunk);
+    }
+
+    pub fn prefill_chunk(&self) -> usize {
+        self.chunk
     }
 
     /// QSA mode (`STREAMMOE_QSA`, default sparse).
@@ -672,32 +714,34 @@ impl<B: Q38Exec> Q38Engine<B> {
     }
 
     /// The Gated Residual mix of `hc` from `hyper` into `mixed` (and
-    /// the injection weights into `inj` when it has a `block_inject`).
-    fn hc_steps(&self, hc: &HcRefs, steps: &mut Vec<Step>) {
+    /// the injection weights into `inj` when it has a `block_inject`),
+    /// `n` token rows.
+    fn hc_steps(&self, hc: &HcRefs, n_tok: u32, steps: &mut Vec<Step>) {
         let c = &self.cfg;
         let bu = &self.bufs;
         let (h, n) = (c.hidden as u32, c.hc_count as u32);
         let width = h * n;
+        let lr = c.hc_lowrank as u32;
         steps.push(Step::F(FamOp::HcNorm {
             x: bu.hyper,
             gain_off: hc.gain_off,
             out: bu.normed,
             group: h,
             gain_len: width,
-            rows: 1,
+            rows: n_tok,
             eps: c.rms_eps,
         }));
-        steps.push(matvec("q38.hc_mix_down", hc.down, bu.normed, bu.low, width, c.hc_lowrank as u32));
-        steps.push(Step::F(FamOp::SiluScale { v: bu.low, scale: 1.0 / n as f32, n: c.hc_lowrank as u32 }));
-        steps.push(matvec("q38.hc_mix_up", hc.up, bu.low, bu.mix, c.hc_lowrank as u32, width));
-        steps.push(Step::F(FamOp::HcMix { mix: bu.mix, normed: bu.normed, out: bu.mixed, hidden: h, hc: n, n_tokens: 1 }));
+        steps.push(matvec_n("q38.hc_mix_down", hc.down, bu.normed, bu.low, width, lr, n_tok));
+        steps.push(Step::F(FamOp::SiluScale { v: bu.low, scale: 1.0 / n as f32, n: lr * n_tok }));
+        steps.push(matvec_n("q38.hc_mix_up", hc.up, bu.low, bu.mix, lr, width, n_tok));
+        steps.push(Step::F(FamOp::HcMix { mix: bu.mix, normed: bu.normed, out: bu.mixed, hidden: h, hc: n, n_tokens: n_tok }));
         if let Some(inj) = hc.inject {
-            steps.push(matvec("q38.hc_block_inject", inj, bu.normed, bu.inj, width, n));
-            steps.push(Step::F(FamOp::InjWeights { inj: bu.inj, hc: n, n_tokens: 1 }));
+            steps.push(matvec_n("q38.hc_block_inject", inj, bu.normed, bu.inj, width, n, n_tok));
+            steps.push(Step::F(FamOp::InjWeights { inj: bu.inj, hc: n, n_tokens: n_tok }));
         }
     }
 
-    fn inject_step(&self) -> Step {
+    fn inject_step(&self, n_tok: u32) -> Step {
         let c = &self.cfg;
         Step::F(FamOp::HcInject {
             hyper: self.bufs.hyper,
@@ -705,12 +749,15 @@ impl<B: Q38Exec> Q38Engine<B> {
             inj: self.bufs.inj,
             hidden: c.hidden as u32,
             hc: c.hc_count as u32,
-            n_tokens: 1,
+            n_tokens: n_tok,
         })
     }
 
-    /// Gated DeltaNet on `mixed` into `block_out`, one token.
-    fn gdn_steps(&self, g: &GdnRefs, lb: &LayerBufs, steps: &mut Vec<Step>) {
+    /// Gated DeltaNet on `mixed` into `block_out`, `n` tokens. The conv
+    /// and the recurrence ops walk the chunk's tokens in order inside
+    /// the kernel (the state carries from row to row), so a chunk
+    /// equals its tokens one at a time.
+    fn gdn_steps(&self, g: &GdnRefs, lb: &LayerBufs, n: u32, steps: &mut Vec<Step>) {
         let LayerBufs::Gdn { conv, delta, .. } = *lb else { unreachable!() };
         let c = &self.cfg;
         let bu = &self.bufs;
@@ -718,10 +765,10 @@ impl<B: Q38Exec> Q38Engine<B> {
         let (hk, hv) = (c.linear_k_heads as u32, c.linear_v_heads as u32);
         let (dk, dv) = (c.linear_key_dim as u32, c.linear_value_dim as u32);
         let conv_dim = c.linear_conv_dim() as u32;
-        steps.push(matvec("q38.gdn.in_proj_qkv", g.qkv, bu.mixed, bu.qkv, h, conv_dim));
-        steps.push(matvec("q38.gdn.in_proj_z", g.z, bu.mixed, bu.z, h, hv * dv));
-        steps.push(matvec("q38.gdn.in_proj_b", g.b, bu.mixed, bu.beta, h, hv));
-        steps.push(matvec("q38.gdn.in_proj_a", g.a, bu.mixed, bu.alpha, h, hv));
+        steps.push(matvec_n("q38.gdn.in_proj_qkv", g.qkv, bu.mixed, bu.qkv, h, conv_dim, n));
+        steps.push(matvec_n("q38.gdn.in_proj_z", g.z, bu.mixed, bu.z, h, hv * dv, n));
+        steps.push(matvec_n("q38.gdn.in_proj_b", g.b, bu.mixed, bu.beta, h, hv, n));
+        steps.push(matvec_n("q38.gdn.in_proj_a", g.a, bu.mixed, bu.alpha, h, hv, n));
         steps.push(Step::G(Op::Conv1dStepNTokens {
             label: "q38.gdn.conv1d",
             qkv_in: t(bu.qkv),
@@ -729,7 +776,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             weight_off: g.conv_off,
             conv_out: t(bu.conv_out),
             conv_dim,
-            n_tokens: 1,
+            n_tokens: n,
         }));
         steps.push(Step::G(Op::RmsNormQkNTokens {
             label: "q38.gdn.qk_norm",
@@ -738,7 +785,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             key_dim: dk,
             key_offset_per_token: hk * dk,
             per_token_total: conv_dim,
-            n_tokens: 1,
+            n_tokens: n,
         }));
         steps.push(Step::G(Op::ComputeDecayBetaNTokens {
             label: "q38.gdn.decay_beta",
@@ -749,7 +796,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             g_decay_out: t(bu.g_decay),
             beta_gate_out: t(bu.beta_gate),
             num_v_heads: hv,
-            n_tokens: 1,
+            n_tokens: n,
         }));
         steps.push(Step::G(Op::GatedDeltaNetStepNTokens {
             label: "q38.gdn.recurrence",
@@ -761,7 +808,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             num_v_heads: hv,
             value_dim: dv,
             k_heads_per_v: hv / hk,
-            n_tokens: 1,
+            n_tokens: n,
         }));
         steps.push(Step::F(FamOp::GatedRmsNormSigmoid {
             values: bu.delta_out,
@@ -769,10 +816,10 @@ impl<B: Q38Exec> Q38Engine<B> {
             weight_off: g.norm_off,
             out: bu.value_out,
             dim: dv,
-            n_groups: hv,
+            n_groups: hv * n,
             eps: c.rms_eps,
         }));
-        steps.push(matvec("q38.gdn.out_proj", g.out, bu.value_out, bu.block_out, hv * dv, h));
+        steps.push(matvec_n("q38.gdn.out_proj", g.out, bu.value_out, bu.block_out, hv * dv, h, n));
     }
 
     fn qsa_bufs(&self, lb: &LayerBufs) -> QsaGraphBufs {
@@ -820,8 +867,9 @@ impl<B: Q38Exec> Q38Engine<B> {
         Ok(())
     }
 
-    /// QSA on `mixed` into `block_out` for the token at `self.pos`.
-    fn qsa_layer(&mut self, b: &mut B, l: usize, steps: &mut Vec<Step>) -> Result<()> {
+    /// QSA on `mixed` into `block_out` for the `n` tokens at
+    /// `self.pos..`.
+    fn qsa_layer(&mut self, b: &mut B, l: usize, n: usize, steps: &mut Vec<Step>) -> Result<()> {
         self.drain_pending_index(b)?;
         let AttnRefs::Qsa(q) = &self.w.layers[l].attn else { unreachable!() };
         let qw = q.w;
@@ -830,7 +878,7 @@ impl<B: Q38Exec> Q38Engine<B> {
         let shape = self.qsa;
         let pos = self.pos;
         let mut g = Graph::new();
-        push_qsa_pre_sdpa(&mut g, &shape, &qw, &bufs, 1, pos, pos as i32);
+        push_qsa_pre_sdpa(&mut g, &shape, &qw, &bufs, n, pos, pos as i32);
         for op in g.ops.drain(..) {
             // The graph's per-head norm applies a plain bf16 gain; this
             // family's Q / K norms are `1 + w` on the stored gain.
@@ -847,48 +895,164 @@ impl<B: Q38Exec> Q38Engine<B> {
                 op => steps.push(Step::G(op)),
             }
         }
-        if !qsa_needs_sparse(&shape, self.mode, pos + 1) {
-            // Dense is exact: the indexer only has to cache this
-            // token's raw key, which can wait for the router's submit
-            // (no extra command buffer).
+        if !qsa_needs_sparse(&shape, self.mode, pos + n) {
+            // Dense is exact: the indexer only has to cache the chunk's
+            // raw keys, which can wait for the router's submit (no extra
+            // command buffer).
             let mut g = Graph::new();
-            push_qsa_sdpa(&mut g, &shape, &bufs, 1, pos);
+            push_qsa_sdpa(&mut g, &shape, &bufs, n, pos);
             steps.extend(g.ops.drain(..).map(Step::G));
-            self.pending_index = Some((l, pos, 1));
-            let mut g = Graph::new();
-            push_qsa_o_proj(&mut g, &shape, &qw, &bufs, 1);
-            steps.extend(g.ops.drain(..).map(Step::G));
-            return Ok(());
-        }
-        self.flush(b, steps, "q38.qsa_pre")?;
-        // Indexer (host), every token: the raw keys must be cached
-        // from the start.
-        let idx_qk = download(b, self.bufs.idx_qk, shape.idx_proj_dim())?;
-        let p = pos as i32;
-        let cache = self.indexer[l].as_mut().expect("QSA layer has an indexer cache");
-        let q_idx = qsa_indexer_step(&shape, &idx_qk, &[[p, p, p]], &idx_q_norm, cache);
-        if qsa_needs_sparse(&shape, self.mode, pos + 1) {
-            // Over the budget: block-selected attention on the host
-            // over the GPU caches. TODO: q38-batch's GPU sparse-rows
-            // SDPA (qsa_gpu.rs).
-            let LayerBufs::Qsa { k_cache, v_cache } = self.layers[l] else { unreachable!() };
-            let kvd = shape.kv_dim();
-            let qv = download(b, self.bufs.q, shape.q_dim())?;
-            let gv = download(b, self.bufs.gate, shape.q_dim())?;
-            let kc = download(b, k_cache, (pos + 1) * kvd)?;
-            let vc = download(b, v_cache, (pos + 1) * kvd)?;
-            let mut attn = vec![0.0f32; shape.q_dim()];
-            let cache = self.indexer[l].as_ref().expect("indexer");
-            qsa_attend_rows(&shape, self.mode, None, &qv, &gv, &kc, &vc, pos, &q_idx, cache, &mut attn);
-            upload(b, self.bufs.attn_out, &attn)?;
+            self.pending_index = Some((l, pos, n));
         } else {
-            let mut g = Graph::new();
-            push_qsa_sdpa(&mut g, &shape, &bufs, 1, pos);
-            steps.extend(g.ops.drain(..).map(Step::G));
+            // Over the budget: the host scores the blocks and picks each
+            // query's rows (it needs this chunk's indexer projection, so
+            // one submit here); the GPU gathers them from the caches
+            // (`FamOp::SparseRows`, `qsa::gpu`). Queries still within the
+            // budget get all their rows.
+            self.flush(b, steps, "q38.qsa_pre")?;
+            let idx_qk = download(b, self.bufs.idx_qk, n * shape.idx_proj_dim())?;
+            let positions: Vec<[i32; 3]> = (pos..pos + n).map(|p| [p as i32; 3]).collect();
+            let cache = self.indexer[l].as_mut().expect("QSA layer has an indexer cache");
+            let q_idx = qsa_indexer_step(&shape, &idx_qk, &positions, &idx_q_norm, cache);
+            let lists = qsa_select_rows(&shape, self.mode, None, &q_idx, pos, n, cache);
+            b.fam_set_rows(&mut self.fam, &lists);
+            let LayerBufs::Qsa { k_cache, v_cache } = self.layers[l] else { unreachable!() };
+            steps.push(Step::F(FamOp::SparseRows {
+                q: self.bufs.q,
+                gate: self.bufs.gate,
+                k_cache,
+                v_cache,
+                out: self.bufs.attn_out,
+                n_tokens: n as u32,
+            }));
         }
         let mut g = Graph::new();
-        push_qsa_o_proj(&mut g, &shape, &qw, &bufs, 1);
+        push_qsa_o_proj(&mut g, &shape, &qw, &bufs, n);
         steps.extend(g.ops.drain(..).map(Step::G));
+        Ok(())
+    }
+
+    /// MoE of a chunk (`n > 1` tokens) on `mixed` into `block_out`,
+    /// then inject. The routing reads back every token's router logits
+    /// (one submit), then groups the tokens by expert like the batched
+    /// prefill of the other families (`build_expert_buckets`, one
+    /// `Op::MoeBatchedPermuteFuse` per group): the experts the chunk
+    /// picked are read into the `top_k` staging slots `top_k` at a time,
+    /// each group adding its buckets into `out_sum`. Every group but
+    /// the last is one more submit (the staging slots are reused).
+    fn moe_layer_n(
+        &mut self,
+        b: &mut B,
+        l: usize,
+        n: usize,
+        experts: &ExpertFiles,
+        io_pool: &rayon::ThreadPool,
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
+        let c = self.cfg.clone();
+        let m = self.w.layers[l].moe;
+        let bu = &self.bufs;
+        let (h, si, k, ne) = (c.hidden as u32, c.shared_intermediate as u32, c.top_k, c.num_experts);
+        let nt = n as u32;
+        steps.push(matvec_n("q38.moe.router", m.router, bu.mixed, bu.router_logits, h, ne as u32, nt));
+        steps.push(matvec_n("q38.moe.shared_expert_gate", m.shared_gate, bu.mixed, bu.shared_gate, h, 1, nt));
+        steps.push(matvec_n("q38.moe.shared_gate_proj", m.gate, bu.mixed, bu.s_gate, h, si, nt));
+        steps.push(matvec_n("q38.moe.shared_up_proj", m.up, bu.mixed, bu.s_up, h, si, nt));
+        steps.push(Step::G(Op::SwigluFusedBatched {
+            label: "q38.moe.shared_swiglu",
+            gate: t(bu.s_gate),
+            up: t(bu.s_up),
+            out: t(bu.s_act),
+            total: si * nt,
+        }));
+        steps.push(matvec_n("q38.moe.shared_down_proj", m.down, bu.s_act, bu.s_down, si, h, nt));
+        self.flush(b, steps, "q38.layer")?;
+
+        // Router (host): softmax, top-k, renormalized, per token.
+        let mut scores = download(b, bu.router_logits, n * ne)?;
+        let mut idx = vec![0i32; n * k];
+        let mut wts = vec![0.0f32; n * k];
+        for ((s, i), w) in scores.chunks_mut(ne).zip(idx.chunks_mut(k)).zip(wts.chunks_mut(k)) {
+            moe_router_cpu_with(s, k, c.norm_topk_prob, i, w)?;
+        }
+        let buckets = build_expert_buckets(&idx, &wts, n, k, ne);
+        let nb = buckets.expert_ids.len();
+        for bi in 0..nb {
+            let cnt = buckets.offsets[bi + 1] - buckets.offsets[bi];
+            experts.record_pick(l, buckets.expert_ids[bi] as usize, cnt);
+        }
+        steps.push(Step::G(Op::ZeroBuffer { label: "q38.moe.out_sum_zero", buf: t(bu.out_sum), n_bytes: nt * h * 4 }));
+        let es = self.expert_size;
+        let mut start = 0;
+        while start < nb {
+            let end = (start + k).min(nb);
+            let ids = &buckets.expert_ids[start..end];
+            let read = b
+                .pool_mut()
+                .with_bytes_mut(bu.expert_base, |staging: &mut [u8]| {
+                    io_pool.install(|| {
+                        staging[..ids.len() * es]
+                            .par_chunks_mut(es)
+                            .zip(ids.par_iter())
+                            .try_for_each(|(dst, &e)| experts.read_expert(l, e as usize, dst))
+                    })
+                })
+                .map_err(|e| Q38EngineError::Other(format!("staging: {e}")))?;
+            read?;
+            let (a0, a1) = (buckets.offsets[start] as usize, buckets.offsets[end] as usize);
+            let group = ExpertBuckets {
+                expert_ids: ids.to_vec(),
+                offsets: buckets.offsets[start..=end].iter().map(|&o| o - a0 as u32).collect(),
+                token_idx: buckets.token_idx[a0..a1].to_vec(),
+                weights: buckets.weights[a0..a1].to_vec(),
+            };
+            let mut expert_indices = vec![0u32; a1 - a0];
+            for bi in 0..ids.len() {
+                let (s, e) = (group.offsets[bi] as usize, group.offsets[bi + 1] as usize);
+                expert_indices[s..e].fill(bi as u32);
+            }
+            upload(b, bu.bucket_token_idx, &group.token_idx)?;
+            upload(b, bu.bucket_weights, &group.weights)?;
+            upload(b, bu.expert_indices, &expert_indices)?;
+            steps.push(Step::F(FamOp::GatherRows {
+                src: bu.mixed,
+                idx: bu.bucket_token_idx,
+                dst: bu.bucket_input,
+                width: h,
+                n_rows: (a1 - a0) as u32,
+            }));
+            steps.push(Step::G(Op::MoeBatchedPermuteFuse {
+                label: "q38.moe.permute_fuse",
+                expert_base: t(bu.expert_base),
+                expert_stride: es as u64,
+                expert_indices: t(bu.expert_indices),
+                expert_slots: (0..ids.len() as u32).collect(),
+                bucket_input: t(bu.bucket_input),
+                bucket_gate: t(bu.bucket_gate),
+                bucket_up: t(bu.bucket_up),
+                bucket_act: t(bu.bucket_act),
+                bucket_out: t(bu.bucket_out),
+                bucket_token_idx: t(bu.bucket_token_idx),
+                bucket_weights: t(bu.bucket_weights),
+                out_sum: t(bu.out_sum),
+                buckets: group,
+            }));
+            if end < nb {
+                self.flush(b, steps, "q38.moe_group")?;
+            }
+            start = end;
+        }
+        steps.push(Step::G(Op::MoeCombineResidualNTokens {
+            label: "q38.moe.combine",
+            h_mid: t(bu.zeros),
+            moe_sum: t(bu.out_sum),
+            shared_out: t(bu.s_down),
+            shared_gate: t(bu.shared_gate),
+            hidden_out: t(bu.block_out),
+            n_tokens: nt,
+            dim: h,
+        }));
+        steps.push(self.inject_step(nt));
         Ok(())
     }
 
@@ -993,7 +1157,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             n_tokens: 1,
             dim: h,
         }));
-        steps.push(self.inject_step());
+        steps.push(self.inject_step(1));
         Ok(())
     }
 
@@ -1008,12 +1172,37 @@ impl<B: Q38Exec> Q38Engine<B> {
         token: i32,
         logits: Option<&mut [f32]>,
     ) -> Result<()> {
-        if self.pos >= self.n_ctx {
+        self.forward_chunk(b, wf, experts, io_pool, &[token], logits)
+    }
+
+    /// `tokens` (at most the buffers' rows) at the next positions in
+    /// one pass of every layer; the last token's logits into `logits`
+    /// when given. One token is the decode step.
+    pub fn forward_chunk(
+        &mut self,
+        b: &mut B,
+        wf: &WeightFile,
+        experts: &ExpertFiles,
+        io_pool: &rayon::ThreadPool,
+        tokens: &[i32],
+        logits: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if n > self.max_chunk {
+            return Err(Q38EngineError::Other(format!("chunk of {n} tokens, buffers hold {}", self.max_chunk)));
+        }
+        if self.pos + n > self.n_ctx {
             return Err(Q38EngineError::Other(format!("context full ({} tokens)", self.n_ctx)));
         }
         let c = self.cfg.clone();
-        let mut emb = vec![0.0f32; c.hidden];
-        embed_lookup(wf, token, &mut emb).map_err(|e| Q38EngineError::Other(format!("embedding: {e}")))?;
+        let nt = n as u32;
+        let mut emb = vec![0.0f32; n * c.hidden];
+        for (&tok, row) in tokens.iter().zip(emb.chunks_mut(c.hidden)) {
+            embed_lookup(wf, tok, row).map_err(|e| Q38EngineError::Other(format!("embedding: {e}")))?;
+        }
         upload(b, self.bufs.emb, &emb)?;
         let mut steps = Vec::new();
         steps.push(Step::F(FamOp::HcExpand {
@@ -1021,45 +1210,54 @@ impl<B: Q38Exec> Q38Engine<B> {
             hyper: self.bufs.hyper,
             hidden: c.hidden as u32,
             hc: c.hc_count as u32,
-            n_tokens: 1,
+            n_tokens: nt,
         }));
         for l in 0..c.num_layers {
             if self.ple.as_ref().is_some_and(|p| p.0 == l) {
                 self.flush(b, &mut steps, "q38.layer")?;
-                let hyper = download(b, self.bufs.hyper, c.hc_hidden())?;
-                let mut out = vec![0.0f32; c.hc_hidden()];
+                let hyper = download(b, self.bufs.hyper, n * c.hc_hidden())?;
+                let mut out = vec![0.0f32; n * c.hc_hidden()];
                 let (pl, layer, state) = self.ple.as_mut().expect("checked");
                 let w = ple_weights(wf, *pl)?;
-                layer.forward(&w, state, &[token], &hyper, &mut out, Some(io_pool))?;
+                layer.forward(&w, state, tokens, &hyper, &mut out, Some(io_pool))?;
                 upload(b, self.bufs.ple_out, &out)?;
                 steps.push(Step::F(FamOp::Add {
                     dst: self.bufs.hyper,
                     src: self.bufs.ple_out,
-                    n: c.hc_hidden() as u32,
+                    n: (n * c.hc_hidden()) as u32,
                 }));
             }
             let lr = self.w.layers[l].clone();
-            self.hc_steps(&lr.attn_hc, &mut steps);
+            self.hc_steps(&lr.attn_hc, nt, &mut steps);
             match &lr.attn {
-                AttnRefs::Gdn(g) => self.gdn_steps(g, &self.layers[l], &mut steps),
-                AttnRefs::Qsa(_) => self.qsa_layer(b, l, &mut steps)?,
+                AttnRefs::Gdn(g) => self.gdn_steps(g, &self.layers[l], nt, &mut steps),
+                AttnRefs::Qsa(_) => self.qsa_layer(b, l, n, &mut steps)?,
             }
-            steps.push(self.inject_step());
-            self.hc_steps(&lr.mlp_hc, &mut steps);
-            self.moe_layer(b, l, experts, io_pool, &mut steps)?;
+            steps.push(self.inject_step(nt));
+            self.hc_steps(&lr.mlp_hc, nt, &mut steps);
+            if n == 1 {
+                self.moe_layer(b, l, experts, io_pool, &mut steps)?;
+            } else {
+                self.moe_layer_n(b, l, n, experts, io_pool, &mut steps)?;
+            }
         }
-        // Final mixer → LM head; no final norm in this family.
-        let mixer = self.w.mixer;
-        self.hc_steps(&mixer, &mut steps);
+        // Final mixer → LM head on the last row; no final norm in this
+        // family. Without logits the mixer is skipped (it changes no
+        // state).
         if logits.is_some() {
-            steps.push(matvec(
-                "q38.lm_head",
-                self.w.lm_head,
-                self.bufs.mixed,
-                self.bufs.logits,
-                c.hidden as u32,
-                c.vocab as u32,
-            ));
+            let mixer = self.w.mixer;
+            self.hc_steps(&mixer, nt, &mut steps);
+            steps.push(Step::G(Op::MatvecNTokens {
+                label: "q38.lm_head",
+                weight: self.w.lm_head,
+                input: t(self.bufs.mixed),
+                input_off: ((n - 1) * c.hidden * 4) as u64,
+                output: t(self.bufs.logits),
+                output_off: 0,
+                in_dim: c.hidden as u32,
+                out_dim: c.vocab as u32,
+                n_tokens: 1,
+            }));
         }
         self.flush(b, &mut steps, "q38.tail")?;
         self.drain_pending_index(b)?;
@@ -1067,12 +1265,13 @@ impl<B: Q38Exec> Q38Engine<B> {
             let v = download(b, self.bufs.logits, c.vocab)?;
             out.copy_from_slice(&v);
         }
-        self.pos += 1;
+        self.pos += n;
         Ok(())
     }
 
-    /// `tokens` at the next positions, token at a time; the last one's
-    /// logits into `logits` when given.
+    /// `tokens` at the next positions in chunks of
+    /// [`Self::prefill_chunk`] tokens ([`Self::forward_chunk`]); the
+    /// last one's logits into `logits` when given.
     pub fn eval(
         &mut self,
         b: &mut B,
@@ -1082,10 +1281,14 @@ impl<B: Q38Exec> Q38Engine<B> {
         tokens: &[i32],
         mut logits: Option<&mut [f32]>,
     ) -> Result<()> {
-        for (i, &tok) in tokens.iter().enumerate() {
-            let last = i + 1 == tokens.len();
-            let out = if last { logits.as_deref_mut() } else { None };
-            self.step(b, wf, experts, io_pool, tok, out)?;
+        if self.pos + tokens.len() > self.n_ctx {
+            return Err(Q38EngineError::Other(format!("context full ({} tokens)", self.n_ctx)));
+        }
+        let chunks = tokens.chunks(self.chunk);
+        let last = chunks.len().saturating_sub(1);
+        for (i, ch) in chunks.enumerate() {
+            let out = if i == last { logits.as_deref_mut() } else { None };
+            self.forward_chunk(b, wf, experts, io_pool, ch, out)?;
         }
         Ok(())
     }
@@ -1243,6 +1446,11 @@ pub const Q38_STATE_VERSION: u32 = 1;
 
 /// A one-token matvec step.
 fn matvec(label: &'static str, w: WeightRef, input: FBuf, output: FBuf, in_dim: u32, out_dim: u32) -> Step {
+    matvec_n(label, w, input, output, in_dim, out_dim, 1)
+}
+
+/// A matvec step over `n_tokens` rows (`[n, in_dim] → [n, out_dim]`).
+fn matvec_n(label: &'static str, w: WeightRef, input: FBuf, output: FBuf, in_dim: u32, out_dim: u32, n_tokens: u32) -> Step {
     Step::G(Op::MatvecNTokens {
         label,
         weight: w,
@@ -1252,6 +1460,6 @@ fn matvec(label: &'static str, w: WeightRef, input: FBuf, output: FBuf, in_dim: 
         output_off: 0,
         in_dim,
         out_dim,
-        n_tokens: 1,
+        n_tokens,
     })
 }

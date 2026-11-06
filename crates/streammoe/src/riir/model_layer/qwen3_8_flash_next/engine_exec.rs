@@ -19,6 +19,10 @@
 //!   ([`FamOp::GatedRmsNormSigmoid`]; the graph's
 //!   `Op::GatedRmsNormNTokens` gates with SiLU);
 //! - `dst += src` ([`FamOp::Add`], the PLE addition).
+//! - the MoE row gather ([`FamOp::GatherRows`]: each expert assignment
+//!   row from its token's row, on the GPU);
+//! - QSA past the budget ([`FamOp::SparseRows`]: attention over host-
+//!   selected cache rows, `qsa::gpu` on Metal).
 //!
 //! **Norm gains.** Every `1 + w` gain is applied in the kernels, from
 //! the checkpoint's zero-centred bf16 values in the weight file. The
@@ -42,6 +46,8 @@ use std::cell::RefCell;
 use metal::{BufferRef, CommandBufferRef, CompileOptions, ComputePipelineState, Device, MTLSize, NSUInteger};
 
 use super::gated_residual_gpu::{Q38GpuError, Q38GpuKernels};
+use super::qsa::gpu::{QsaGpuKernels, QsaRowBuffers, QsaRowLists};
+use super::qsa::{sdpa_rows, QsaShape};
 use crate::riir::backend::buftype::{Buf, HiddenBuf};
 use crate::riir::backend::{Backend, BufId, BufferPool, CpuBackend, GraphError, MetalBackend, Op};
 use crate::riir::io::embedding::bf16_to_f32;
@@ -90,6 +96,12 @@ pub enum FamOp {
     /// `dst[r, :] = src[idx[r], :]` for `n_rows` rows of `width` (`idx`
     /// i32: the MoE assignment rows from the token rows, on the GPU).
     GatherRows { src: FBuf, idx: FBuf, dst: FBuf, width: u32, n_rows: u32 },
+    /// QSA over the budget: gated attention of `n_tokens` queries (`q` /
+    /// `gate` `[n, q_dim]`) over the cache rows of the last
+    /// [`Q38Exec::fam_set_rows`] lists, into `out` `[n, q_dim]`. Metal:
+    /// [`QsaGpuKernels::encode_sdpa_rows`] (no K / V copies to the
+    /// host); CPU: [`sdpa_rows`] per query.
+    SparseRows { q: FBuf, gate: FBuf, k_cache: FBuf, v_cache: FBuf, out: FBuf, n_tokens: u32 },
 }
 
 /// One entry of a pass.
@@ -101,9 +113,14 @@ pub enum Step {
 
 /// A backend that also runs [`FamOp`]s.
 pub trait Q38Exec: Backend<Error = GraphError> {
-    /// Compiled family kernels (Metal) or nothing (CPU).
+    /// Compiled family kernels and the QSA row lists (Metal), or the
+    /// QSA shape and row lists (CPU).
     type Fam;
-    fn fam_new(&self) -> Result<Self::Fam, Q38GpuError>;
+    fn fam_new(&self, qsa: &QsaShape) -> Result<Self::Fam, Q38GpuError>;
+    /// The row lists the next [`FamOp::SparseRows`] reads. Call it
+    /// after the previous pass has completed (the lists live in one
+    /// buffer).
+    fn fam_set_rows(&self, fam: &mut Self::Fam, lists: &QsaRowLists);
     fn encode_fam(&self, fam: &Self::Fam, op: &FamOp, ctx: &mut Self::EncodeCtx);
 }
 
@@ -355,14 +372,25 @@ impl Q38EngineKernels {
 pub struct Q38MetalFam {
     pub gr: Q38GpuKernels,
     pub eng: Q38EngineKernels,
+    pub qsa: QsaGpuKernels,
+    pub rows: QsaRowBuffers,
 }
 
 impl Q38Exec for MetalBackend {
     type Fam = Q38MetalFam;
 
-    fn fam_new(&self) -> Result<Q38MetalFam, Q38GpuError> {
+    fn fam_new(&self, qsa: &QsaShape) -> Result<Q38MetalFam, Q38GpuError> {
         let device = self.metal().device();
-        Ok(Q38MetalFam { gr: Q38GpuKernels::new(device)?, eng: Q38EngineKernels::new(device)? })
+        Ok(Q38MetalFam {
+            gr: Q38GpuKernels::new(device)?,
+            eng: Q38EngineKernels::new(device)?,
+            qsa: QsaGpuKernels::new(device, qsa)?,
+            rows: QsaRowBuffers::new(device),
+        })
+    }
+
+    fn fam_set_rows(&self, fam: &mut Q38MetalFam, lists: &QsaRowLists) {
+        fam.rows.upload(lists);
     }
 
     fn encode_fam(&self, fam: &Q38MetalFam, op: &FamOp, ctx: &mut Self::EncodeCtx) {
@@ -395,6 +423,25 @@ impl Q38Exec for MetalBackend {
             FamOp::Add { dst, src, n } => fam.eng.encode_add(cmd, h(dst), h(src), n),
             FamOp::GatherRows { src, idx, dst, width, n_rows } => {
                 fam.eng.encode_gather_rows(cmd, h(src), h(idx), h(dst), width, n_rows)
+            }
+            FamOp::SparseRows { q, gate, k_cache, v_cache, out, n_tokens } => {
+                let r = &fam.rows;
+                debug_assert_eq!(r.n_tokens, n_tokens as usize, "SparseRows: row lists of another chunk");
+                fam.qsa.encode_sdpa_rows(
+                    cmd,
+                    h(q),
+                    0,
+                    h(gate),
+                    0,
+                    h(k_cache),
+                    h(v_cache),
+                    r.rows.raw(),
+                    r.counts.raw(),
+                    r.max_rows,
+                    h(out),
+                    0,
+                    u(n_tokens),
+                )
             }
         }
     }
@@ -434,14 +481,25 @@ fn rms_groups(x: &[f32], out: &mut [f32], group: usize, eps: f32, gain: impl Fn(
     }
 }
 
-impl Q38Exec for CpuBackend {
-    type Fam = ();
+/// The CPU backend's family state: the QSA shape and the last row
+/// lists ([`FamOp::SparseRows`]).
+pub struct Q38CpuFam {
+    pub qsa: QsaShape,
+    pub rows: QsaRowLists,
+}
 
-    fn fam_new(&self) -> Result<(), Q38GpuError> {
-        Ok(())
+impl Q38Exec for CpuBackend {
+    type Fam = Q38CpuFam;
+
+    fn fam_new(&self, qsa: &QsaShape) -> Result<Q38CpuFam, Q38GpuError> {
+        Ok(Q38CpuFam { qsa: *qsa, rows: QsaRowLists::default() })
     }
 
-    fn encode_fam(&self, _: &(), op: &FamOp, _ctx: &mut ()) {
+    fn fam_set_rows(&self, fam: &mut Q38CpuFam, lists: &QsaRowLists) {
+        fam.rows = lists.clone();
+    }
+
+    fn encode_fam(&self, fam: &Q38CpuFam, op: &FamOp, _ctx: &mut ()) {
         let pool = self.pool();
         match *op {
             FamOp::HcNorm { x, gain_off, out, group, gain_len, rows, eps } => {
@@ -532,6 +590,19 @@ impl Q38Exec for CpuBackend {
                 for (r, row) in dv[..w * n_rows as usize].chunks_mut(w).enumerate() {
                     let s = iv[r] as usize;
                     row.copy_from_slice(&sv[s * w..(s + 1) * w]);
+                }
+            }
+            FamOp::SparseRows { q, gate, k_cache, v_cache, out, n_tokens } => {
+                let (s, r) = (&fam.qsa, &fam.rows);
+                debug_assert_eq!(r.n_tokens, n_tokens as usize, "SparseRows: row lists of another chunk");
+                let qd = s.q_dim();
+                let (qv, gv) = (f32s(pool.handle(q)), f32s(pool.handle(gate)));
+                let (kc, vc) = (f32s(pool.handle(k_cache)), f32s(pool.handle(v_cache)));
+                let mut ov = f32s_mut(pool.handle(out));
+                for t in 0..n_tokens as usize {
+                    let rows = &r.rows[t * r.max_rows..t * r.max_rows + r.counts[t] as usize];
+                    let (qt, gt) = (&qv[t * qd..(t + 1) * qd], &gv[t * qd..(t + 1) * qd]);
+                    sdpa_rows(s, qt, gt, &kc, &vc, 0, Some(rows), &mut ov[t * qd..(t + 1) * qd]);
                 }
             }
         }
