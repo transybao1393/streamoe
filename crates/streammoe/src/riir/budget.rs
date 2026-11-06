@@ -598,6 +598,7 @@ mod tests {
     /// `staging_experts` clamps to the expert count and rounds a
     /// bounded request down to a multiple of 8 (at least 8).
     #[test]
+    #[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))] // assumes >= 16 experts
     fn staging_experts_rounds_and_clamps() {
         let all = VARIANT.num_experts;
         assert_eq!(staging_experts(all), all);

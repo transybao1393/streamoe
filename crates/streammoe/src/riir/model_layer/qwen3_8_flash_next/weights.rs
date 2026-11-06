@@ -368,6 +368,7 @@ mod tests {
     /// the README's 148, and the per-layer / global name lists are
     /// exactly the index's text tensors.
     #[test]
+    #[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))] // the real index vs the real config
     fn index_is_fully_classified() {
         let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
             .join("models/qwen3-8-flash-next/meta/model.safetensors.index.json");

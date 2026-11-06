@@ -1050,6 +1050,19 @@ pub fn plan_staging(
 mod tests {
     use super::*;
 
+    /// A padded stride is honoured only when the file is exactly
+    /// `num_experts` strides long; otherwise the size-derived layout.
+    #[test]
+    fn layout_and_stride_honours_declared_padding() {
+        let size = ExpertLayout::Q4.expert_size() as u64;
+        let stride = (size + 4095) / 4096 * 4096 + 4096;
+        let n = VARIANT.num_experts as u64;
+        assert_eq!(layout_and_stride(n * stride, Some((size, stride))), (ExpertLayout::Q4, stride));
+        // No declaration, or a length that does not match it: dense.
+        assert_eq!(layout_and_stride(n * size, None), (ExpertLayout::Q4, size));
+        assert_eq!(layout_and_stride(n * size, Some((size, stride))), (ExpertLayout::Q4, size));
+    }
+
     fn scratch_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("streammoe-tier-{tag}-{}", std::process::id()));
         let (p, f) = (root.join("primary"), root.join("fast"));
@@ -1108,6 +1121,7 @@ mod tests {
     /// `stage_layer_compact` puts the i-th listed expert at slot i
     /// (runs coalesced) and leaves the slots past the list untouched.
     #[test]
+    #[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))] // assumes >= 10 experts
     fn stage_layer_compact_packs_listed_experts() {
         use std::io::{Seek, SeekFrom, Write};
         let v = VARIANT;
