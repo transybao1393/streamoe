@@ -336,10 +336,89 @@ weights are 5.14 GiB and the hot tier 1.49 GiB (226 experts).
 - Interactive use needs short messages with thinking off: the first
   word takes ~20 s and a prompt is processed at ~1 token per second.
 
+With the 2026-11-05 defaults (`07c75ec`: prefill overlap and a
+streamed embedding, which frees 0.53 GiB for the hot tier: 226 → 305
+experts), same setup, 32 tokens per answer, identical answers:
+
+| Setup | First word | tok/s | Hot-tier hits |
+| --- | --- | --- | --- |
+| Both off | 22.6 s | 0.53 | 21–24% |
+| **Defaults** | **21.2 s** | **0.54** | 23–26% |
+| Defaults + prefill while typing (chat page default) | 13.9–14.5 s on prompts 2–3 | 0.55 | 23–25% |
+| Defaults + `--spec` | 20.4 s | 0.52 | 19–23% |
+
+**Long prompts.** Layer-major prefill (opt-in,
+`STREAMMOE_LAYER_MAJOR=1`, branch `98a6263`) runs each layer over the
+whole prompt before the next layer, so each layer's experts are read
+once per prompt instead of once per 512-token chunk. Same setup, a
+2,062-token prompt + 4 tokens, one run each, 2026-11-06, same answer:
+
+| | First word | Prompt speed | tok/s | Hot tier | Peak memory |
+| --- | --- | --- | --- | --- | --- |
+| Chunk by chunk (default) | 368 s | 5.6 tok/s | 0.43 | 305 experts | 8.64 GiB |
+| **Layer-major** | **135 s (2.7× sooner)** | 15.3 tok/s | 0.42 | 257 experts | 8.61 GiB |
+
+Its 0.31 GiB window comes out of the hot tier, so it pays only for
+prompts longer than 512 tokens.
+
+### With a bigger cap (predicted)
+
+*Not measured.* This Mac has 18 GB, so caps above ~10 GiB need a
+larger Mac. The prediction combines two measured things:
+
+- **Hit rate:** a 192-token decode trace of the three standard prompts
+  (600 picks per token), replayed through the engine's own LFU rule at
+  each tier size. At 9 GiB the replay gives 25.5% and the engine
+  measured 23–26%.
+- **Time per token:** fitted to the 9 GiB runs, ~0.3 s of compute plus
+  ~3.2 ms per 6.75 MiB read on the external SSD (~2.4 GB/s), counting
+  ~35 wrong prefetches per token. For the internal SSD, ~5 GB/s
+  measured on 6.75 MiB reads.
+
+Everything except the hot tier stays at ~7 GiB, so the tier is the cap
+minus 7 GiB, plus 124 lent prefill slots.
+
+| Cap | Hot tier (experts) | Share of 30,720 | Hits (replay) | Reads / token | tok/s, external SSD | tok/s, internal SSD |
+| --- | --- | --- | --- | --- | --- | --- |
+| **9 GiB** (measured: 0.54) | 429 | 1.4% | 25.5% | 447 | 0.54 | ~0.9 |
+| 12 GiB | ~880 | 2.9% | 34.9% | 390 | ~0.6 | ~1.0 |
+| 16 GiB | ~1,490 | 4.9% | 42.7% | 344 | ~0.65 | ~1.1 |
+| 24 GiB | ~2,700 | 8.8% | 54.0% | 276 | ~0.75 | ~1.25 |
+| 32 GiB | ~3,920 | 13% | 61.0% | 234 | ~0.85 | ~1.35 |
+| 48 GiB | ~6,340 | 21% | 69.2% | 185 | ~1.0 | ~1.6 |
+| 80 GiB | ~11,200 | 36% | 78.5% | 129 | ~1.2 | ~1.8 |
+| 120 GiB | ~17,000 | 55% | 83.8% | 97 | ~1.4 | ~2.0 |
+| ~215 GiB (whole model) | 30,720 | 100% | 100% | 0 | ~3 | ~3 |
+
+- A bigger cap helps steadily but slowly: doubling it from 16 to
+  32 GiB adds ~30%. Above ~48 GiB the ~0.3 s of compute per token
+  becomes the larger part.
+- Above ~24 GiB these hit rates are pessimistic. In 192 tokens the
+  trace touches 18,313 different experts, so no tier can score above
+  ~84% on it, while a long session reuses more.
+- The drive matters as much as the cap: the internal SSD at 9 GiB is
+  predicted to beat the external SSD at 32 GiB. The model (208 GiB)
+  doesn't fit on this Mac's internal disk.
+- Packed 3-bit experts (5.3 MiB instead of 6.75) would put ~27% more
+  experts in the same tier and read ~22% fewer bytes per miss. Not
+  converted yet for the 397B.
+
+Replaying the trace also shows the LFU rule is already at its best
+decay setting. A perfect policy (Belady) would read 26% fewer experts
+at 9 GiB; at bigger caps the gap closes (84.1% vs 83.8% at 120 GiB).
+Details, plus notes on prefill, prefetch, a DGX Spark and
+Qwen3.8-Flash-Next: [`docs/design-notes.md`](docs/design-notes.md).
+
 ## Roadmap
 
-- **Faster time to first word**: stage layer L+1's experts while the
-  GPU computes layer L (staging is ~74% of prefill).
+- **Faster time to first word**: layer-major prefill, which reads each
+  layer's experts once per prompt instead of once per 512-token chunk
+  (built and opt-in; on a 2,062-token prompt −45% prefill on the 35B,
+  first word 368 → 135 s on the 397B); stage layer L+1's experts while the
+  GPU computes layer L.
+- **Qwen3.8-Flash-Next**: 6B active of 125B, ~63 GiB of 4-bit
+  experts; needs Qwen Sparse Attention, Gated Residual and an n-gram
+  embedding lookup ([notes](docs/design-notes.md#qwen38-flash-next)).
 - **Router policy and per-expert precision**: per expert, 4-bit, 3-bit
   or skip, chosen at run time.
 - **Fewer, longer GPU bursts**: more than half of each token is GPU

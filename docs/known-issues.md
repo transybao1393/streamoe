@@ -579,3 +579,22 @@ history of `.claude/memory/`, which is no longer tracked.
   82 → 80%) and mixed reads more experts per token (128 → 138,
   69 → 80). All-3-bit stays the faster choice; mixed only buys
   quality back at a speed cost below 4-bit.
+
+- Longer hot-tier decay on the 397B (2026-11-05, 9 GiB cap, 305
+  slots): `STREAMMOE_HOT_DECAY` 16k / 64k / 256k ran 0.5 / 0.5 /
+  0.4–0.5 tok/s against 0.5–0.6 at the default 4096. A replay of a
+  192-token trace agrees: hits 25.5% at 4096, 21.2% at 16k, 15.3% at
+  256k (2048 ties 4096); LRU 0%, best fixed set 17.2%, Belady's optimum
+  44.7%. The default is at the top of the curve. See
+  [`design-notes.md`](design-notes.md#hot-tier-lfu-with-decay).
+- A probation segment for experts a prompt drags in (SLRU / 2Q: LRU
+  probation, promoted on the first decode hit; branch
+  `worktree-agent-ad49b03d6621548f5`): in the lent slots it can't work,
+  since those are emptied at every prefill; with its own slots it costs
+  4–6 points of hits. Counting prefill picks once per expert per chunk
+  (`STREAMMOE_HOT_PREFILL=once`) gains 1–3 points on long prompts, a
+  wash on chat; not merged.
+- Prompt-lookup speculative decoding (`--spec`) on the 397B in chat
+  (2026-11-05): 0.52 vs 0.54 tok/s. Guesses rarely match on normal
+  chat, and the check-pass buffers (0.74 GiB) shrink the hot tier
+  2.01 → 1.27 GiB.
