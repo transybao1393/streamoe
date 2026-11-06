@@ -15,7 +15,13 @@ use crate::riir::variants::{MROPE_SECTION, RMS_NORM_EPS, ROPE_THETA, VARIANT};
 /// Copies of the hidden state in the residual stream (`hc_count`).
 pub const HC_COUNT: usize = 4;
 /// Rank of the Gated Residual's input-mix gate (`hc_lowrank`).
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const HC_LOWRANK: usize = 320;
+/// Test-only tiny build (`model-qwen3-8-flash-next-tiny`): the
+/// `make_tiny.py --shapes engine` config. Every tiny value below
+/// follows it.
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const HC_LOWRANK: usize = 32;
 /// Width of the residual stream: `hc_count * hidden_size` = 10240.
 pub const HC_HIDDEN: usize = HC_COUNT * VARIANT.hidden_dim;
 
@@ -48,20 +54,42 @@ pub const PLE_LAYERS: &[usize] = &[1];
 /// `ngram_vocab_size_base`). Owned by the PLE module; listed here so
 /// the whole config is in one place.
 pub const NGRAM_SIZE: usize = 3;
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const HEADS_PER_NGRAM: usize = 8;
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const PLE_EMBED_DIM: usize = 2560;
 pub const PLE_CONV_KERNEL: usize = 4;
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const SPLIT_NGRAM_PARTS: usize = 128;
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const NGRAM_VOCAB_SIZE_BASE: usize = 20_000_000;
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const HEADS_PER_NGRAM: usize = 2;
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const PLE_EMBED_DIM: usize = 128;
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const SPLIT_NGRAM_PARTS: usize = 4;
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const NGRAM_VOCAB_SIZE_BASE: usize = 1000;
+/// `make_ngram_vocab_size_divisible_by` and `seed` (the released config
+/// leaves `seed` at its default, 1234).
+pub const NGRAM_VOCAB_DIVISIBLE_BY: usize = 128;
+pub const NGRAM_SEED: u64 = 1234;
 
 /// QSA indexer (`indexer_n_heads`, `indexer_head_dim`,
 /// `indexer_kv_heads`, `indexer_budget`, `indexer_compress_ratio`).
 /// Owned by the QSA module. Up to `INDEXER_BUDGET` tokens of context
 /// every block is selected and QSA equals dense attention.
 pub const INDEXER_N_HEADS: usize = 4;
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const INDEXER_HEAD_DIM: usize = 128;
-pub const INDEXER_KV_HEADS: usize = 1;
+#[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
 pub const INDEXER_BUDGET: usize = 2048;
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const INDEXER_HEAD_DIM: usize = 32;
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const INDEXER_BUDGET: usize = 8;
+pub const INDEXER_KV_HEADS: usize = 1;
 pub const INDEXER_COMPRESS_RATIO: usize = 4;
 
 /// MLX quantization: everything 4-bit with group size 32, except the
@@ -176,6 +204,7 @@ mod tests {
     use super::*;
 
     /// The real config against `text_config` in the MLX `config.json`.
+    #[cfg(not(feature = "model-qwen3-8-flash-next-tiny"))]
     #[test]
     fn real_config_matches_text_config() {
         let c = Q38Config::REAL;

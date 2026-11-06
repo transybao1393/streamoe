@@ -23,6 +23,10 @@ model-cogito-v2-671b    = []
 model-olmoe-1b-7b       = []
 # Qwen3.8-Flash-Next (qwen4_exp preview); layers in riir/model_layer/.
 model-qwen3-8-flash-next = []
+# Test only: Qwen3.8-Flash-Next at the tiny random-weight shapes of
+# tools/model_layer/qwen3_8_flash_next/make_tiny.py --shapes engine
+# (hidden 256), for the engine integration tests. Not a model.
+model-qwen3-8-flash-next-tiny = ["model-qwen3-8-flash-next"]
 
 [dependencies]
 thiserror   = { workspace = true }

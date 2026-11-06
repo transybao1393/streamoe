@@ -183,6 +183,11 @@ pub struct ExpertFiles {
     layout: ExpertLayout,
     /// Bytes per expert blob: `layout.expert_size()`.
     expert_size: usize,
+    /// Bytes between consecutive experts in a layer file: `expert_size`
+    /// unless `layout.json` declares padding ([`declared_stride`]).
+    /// Only file offsets use it; staging buffers, slots and the hot
+    /// tier hold blobs at `expert_size`.
+    expert_stride: usize,
     /// Directory the files were opened relative to. Kept for
     /// diagnostics / debug-impl; never re-read.
     experts_dir: PathBuf,
@@ -230,14 +235,46 @@ pub fn layout_of_len(len: u64) -> ExpertLayout {
     }
 }
 
+/// `(expert_size, expert_stride)` declared by
+/// `packed_experts/layout.json`, when the converter wrote one with a
+/// stride above the size (experts padded to an alignment, e.g. the
+/// Qwen3.8-Flash-Next converter's 16 KiB). Expert `e` then starts at
+/// `e * expert_stride` in its layer file. `None` without the file, or
+/// when it declares no padding — every older layout, where stride ==
+/// size and [`layout_of_len`] decides.
+pub fn declared_stride(subdir: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(subdir.join("layout.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let size = v.get("expert_size")?.as_u64()?;
+    let stride = v.get("expert_stride")?.as_u64()?;
+    (stride > size && ExpertLayout::from_expert_size(size).is_some()).then_some((size, stride))
+}
+
+/// Layout and expert stride of a layer file `len` bytes long: the
+/// declared padded layout ([`declared_stride`]) when the file is
+/// exactly `num_experts` strides long, else [`layout_of_len`] with
+/// stride = size.
+pub fn layout_and_stride(len: u64, declared: Option<(u64, u64)>) -> (ExpertLayout, u64) {
+    if let Some((size, stride)) = declared {
+        if len == VARIANT.num_experts as u64 * stride {
+            if let Some(l) = ExpertLayout::from_expert_size(size) {
+                return (l, stride);
+            }
+        }
+    }
+    let l = layout_of_len(len);
+    (l, l.expert_size() as u64)
+}
+
 /// Layout of the experts under `experts_dir/packed_experts/`, from the
 /// first layer file in `range` present on disk (4-bit if none is).
 /// [`ExpertFiles::open_range_tiered`] checks that the rest agree.
 pub fn detect_layout(experts_dir: &Path, range: std::ops::Range<usize>) -> ExpertLayout {
     let dir = experts_dir.join("packed_experts");
+    let declared = declared_stride(&dir);
     range
         .filter_map(|i| std::fs::metadata(dir.join(format!("layer_{i:02}.bin"))).ok())
-        .map(|m| layout_of_len(m.len()))
+        .map(|m| layout_and_stride(m.len(), declared).0)
         .next()
         .unwrap_or(ExpertLayout::Q4)
 }
@@ -307,6 +344,8 @@ impl ExpertFiles {
         let mut mmap_layers: Vec<Option<Mmap>> = (0..v.num_layers).map(|_| None).collect();
         // First opened layer's layout; the rest must match it.
         let mut layout: Option<(usize, ExpertLayout)> = None;
+        let declared = declared_stride(&subdir);
+        let mut expert_stride: Option<u64> = None;
         for i in 0..v.num_layers {
             if !range.contains(&i) {
                 layers.push(None);
@@ -332,7 +371,8 @@ impl ExpertFiles {
             match File::open(&path) {
                 Ok(f) => {
                     let len = f.metadata().map_err(|e| ExpertIoError::Io { layer: i, source: e })?.len();
-                    let this = layout_of_len(len);
+                    let (this, stride) = layout_and_stride(len, declared);
+                    expert_stride.get_or_insert(stride);
                     match layout {
                         None => layout = Some((i, this)),
                         Some((first_layer, first)) if first != this => {
@@ -392,6 +432,7 @@ impl ExpertFiles {
             layers,
             layout,
             expert_size: layout.expert_size(),
+            expert_stride: expert_stride.map_or(layout.expert_size(), |s| s as usize),
             experts_dir: experts_dir.to_path_buf(),
             mmap_buffers,
             mmap_buf_ids,
@@ -526,7 +567,7 @@ impl ExpertFiles {
         expert_idx: u32,
     ) -> Option<(BufId<ExpertBaseBuf>, u64)> {
         let id = self.mmap_buf_ids.get(layer_idx)?.as_ref()?;
-        let off = (expert_idx as u64) * (self.expert_size as u64);
+        let off = (expert_idx as u64) * (self.expert_stride as u64);
         Some((*id, off))
     }
 
@@ -540,7 +581,7 @@ impl ExpertFiles {
         expert_idx: u32,
     ) -> Option<(&Buffer, u64)> {
         let buf = self.mmap_buffers.get(layer_idx)?.as_ref()?;
-        let off = (expert_idx as u64) * (self.expert_size as u64);
+        let off = (expert_idx as u64) * (self.expert_stride as u64);
         Some((buf, off))
     }
 
@@ -606,7 +647,7 @@ impl ExpertFiles {
         let Some(file) = self.layers[layer_idx].as_ref() else {
             return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
         };
-        let off = (expert_idx as u64) * (self.expert_size as u64);
+        let off = (expert_idx as u64) * (self.expert_stride as u64);
         let permit = self.limits.admit(self.expert_size as u64);
         let tr0 = super::io_trace::now();
         let n = file.read_at(out, off).map_err(|e| ExpertIoError::Io {
@@ -651,6 +692,14 @@ impl ExpertFiles {
             });
         }
         self.read_expert_checks(layer_idx, first + n - 1, &out[..es])?;
+        // Padded experts (stride > size) are not one contiguous range:
+        // read them one by one.
+        if self.expert_stride != es {
+            for (i, blob) in out.chunks_exact_mut(es).enumerate() {
+                self.read_expert_disk_as(kind, layer_idx, first + i, blob)?;
+            }
+            return Ok(());
+        }
         let Some(file) = self.layers[layer_idx].as_ref() else {
             return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
         };
@@ -927,6 +976,14 @@ impl ExpertFiles {
     /// Bytes per expert blob (`layout().expert_size()`).
     pub fn expert_size(&self) -> usize {
         self.expert_size
+    }
+
+    /// Bytes between experts in a layer file ([`declared_stride`]);
+    /// equals [`Self::expert_size`] unless the files are padded. The
+    /// mmap'd layer buffers ([`Self::mmap_id_for_expert`]) are laid out
+    /// at this stride.
+    pub fn expert_stride(&self) -> usize {
+        self.expert_stride
     }
 
     /// `true` iff `layer_idx`'s file was opened from the fast dir.

@@ -843,7 +843,7 @@ pub const VARIANT: Variant = Variant {
 /// quantization — lives in `model_layer::qwen3_8_flash_next::config`.
 /// `num_attn_heads * head_dim` (6144) is not a multiple of
 /// `hidden_dim` (2560); that static check is skipped for this variant.
-#[cfg(feature = "model-qwen3-8-flash-next")]
+#[cfg(all(feature = "model-qwen3-8-flash-next", not(feature = "model-qwen3-8-flash-next-tiny")))]
 pub const VARIANT: Variant = Variant {
     name: "Qwen3.8-Flash-Next-4bit",
     hidden_dim: 2560,
@@ -872,6 +872,60 @@ pub const VARIANT: Variant = Variant {
     attn_output_gate: true,
     qk_norm: QkNorm::PerHead,
     gqa_rotary_dim: 64, // head_dim / 4 (partial_rotary_factor 0.25)
+    norm_topk_prob: true,
+    q_lora_rank: 0,
+    kv_lora_rank: 0,
+    qk_nope_head_dim: 0,
+    qk_rope_head_dim: 0,
+    v_head_dim: 0,
+    n_group: 0,
+    topk_group: 0,
+    routed_scaling_factor: 1.0,
+    first_k_dense_replace: 0,
+    dense_intermediate: 0,
+    yarn_factor: 1.0,
+    yarn_original_max_pos: 0,
+    yarn_beta_fast: 0.0,
+    yarn_beta_slow: 0.0,
+    yarn_mscale: 1.0,
+    yarn_mscale_all_dim: 1.0,
+};
+
+/// Test only (`model-qwen3-8-flash-next-tiny`, which turns on
+/// `model-qwen3-8-flash-next` too): Qwen3.8-Flash-Next at the tiny
+/// random-weight shapes of `tools/model_layer/qwen3_8_flash_next/
+/// make_tiny.py --shapes engine` — hidden 256, 4 layers (3 Gated
+/// DeltaNet + 1 QSA), the kernels' head dims (linear attention 128,
+/// attention 128), 8 experts top-3. Lets the engine integration tests
+/// open a converted tiny model; not a model anyone runs. The rest of
+/// the tiny config is in `model_layer::qwen3_8_flash_next::config`.
+#[cfg(feature = "model-qwen3-8-flash-next-tiny")]
+pub const VARIANT: Variant = Variant {
+    name: "Qwen3.8-Flash-Next-tiny",
+    hidden_dim: 256,
+    num_layers: 4,
+    num_attn_heads: 4,
+    num_kv_heads: 2,
+    head_dim: 128,
+    vocab_size: 1024,
+    num_experts: 8,
+    num_experts_per_tok: 3,
+    moe_intermediate: 64,
+    shared_intermediate: 64,
+    full_attn_interval: 4,
+    linear_num_v_heads: 4,
+    linear_num_k_heads: 2,
+    eos_token_1: 1023,
+    eos_token_2: 1022,
+    think_start_token: 1020,
+    think_end_token: 1021,
+    attn_kind: AttnKind::Gqa,
+    rope_kind: RopeKind::Vanilla,
+    router_kind: RouterKind::Softmax,
+    shared_expert_gate: SharedExpertGate::SigmoidGate,
+    attn_output_gate: true,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 32, // head_dim / 4
     norm_topk_prob: true,
     q_lora_rank: 0,
     kv_lora_rank: 0,

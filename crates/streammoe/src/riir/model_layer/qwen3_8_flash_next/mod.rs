@@ -80,6 +80,10 @@
 //!   `StageInput::Hidden` for layer ranges) become `hc · H` wide.
 
 pub mod config;
+pub mod engine;
+pub mod engine_exec;
+#[cfg(all(test, feature = "model-qwen3-8-flash-next-tiny"))]
+mod engine_tests;
 pub mod gated_residual;
 pub mod gated_residual_gpu;
 pub mod layer;

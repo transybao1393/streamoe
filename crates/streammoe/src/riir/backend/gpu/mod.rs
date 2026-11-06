@@ -529,6 +529,14 @@ pub struct MetalEncodeCtx {
     cmdbuf: CommandBuffer,
 }
 
+impl MetalEncodeCtx {
+    /// The command buffer, for callers that encode their own kernels
+    /// between graph ops (e.g. a model family's extra kernels).
+    pub fn cmdbuf(&self) -> &CommandBufferRef {
+        &self.cmdbuf
+    }
+}
+
 /// Metal `Backend` trait impl.
 ///
 /// Composes a renamed [`MetalContext`] (device + library + pipeline

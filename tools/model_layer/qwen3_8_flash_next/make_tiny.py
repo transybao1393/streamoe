@@ -56,7 +56,29 @@ V = 1024
 EOS = 1023
 
 
-def tiny_text_config():
+# `--shapes engine`: the same model at the shapes the engine's Metal
+# kernels take (Gated DeltaNet heads of 128, attention head_dim 128 for
+# the flash SDPA, hidden 256), for the `model-qwen3-8-flash-next-tiny`
+# build's VARIANT (crates/streammoe/src/riir/variants.rs) and
+# model_layer/qwen3_8_flash_next/config.rs. Keep the three in step.
+ENGINE_SHAPES = {
+    "hidden_size": 256, "head_dim": 128, "num_attention_heads": 4, "num_key_value_heads": 2,
+    "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+    "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+    "indexer_head_dim": 32,
+}
+ENGINE_MROPE_SECTION = [6, 5, 5]      # sums to rotary_dim / 2 = 16
+
+
+def tiny_text_config(shapes="tiny"):
+    tc = _tiny_text_config()
+    if shapes == "engine":
+        tc.update(ENGINE_SHAPES)
+        tc["rope_parameters"] = dict(tc["rope_parameters"], mrope_section=ENGINE_MROPE_SECTION)
+    return tc
+
+
+def _tiny_text_config():
     layer_types = ["linear_attention"] * 3 + ["full_attention"]
     return {
         "attention_bias": False, "attention_dropout": 0.0,
@@ -84,8 +106,8 @@ def tiny_text_config():
     }
 
 
-def tiny_config(quantized):
-    tc = tiny_text_config()
+def tiny_config(quantized, shapes="tiny"):
+    tc = tiny_text_config(shapes)
     cfg = {"architectures": ["Qwen4ExpForConditionalGeneration"], "eos_token_id": [1022, EOS],
            "model_type": "qwen4_exp", "language_model_only": True, "tie_word_embeddings": False,
            "text_config": tc}
@@ -311,11 +333,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="tiny")
     ap.add_argument("--seed", type=int, default=2)  # 2: widest router / QSA margins of seeds 0-3
+    ap.add_argument("--shapes", choices=("tiny", "engine"), default="tiny",
+                    help="engine: the engine kernels' head dims (model-qwen3-8-flash-next-tiny)")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     root = os.path.join(os.path.expanduser(a.out), a.name)
-    cfg_u, cfg_q = tiny_config(False), tiny_config(True)
+    cfg_u, cfg_q = tiny_config(False, a.shapes), tiny_config(True, a.shapes)
     tc = schema.text_config(cfg_u)
     w = random_weights(cfg_u, a.seed)
 
