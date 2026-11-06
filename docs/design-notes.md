@@ -424,3 +424,53 @@ try IQ3_XXS later as an experiment; skip 2-bit.
 **Blocker: disk.** ~95 GB for a 4-bit copy with the n-gram table
 quantized (~170 GB with it in BF16), plus room for the source during
 conversion. Free on 2026-11-05: 75 GiB internal, 17 GiB external.
+
+### Expert reads and PLE in the engine
+
+**Expert reads** (`Q38Engine::moe_layer`). One staging buffer, read
+by the permute-fuse op at `slot · expert_size` (the padded file
+stride, 3,080,192 B on the real model and 32,768 B on the tiny one, is
+only a file offset):
+
+| Slots | Holds |
+| --- | --- |
+| `0 .. K` | Bucket i's expert: a hot-tier copy or a pread |
+| `K + s·P .. K + s·P + P` | Prefetch set `s = layer % 2`, `P = min(prefetch_experts, K)` |
+
+The prefetch is the a3b decode path's `PrefetchState`: previous-token
+guess, strongest pick first, hot-tier experts masked out. Layer L's
+reads go out at the top of layer L, so they run under the GPU work up
+to its router; with `prefetch_lookahead`, layer L+1's go out right
+after layer L's router readback. A routed expert found in the set binds
+that slot directly. Settings and defaults are the context's (all K
+uncapped, 4 under a cap, `prefetch_experts = 0` turns it off); the plan
+counts the `2P` extra slots. Not used: the cross-layer guesser (GQA
+only) and switches A/B/C (on a separate branch, not merged here).
+Everything in flight is drained at the end of each token.
+
+Measured on the tiny model (4 layers × 8 experts, top 3; 13 + 8 tokens
+× 3 prompts = 780 picks; logits bit-identical in every arm):
+
+| Arm | Prefetch hits / reads | Demand reads | Hot hits |
+| --- | --- | --- | --- |
+| Off | – | 780 | – |
+| Prefetch all 3 | 283 / 732 | 497 | – |
+| Prefetch 1 + lookahead | 95 / 244 | 685 | – |
+| Hot tier 12 slots | – | 501 | 279 |
+| Prefetch all + hot tier 12 | 173 / 438 | 322 | 285 |
+
+Random weights route close to uniformly, so these say nothing about
+the real model's hit rates. Hot-tier hits are still copied into the
+staging (~3 MB each); binding them in place needs per-bucket buffers
+in the permute-fuse op.
+
+**PLE** (`ple_gpu.rs`). The n-gram rows are a host table lookup and
+are uploaded (2,560 floats per token); `key_proj` / `value_proj` are
+graph matvecs; the norms, the signed-sqrt gate and the dilated conv
+are two family ops (`PleOp::Gate`, `PleOp::Conv`), and the conv state
+lives in a GPU buffer. The PLE layer no longer flushes or reads the
+residual back. The ops take T rows (the conv walks them in order), so
+chunked prefill can reuse them once the engine's PLE buffers hold T
+rows; until then a call with more rows takes the host path. Checked
+against `ple_reference.py`'s fixture (Metal 3.6e-7, CPU 2.6e-7) and,
+in the engine, against the host PLE (≤ 1.5e-6 on the logits).
