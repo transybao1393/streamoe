@@ -100,9 +100,13 @@ pub enum Q38EngineError {
     Kernels(#[from] super::gated_residual_gpu::Q38GpuError),
     #[error("router: {0}")]
     Router(#[from] crate::riir::moe::moe_router::MoeRouterError),
+    #[error("snapshot: {0}")]
+    Snapshot(#[from] SnapErr),
     #[error("{0}")]
     Other(String),
 }
+
+use crate::riir::snapshot::state_snapshot::StateSnapshotError as SnapErr;
 
 type Result<T> = std::result::Result<T, Q38EngineError>;
 
@@ -1045,17 +1049,7 @@ impl<B: Q38Exec> Q38Engine<B> {
 
     /// Bytes of a snapshot at position `pos` (`n_ctx` for the largest).
     pub fn state_size_at(&self, pos: usize) -> usize {
-        let mut n = 16;
-        for lb in &self.layers {
-            n += match *lb {
-                LayerBufs::Gdn { conv_len, delta_len, .. } => 4 * (conv_len + delta_len),
-                LayerBufs::Qsa { .. } => 4 * pos * (2 * self.qsa.kv_dim() + self.qsa.idx_head_dim),
-            };
-        }
-        if let Some((_, _, st)) = &self.ple {
-            n += 8 + st.state_bytes();
-        }
-        n
+        state_size_at(pos)
     }
 
     /// Serialize the sequence state (`Q38S` v1): position, per layer
@@ -1064,7 +1058,7 @@ impl<B: Q38Exec> Q38Engine<B> {
     pub fn state_save(&self, b: &B, buf: &mut [u8]) -> Result<usize> {
         let need = self.state_size();
         if buf.len() < need {
-            return Err(Q38EngineError::Other(format!("state buffer {} < {need} bytes", buf.len())));
+            return Err(SnapErr::BufferTooSmall { need, got: buf.len() }.into());
         }
         let mut out: Vec<u8> = Vec::with_capacity(need);
         out.extend_from_slice(&Q38_STATE_MAGIC.to_le_bytes());
@@ -1100,20 +1094,31 @@ impl<B: Q38Exec> Q38Engine<B> {
     /// Restore a [`Self::state_save`] snapshot. Checks the whole buffer
     /// before changing anything.
     pub fn state_load(&mut self, b: &mut B, buf: &[u8]) -> Result<()> {
-        let bad = |m: &str| Q38EngineError::Other(format!("snapshot: {m}"));
         let u32_at = |o: usize| -> Result<u32> {
-            buf.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap())).ok_or_else(|| bad("truncated header"))
+            buf.get(o..o + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+                .ok_or(Q38EngineError::Snapshot(SnapErr::Truncated { layer: 0, need: o + 4, got: buf.len() }))
         };
-        if u32_at(0)? != Q38_STATE_MAGIC || u32_at(4)? != Q38_STATE_VERSION {
-            return Err(bad("not a Q38S v1 snapshot"));
+        let magic = u32_at(0)?;
+        if magic != Q38_STATE_MAGIC {
+            return Err(SnapErr::BadMagic { got: magic, want: Q38_STATE_MAGIC }.into());
+        }
+        let version = u32_at(4)?;
+        if version != Q38_STATE_VERSION {
+            return Err(SnapErr::BadVersion { got: version, want: Q38_STATE_VERSION }.into());
         }
         let pos = u32_at(8)? as usize;
-        if u32_at(12)? as usize != self.layers.len() || pos > self.n_ctx {
-            return Err(bad("shape mismatch"));
+        let n_layers = u32_at(12)?;
+        if n_layers as usize != self.layers.len() {
+            return Err(SnapErr::ShapeMismatch { field: "num_layers", got: n_layers, want: self.layers.len() as u32 }
+                .into());
+        }
+        if pos > self.n_ctx {
+            return Err(SnapErr::LenOverflow { layer: 0, len: pos as i32, max: self.n_ctx }.into());
         }
         let need = self.state_size_at(pos);
         if buf.len() < need {
-            return Err(bad("truncated"));
+            return Err(SnapErr::Truncated { layer: 0, need, got: buf.len() }.into());
         }
         let kvd = self.qsa.kv_dim();
         let idd = self.qsa.idx_head_dim;
@@ -1133,15 +1138,14 @@ impl<B: Q38Exec> Q38Engine<B> {
                 LayerBufs::Qsa { .. } => (take(pos * kvd), take(pos * kvd), take(pos * idd)),
             });
         }
-        let ple_bytes = if self.ple.is_some() {
+        if let Some((_, _, st)) = self.ple.as_mut() {
             let n = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap()) as usize;
-            let s = &buf[o + 8..o + 8 + n];
-            Some(s)
-        } else {
-            None
-        };
-        if let (Some((_, _, st)), Some(s)) = (self.ple.as_mut(), ple_bytes) {
-            st.load(s)?;
+            if n != st.state_bytes() {
+                return Err(SnapErr::ShapeMismatch { field: "ple_state", got: n as u32, want: st.state_bytes() as u32 }
+                    .into());
+            }
+            // Fixed size and inside `need`: cannot fail after the checks.
+            st.load(&buf[o + 8..o + 8 + n])?;
         }
         for (l, (lb, (a, bb, ix))) in self.layers.iter().zip(layer_data).enumerate() {
             match *lb {
@@ -1160,6 +1164,27 @@ impl<B: Q38Exec> Q38Engine<B> {
         self.pos = pos;
         Ok(())
     }
+}
+
+/// Bytes of a [`Q38Engine::state_save`] snapshot at position `pos`
+/// (`n_ctx` for the largest; sizes the checkpoint buffers at open).
+pub fn state_size_at(pos: usize) -> usize {
+    let c = q38_config();
+    let s = qsa_shape();
+    let mut n = 16;
+    for l in 0..c.num_layers {
+        n += match c.layer_kind(l) {
+            Q38LayerKind::LinearAttn => {
+                4 * ((c.conv_kernel - 1) * c.linear_conv_dim()
+                    + c.linear_v_heads * c.linear_value_dim * c.linear_key_dim)
+            }
+            Q38LayerKind::Qsa => 4 * pos * (2 * s.kv_dim() + s.idx_head_dim),
+        };
+    }
+    if !c.ple_layers.is_empty() {
+        n += 8 + PleState::new(&ple_config(), &ngram_config()).state_bytes();
+    }
+    n
 }
 
 /// `Q38S` little-endian.

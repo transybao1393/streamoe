@@ -18,6 +18,9 @@
 //! phase breakdown.
 
 #![allow(missing_docs)] // Phase 3 — types fill in incrementally.
+// Qwen3.8-Flash-Next routes evals to its own engine (`q38_ctx`); the
+// qwen3_5_moe paths it bypasses stay compiled but unused.
+#![cfg_attr(feature = "model-qwen3-8-flash-next", allow(dead_code, unreachable_code, unused_mut))]
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -33,6 +36,8 @@ pub mod gpu_capture;
 pub mod io;
 pub mod model_layer;
 pub mod moe;
+#[cfg(feature = "model-qwen3-8-flash-next")]
+mod q38_ctx;
 pub mod range;
 pub mod requests;
 pub mod snapshot;
@@ -483,6 +488,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// Parked state per slot. The active slot's entry is an empty
     /// placeholder — its state is checked out into the live fields.
     parked: Vec<requests::SeqState>,
+    /// Qwen3.8-Flash-Next: the family engine every eval and state op
+    /// routes to ([`q38_ctx`]); `layer_states` stays empty.
+    #[cfg(feature = "model-qwen3-8-flash-next")]
+    q38: q38_ctx::Q38Slot,
     // Future phases populate: vocab.
 }
 
@@ -601,6 +610,8 @@ impl RsCtx<MetalBackend> {
         config
             .validate()
             .map_err(|detail| RsError::InvalidConfig { detail })?;
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        q38_ctx::check_config(config)?;
         let baseline_peak = match config.mem_cap {
             Some(_) => budget::footprint().ok_or(RsError::InitFailed)?.peak,
             None => 0,
@@ -668,8 +679,15 @@ impl RsCtx<MetalBackend> {
         }
         // Host structs only (lazily committed); allocated here so the
         // plan can size the checkpoint buffers from them.
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone(), config.kv_format);
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         let checkpoint_slot_bytes = snapshot::state_snapshot::state_size_full(&layer_states);
+        // This family's sequence state lives in its engine (`q38_ctx`).
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        let layer_states = alloc_layer_states_range(n_ctx, 0..0, config.kv_format);
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        let checkpoint_slot_bytes = model_layer::qwen3_8_flash_next::engine::state_size_at(n_ctx);
         let mut prefill_staging_experts =
             budget::staging_experts(config.prefill_staging_experts.unwrap_or(VARIANT.num_experts));
         let mut planned_exact = None;
@@ -714,6 +732,8 @@ impl RsCtx<MetalBackend> {
             }
             // Staging every expert of a layer does not fit: bound it,
             // and let the batched MoE layer run in expert groups.
+            #[cfg(feature = "model-qwen3-8-flash-next")]
+            q38_ctx::plan(&mut plan, n_ctx, expert_size, experts_dir)?;
             if config.prefill_staging_experts.is_none() && plan.check(cap).is_err() {
                 let bounded = budget::staging_experts(budget::BOUNDED_STAGING_EXPERTS);
                 if bounded < prefill_staging_experts && plan.get(budget::Account::PrefillStaging) > 0 {
@@ -885,6 +905,8 @@ impl RsCtx<MetalBackend> {
             baseline_peak,
             requests: requests::RequestTable::new(config.max_requests),
             parked,
+            #[cfg(feature = "model-qwen3-8-flash-next")]
+            q38: q38_ctx::Q38Slot::new(experts_dir),
         };
         if hot_tier_bytes >= expert_size {
             ctx.attach_hot_tier(hot_tier_bytes, config.hot_tier_profile.as_deref())?;
@@ -994,6 +1016,9 @@ impl RsCtx<MetalBackend> {
     /// caches, so the context reaches its steady-state footprint
     /// before `open` returns, then check the measured footprint.
     fn reserve_at_open(&mut self, cap: u64) -> Result<(), RsError> {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        self.ensure_q38()?;
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         match VARIANT.attn_kind {
             variants::AttnKind::Gqa => self.ensure_linear_resources()?,
             // `ensure_mla_resources` allocates every slot's MLA caches.
@@ -2553,6 +2578,8 @@ impl RsCtx<MetalBackend> {
         if start_pos < 0 {
             return Err(RsError::EvalFailed);
         }
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_step(input, start_pos, output);
 
         // MLA: tokenwise oracle for now (batched MLA = session-5+).
         if matches!(VARIANT.attn_kind, variants::AttnKind::Mla) {
@@ -3444,6 +3471,9 @@ impl RsCtx<MetalBackend> {
         // Telemetry: wall time per decode token (plan phase 6).
         let t0 = std::time::Instant::now();
         io::io_trace::mark('T', 0);
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        let r = self.q38_step(input, pos, output);
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         let r = self.step_internal_per_token_inner(input, pos, output);
         io::io_trace::mark('E', 0);
         if r.is_ok() {
@@ -3783,6 +3813,8 @@ impl RsCtx<MetalBackend> {
     /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
         self.activate_slot(0);
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        self.q38_clear();
         clear_all(self.layer_states.as_mut_slice());
         if let (Some(bufs), Some(backend)) = (self.linear_buffers.as_ref(), self.backend.as_ref()) {
             let pool = backend.pool();
@@ -3826,8 +3858,13 @@ impl RsCtx<MetalBackend> {
     /// infallible.
     pub fn memory_seq_rm(&mut self, _seq_id: i32, p0: i32, p1: i32) -> bool {
         self.activate_slot(0);
-        truncate(self.layer_states.as_mut_slice(), p0, p1);
-        true
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_seq_rm(p0, p1);
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
+        {
+            truncate(self.layer_states.as_mut_slice(), p0, p1);
+            true
+        }
     }
 
     /// Snapshot the current ctx state at sequence position `pos`.
@@ -4024,6 +4061,9 @@ impl RsCtx<MetalBackend> {
     /// none has any entries. Mirrors `mf_memory_seq_pos_max`
     /// (infer.m:7759).
     pub fn memory_seq_pos_max(&self, _seq_id: i32) -> i32 {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_pos_max();
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         pos_max(self.slot_states(0).as_slice())
     }
 
@@ -4032,6 +4072,9 @@ impl RsCtx<MetalBackend> {
     /// linearly with the largest KV length across full-attn layers;
     /// re-query after each evaluation if the state has changed.
     pub fn state_size(&self) -> usize {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_state_size();
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         snapshot::state_snapshot::state_size(self.slot_states(0))
     }
 
@@ -4056,6 +4099,8 @@ impl RsCtx<MetalBackend> {
         &mut self,
         buf: &mut [u8],
     ) -> Result<usize, snapshot::state_snapshot::StateSnapshotError> {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_state_save(buf);
         // Drain deferred state so the snapshot reflects post-token
         // state, not mid-flight.
         snapshot::state_snapshot::drain_deferred(&mut self.deferred);
@@ -4145,6 +4190,12 @@ impl RsCtx<MetalBackend> {
     /// [`Self::state_size`] for request `req`.
     pub fn state_size_for(&self, req: ReqId) -> Result<usize, RsError> {
         let slot = self.requests.slot_of(req).ok_or(RsError::UnknownRequest { req: req.0 })?;
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return {
+            let _ = slot; // one request slot (`max_requests` 1)
+            Ok(self.q38_state_size())
+        };
+        #[cfg(not(feature = "model-qwen3-8-flash-next"))]
         Ok(snapshot::state_snapshot::state_size(self.slot_states(slot)))
     }
 
@@ -4230,6 +4281,8 @@ impl RsCtx<MetalBackend> {
         &mut self,
         buf: &[u8],
     ) -> Result<(), snapshot::state_snapshot::StateSnapshotError> {
+        #[cfg(feature = "model-qwen3-8-flash-next")]
+        return self.q38_state_load(buf);
         // Drain any pending dispatch — load overwrites the state the
         // dispatch was producing for.
         snapshot::state_snapshot::drain_deferred(&mut self.deferred);
