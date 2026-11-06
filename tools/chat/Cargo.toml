@@ -19,6 +19,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 default = ["a3b"]
 a3b = ["streammoe/model-qwen3-6-35b-a3b"]
 a17b = ["streammoe/model-qwen3-5-a17b"]
+qnext = ["streammoe/model-qwen3-next-80b-a3b"]
 
 # Standalone: not a workspace member, so the engine crate gains no
 # dependencies from this tool.
