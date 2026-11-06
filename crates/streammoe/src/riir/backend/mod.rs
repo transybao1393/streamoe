@@ -296,8 +296,17 @@ pub trait Backend {
         self.execute(graph, label)
     }
 
+    /// Commit work the caller encoded into `ctx` without waiting for it
+    /// (Metal), as [`Self::execute_nowait`] does for a graph;
+    /// [`Self::wait_pending`] waits. The default is
+    /// [`Self::submit_and_wait`] (the CPU backend ran it while encoding).
+    fn submit_nowait(&self, ctx: Self::EncodeCtx, label: &'static str) -> Result<(), Self::Error> {
+        self.submit_and_wait(ctx, label)
+    }
+
     /// Wait, oldest first, until at most `keep` of the commands
-    /// [`Self::execute_nowait`] committed are still in flight.
+    /// [`Self::execute_nowait`] / [`Self::submit_nowait`] committed are
+    /// still in flight.
     fn wait_pending(&self, _keep: usize) -> Result<(), Self::Error> {
         Ok(())
     }

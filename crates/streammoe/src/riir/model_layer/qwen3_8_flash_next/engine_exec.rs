@@ -138,6 +138,20 @@ pub fn run_steps<B: Q38Exec>(b: &B, fam: &B::Fam, steps: &[Step], label: &'stati
     b.submit_and_wait(ctx, label)
 }
 
+/// [`run_steps`] without waiting: committed behind every earlier
+/// command buffer (Metal; [`Backend::wait_pending`] waits), run inline
+/// on the CPU backend.
+pub fn run_steps_nowait<B: Q38Exec>(b: &B, fam: &B::Fam, steps: &[Step], label: &'static str) -> Result<(), GraphError> {
+    let mut ctx = b.begin_encoding();
+    for s in steps {
+        match s {
+            Step::G(op) => b.encode_op(op, &mut ctx),
+            Step::F(f) => b.encode_fam(fam, f, &mut ctx),
+        }
+    }
+    b.submit_nowait(ctx, label)
+}
+
 // --- Metal -------------------------------------------------------------
 
 /// Kernels the Gated Residual library does not have.

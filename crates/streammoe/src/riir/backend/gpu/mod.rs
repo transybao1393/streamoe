@@ -759,6 +759,13 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn submit_nowait(&self, ctx: MetalEncodeCtx, label: &'static str) -> Result<(), GraphError> {
+        ctx.cmdbuf.commit();
+        crate::riir::backend::gpu::gpu_timing::mark(label);
+        self.pending.lock().expect("pending mutex poisoned").push_back((ctx.cmdbuf, label));
+        Ok(())
+    }
+
     fn wait_pending(&self, keep: usize) -> Result<(), GraphError> {
         loop {
             let next = {

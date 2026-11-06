@@ -100,7 +100,7 @@ use super::config::{
     NGRAM_SEED, NGRAM_SIZE, NGRAM_VOCAB_DIVISIBLE_BY, NGRAM_VOCAB_SIZE_BASE, HEADS_PER_NGRAM, PLE_CONV_KERNEL,
     PLE_EMBED_DIM,
 };
-use super::engine_exec::{retag, run_steps, FBuf, FamOp, Q38Exec, Step};
+use super::engine_exec::{retag, run_steps, run_steps_nowait, FBuf, FamOp, Q38Exec, Step};
 use super::ngram::{NgramConfig, NgramTable};
 use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
 use super::qsa::gpu::{qsa_select_rows, QsaRowLists};
@@ -571,7 +571,7 @@ pub fn plan_bytes_io(
             + 2 * c.linear_conv_dim() as u64 + 3 * vt + 4 * c.linear_v_heads as u64
             + (s.q_proj_dim() + 3 * s.q_dim() + 2 * s.kv_dim() + s.idx_proj_dim() + s.rotary_dim) as u64
             + c.num_experts as u64 + 4 * c.shared_intermediate as u64 + 2 * h + 2
-            + k * (2 * h + 3 * c.moe_intermediate as u64 + 3)
+            + k * (2 * h + 3 * c.moe_intermediate as u64 + 6) // bucket rows, two metadata sets
             // GPU PLE: the n-gram embedding, k, v, norm_conv rows.
             + (pc.embed_dim + 2 * pc.hc_hidden() + pc.hidden) as u64)
             + c.vocab as u64);
@@ -646,6 +646,10 @@ struct Bufs {
     bucket_out: FBuf,
     bucket_token_idx: FBuf,
     bucket_weights: FBuf,
+    /// The second set of `[bucket_token_idx, bucket_weights,
+    /// expert_indices]`: prefill batches alternate sets, so a batch's
+    /// uploads never touch what the batch still in flight reads.
+    meta_b: [FBuf; 3],
     logits: FBuf,
     /// Prefill expert staging ([`Q38PrefillIo::slots`] slots,
     /// [`Q38PrefillIo::stride`] apart).
@@ -860,6 +864,11 @@ impl<B: Q38Exec> Q38Engine<B> {
             bucket_out: alloc(b, ch * k * h, "q38.bucket_out")?,
             bucket_token_idx: alloc(b, ch * k, "q38.bucket_token_idx")?,
             bucket_weights: alloc(b, ch * k, "q38.bucket_weights")?,
+            meta_b: [
+                alloc(b, ch * k, "q38.bucket_token_idx_b")?,
+                alloc(b, ch * k, "q38.bucket_weights_b")?,
+                alloc(b, ch * k, "q38.expert_indices_b")?,
+            ],
             logits: alloc(b, cfg.vocab, "q38.logits")?,
             prefill_staging: alloc(b, (io.slots * io.stride).div_ceil(4), "q38.prefill_staging")?,
         };
@@ -1351,16 +1360,37 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
     }
 
-    /// Run `steps` (cleared) as one pass.
+    /// Run `steps` (cleared) as one pass and wait for it and for every
+    /// pass [`Self::flush_nowait`] left in flight.
     fn flush(&self, b: &B, steps: &mut Vec<Step>, label: &'static str) -> Result<()> {
+        let t0 = std::time::Instant::now();
         if !steps.is_empty() {
-            let t0 = std::time::Instant::now();
             run_steps(b, &self.fam, steps, label)?;
-            let ns = t0.elapsed().as_nanos() as u64;
-            self.gpu_wait_ns.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
             self.submits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             steps.clear();
         }
+        b.wait_pending(0)?;
+        self.gpu_wait_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Commit `steps` (cleared) as one pass without waiting for it
+    /// (Metal; inline on the CPU backend).
+    fn flush_nowait(&self, b: &B, steps: &mut Vec<Step>, label: &'static str) -> Result<()> {
+        if !steps.is_empty() {
+            run_steps_nowait(b, &self.fam, steps, label)?;
+            self.submits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            steps.clear();
+        }
+        Ok(())
+    }
+
+    /// Wait until at most `keep` passes of [`Self::flush_nowait`] are in
+    /// flight.
+    fn wait_passes(&self, b: &B, keep: usize) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        b.wait_pending(keep)?;
+        self.gpu_wait_ns.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -1607,14 +1637,22 @@ impl<B: Q38Exec> Q38Engine<B> {
         // A stride the staging was not built for: expert by expert.
         let spans_ok = experts.expert_stride() == self.io.stride;
         let max_read = if spans_ok { self.io.max_read } else { 1 };
-        let cap = self.pf_io_slots;
+        // With two or more slots, two halves: batch i reads into half
+        // i % 2 while the GPU runs batch i - 1 from the other one.
+        let overlap = self.pf_io_slots >= 2;
+        let cap = if overlap { self.pf_io_slots / 2 } else { self.pf_io_slots };
         let batches = plan_prefill_batches(&buckets.expert_ids, is_hot, whole && spans_ok, cap, max_read);
         self.pio_chunk.layers += 1;
         self.pio_chunk.layer_reads += (whole && spans_ok) as u64;
         self.pio_chunk.experts += nb as u64;
         let st = self.io.stride;
         for (bi_n, bt) in batches.iter().enumerate() {
-            let base = 0u32;
+            let half = if overlap { bi_n % 2 } else { 0 };
+            let base = (half * cap) as u32;
+            if overlap {
+                // Batch i - 2 last read this half and its metadata set.
+                self.wait_passes(b, 1)?;
+            }
             let t0 = std::time::Instant::now();
             self.stage_batch(l, bt, base, &buckets.expert_ids, spans_ok, experts, io_pool)?;
             let io_ns = t0.elapsed().as_nanos() as u64;
@@ -1648,33 +1686,41 @@ impl<B: Q38Exec> Q38Engine<B> {
                 let (r0, r1) = (group.offsets[i] as usize, group.offsets[i + 1] as usize);
                 expert_indices[r0..r1].fill(s);
             }
-            upload(b, bu.bucket_token_idx, &group.token_idx)?;
-            upload(b, bu.bucket_weights, &group.weights)?;
-            upload(b, bu.expert_indices, &expert_indices)?;
+            let [tok, wts, eidx] =
+                if half == 0 { [bu.bucket_token_idx, bu.bucket_weights, bu.expert_indices] } else { bu.meta_b };
+            upload(b, tok, &group.token_idx)?;
+            upload(b, wts, &group.weights)?;
+            upload(b, eidx, &expert_indices)?;
             steps.push(Step::F(FamOp::GatherRows {
                 src: bu.mixed,
-                idx: bu.bucket_token_idx,
+                idx: tok,
                 dst: bu.bucket_input,
                 width: h,
                 n_rows: (a1 - a0) as u32,
             }));
+            // The bucket scratch is shared by every batch: the GPU runs
+            // the passes in order, so only host writes need the halves.
             steps.push(Step::G(Op::MoeBatchedPermuteFuse {
                 label: "q38.moe.permute_fuse",
                 expert_base: t(bu.prefill_staging),
                 expert_stride: st as u64,
-                expert_indices: t(bu.expert_indices),
+                expert_indices: t(eidx),
                 expert_slots: slots,
                 bucket_input: t(bu.bucket_input),
                 bucket_gate: t(bu.bucket_gate),
                 bucket_up: t(bu.bucket_up),
                 bucket_act: t(bu.bucket_act),
                 bucket_out: t(bu.bucket_out),
-                bucket_token_idx: t(bu.bucket_token_idx),
-                bucket_weights: t(bu.bucket_weights),
+                bucket_token_idx: t(tok),
+                bucket_weights: t(wts),
                 out_sum: t(bu.out_sum),
                 buckets: group,
             }));
-            if bi_n + 1 < batches.len() {
+            if overlap {
+                // In flight while the next batch reads; the next
+                // `flush` waits for all of them.
+                self.flush_nowait(b, steps, "q38.moe_group")?;
+            } else if bi_n + 1 < batches.len() {
                 self.flush(b, steps, "q38.moe_group")?;
             }
         }
