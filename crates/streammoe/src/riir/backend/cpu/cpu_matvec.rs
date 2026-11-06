@@ -490,8 +490,10 @@ mod tests {
         // 8 u32 words = 64 nibbles, each = 1 (0x11111111).
         let packed = vec![0x1111_1111u32; 8];
         // scale = 1.0 (BF16 0x3F80), bias = 0.0 (BF16 0x0000).
-        let scales = vec![0x3F80u16; 1];
-        let biases = vec![0x0000u16; 1];
+        // One (scale, bias) per group: 1 at group 64, 2 at group 32.
+        let groups = in_dim / crate::riir::variants::GROUP_SIZE;
+        let scales = vec![0x3F80u16; groups];
+        let biases = vec![0x0000u16; groups];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
         dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out).unwrap();
@@ -525,8 +527,9 @@ mod tests {
         let in_dim = 64;
         let out_dim = 2;
         let packed = vec![0xFFFF_FFFFu32; 8 * out_dim];
-        let scales = vec![0x3F80u16; out_dim];
-        let biases = vec![0x3F80u16; out_dim];
+        let groups = in_dim / crate::riir::variants::GROUP_SIZE;
+        let scales = vec![0x3F80u16; groups * out_dim];
+        let biases = vec![0x3F80u16; groups * out_dim];
         let x = vec![0.0f32; in_dim];
         let mut out = vec![999.0f32; out_dim];
         dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out).unwrap();
@@ -543,8 +546,9 @@ mod tests {
         let out_dim = 1;
         let packed = vec![0u32; 8];
         // scale = 5.0 (BF16 0x40A0), bias = 2.0 (BF16 0x4000).
-        let scales = vec![0x40A0u16; 1];
-        let biases = vec![0x4000u16; 1];
+        let groups = in_dim / crate::riir::variants::GROUP_SIZE;
+        let scales = vec![0x40A0u16; groups];
+        let biases = vec![0x4000u16; groups];
         let x = vec![1.0f32; in_dim];
         let mut out = vec![0.0f32; out_dim];
         dequant_matvec_4bit_cpu(&packed, &scales, &biases, in_dim, out_dim, &x, &mut out).unwrap();
