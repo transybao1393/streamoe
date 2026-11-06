@@ -39,6 +39,8 @@
 //! - [`layer`] — decoder-layer orchestration, the call points for QSA
 //!   ([`layer::AttnBlock`]) and PLE ([`layer::PleHook`]), and a CPU
 //!   end-to-end forward ([`layer::Q38CpuModel`]).
+//! - [`ngram`] / [`ple`] — the per-layer n-gram embedding: hashing,
+//!   streamed row table (`MFNG` file), PLE layer forward.
 //! - [`tiny`] — tiny random-weight models matching the torch port
 //!   `tools/model_layer/qwen3_8_flash_next/core_ref.py`.
 //!
@@ -79,5 +81,7 @@ pub mod config;
 pub mod gated_residual;
 pub mod gated_residual_gpu;
 pub mod layer;
+pub mod ngram;
+pub mod ple;
 pub mod tiny;
 pub mod weights;
