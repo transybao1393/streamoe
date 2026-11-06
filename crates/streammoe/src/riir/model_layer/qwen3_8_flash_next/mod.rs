@@ -79,6 +79,7 @@ pub mod ple;
 pub mod ple_gpu;
 #[cfg(all(test, feature = "model-qwen3-8-flash-next-tiny"))]
 mod prefetch_tests;
+pub mod prefill_io;
 pub mod qsa;
 pub mod tiny;
 pub mod weights;

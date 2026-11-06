@@ -105,6 +105,11 @@ use super::ngram::{NgramConfig, NgramTable};
 use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
 use super::qsa::gpu::{qsa_select_rows, QsaRowLists};
 use super::ple_gpu::PleOp;
+use super::prefill_io::{
+    default_layer_read_frac, env_f64, env_usize, plan_prefill_batches, staging_stride, trace_from_env,
+    PrefillIoStats, DEFAULT_MAX_READ, DEFAULT_PREFILL_SLOTS,
+};
+use crate::riir::io::io_stats::ReadKind;
 use super::qsa::{
     push_qsa_o_proj, push_qsa_pre_sdpa, push_qsa_sdpa, qsa_indexer_step, qsa_needs_sparse,
     QsaGraphBufs, QsaIndexerCache, QsaLayerWeights, QsaMode, QsaShape,
@@ -428,29 +433,61 @@ fn ple_weights<'a>(wf: &'a WeightFile, layer: usize) -> Result<PleWeights<'a>> {
 pub struct Q38PrefillIo {
     /// Tokens per prefill chunk: the rows of every per-token buffer.
     pub chunk: usize,
+    /// Prefill expert staging slots (`STREAMMOE_Q38_PREFILL_SLOTS`,
+    /// default [`DEFAULT_PREFILL_SLOTS`]), `stride` bytes each.
+    pub slots: usize,
+    /// Bytes between staging slots: the expert files' stride
+    /// ([`staging_stride`]), so a run of experts is one pread.
+    pub stride: usize,
+    /// Read a layer whole (gaps read through) when this fraction of its
+    /// experts must come from disk (`STREAMMOE_Q38_LAYER_READ_FRAC`,
+    /// default [`default_layer_read_frac`]; 0 always, above 1 never).
+    pub layer_read_frac: f64,
+    /// Most experts per pread (`STREAMMOE_Q38_MAX_READ`, default
+    /// [`DEFAULT_MAX_READ`]).
+    pub max_read: usize,
 }
 
 impl Q38PrefillIo {
-    /// The settings from the environment for an `n_ctx` context:
-    /// [`prefill_chunk`].
-    pub fn from_env(n_ctx: usize) -> Self {
-        Self { chunk: prefill_chunk(n_ctx) }
-    }
-
-    /// [`Self::from_env`] for the converted model at `root` with
-    /// `expert_size`-byte experts.
-    pub fn for_root(_root: &Path, n_ctx: usize, _expert_size: usize) -> Self {
-        Self::from_env(n_ctx)
-    }
-
-    /// One step smaller, for a plan over the cap: halve the chunk down
-    /// to 64 tokens. `false` when nothing is left to shrink.
-    pub fn shrink(&mut self) -> bool {
-        if self.chunk > 64 {
-            self.chunk = (self.chunk / 2).max(64);
-            return true;
+    /// The settings from the environment for an `n_ctx` context and
+    /// `expert_size`-byte experts `stride` bytes apart in their files.
+    pub fn from_env(n_ctx: usize, expert_size: usize, stride: usize) -> Self {
+        let stride = stride.max(expert_size);
+        Self {
+            chunk: prefill_chunk(n_ctx),
+            slots: env_usize("STREAMMOE_Q38_PREFILL_SLOTS").unwrap_or(DEFAULT_PREFILL_SLOTS).max(1),
+            stride,
+            layer_read_frac: env_f64("STREAMMOE_Q38_LAYER_READ_FRAC")
+                .unwrap_or_else(|| default_layer_read_frac(expert_size, stride)),
+            max_read: env_usize("STREAMMOE_Q38_MAX_READ").unwrap_or(DEFAULT_MAX_READ).max(1),
         }
-        false
+    }
+
+    /// [`Self::from_env`] for the converted model at `root` (its
+    /// declared stride, [`staging_stride`]).
+    pub fn for_root(root: &Path, n_ctx: usize, expert_size: usize) -> Self {
+        Self::from_env(n_ctx, expert_size, staging_stride(root, expert_size))
+    }
+
+    /// Bytes of the prefill staging.
+    pub fn staging_bytes(&self) -> u64 {
+        (self.slots * self.stride) as u64
+    }
+
+    /// One step smaller, for a plan over the cap: the staging halved
+    /// down to 16 slots, then the chunk down to 64 tokens, then the
+    /// staging down to 2. `false` when nothing is left to shrink.
+    pub fn shrink(&mut self) -> bool {
+        if self.slots > 16 {
+            self.slots = (self.slots / 2).max(16);
+        } else if self.chunk > 64 {
+            self.chunk = (self.chunk / 2).max(64);
+        } else if self.slots > 2 {
+            self.slots = (self.slots / 2).max(2);
+        } else {
+            return false;
+        }
+        true
     }
 }
 
@@ -464,6 +501,9 @@ pub struct Q38PlanBytes {
     /// The expert staging buffer: `top_k` demand slots plus two
     /// prefetch sets of `min(prefetch_experts, top_k)`.
     pub expert_slots: u64,
+    /// The prefill expert staging: [`Q38PrefillIo::slots`] slots of
+    /// [`Q38PrefillIo::stride`] bytes.
+    pub prefill_staging: u64,
     /// Everything sized by the prefill chunk ([`Q38PrefillIo::chunk`]
     /// rows): the `hc · H` residual and Gated Residual buffers,
     /// projection / MoE / PLE scratch, the QSA row lists, the host
@@ -477,7 +517,7 @@ pub struct Q38PlanBytes {
 
 impl Q38PlanBytes {
     pub fn total(&self) -> u64 {
-        self.kv + self.linear_state + self.expert_slots + self.scratch + self.family_state
+        self.kv + self.linear_state + self.expert_slots + self.prefill_staging + self.scratch + self.family_state
     }
 }
 
@@ -494,9 +534,12 @@ pub fn prefetch_slots(prefetch_experts: usize) -> usize {
 
 /// [`plan_bytes`] with speculative prefetch reading `prefetch_experts`
 /// experts per layer (two sets of [`prefetch_slots`] staging slots),
-/// prefill settings from the environment ([`Q38PrefillIo::from_env`]).
+/// prefill settings from the environment ([`Q38PrefillIo::from_env`],
+/// staging at stride = `expert_size`; [`plan_bytes_io`] with
+/// [`Q38PrefillIo::for_root`] counts a padded stride).
 pub fn plan_bytes_with(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64, prefetch_experts: usize) -> Q38PlanBytes {
-    plan_bytes_io(n_ctx, expert_size, ngram_cache_bytes, prefetch_experts, &Q38PrefillIo::from_env(n_ctx))
+    let io = Q38PrefillIo::from_env(n_ctx, expert_size, expert_size);
+    plan_bytes_io(n_ctx, expert_size, ngram_cache_bytes, prefetch_experts, &io)
 }
 
 /// [`plan_bytes_with`] for the prefill settings `io`.
@@ -550,7 +593,7 @@ pub fn plan_bytes_io(
         + n_qsa * (n_ctx * 12) as u64
         + 2 * (pc.conv_state_rows() * pc.hc_hidden()) as u64 * f
         + ngram_cache_bytes;
-    Q38PlanBytes { kv, linear_state, expert_slots, scratch, family_state }
+    Q38PlanBytes { kv, linear_state, expert_slots, prefill_staging: io.staging_bytes(), scratch, family_state }
 }
 
 // --- Buffers ---------------------------------------------------------------
@@ -604,6 +647,9 @@ struct Bufs {
     bucket_token_idx: FBuf,
     bucket_weights: FBuf,
     logits: FBuf,
+    /// Prefill expert staging ([`Q38PrefillIo::slots`] slots,
+    /// [`Q38PrefillIo::stride`] apart).
+    prefill_staging: FBuf,
 }
 
 /// The PLE on the GPU ([`super::ple_gpu`]): weight offsets, buffers
@@ -702,6 +748,20 @@ pub struct Q38Engine<B: Q38Exec> {
     /// handed out as disjoint slices of it ([`Self::slot`]), so
     /// prefetch workers and demand reads never alias.
     staging_addr: usize,
+    /// The prefill read settings the buffers were built for.
+    io: Q38PrefillIo,
+    /// Prefill staging slots in use (`<= io.slots`,
+    /// [`Self::set_prefill_slots`]).
+    pf_io_slots: usize,
+    /// Host address of `bufs.prefill_staging` (as `staging_addr`).
+    prefill_addr: usize,
+    /// Prefill read counters: all chunks, and the chunk in progress.
+    pio: PrefillIoStats,
+    pio_chunk: PrefillIoStats,
+    /// Host time blocked on the backend in [`Self::flush`], ns.
+    gpu_wait_ns: std::sync::atomic::AtomicU64,
+    /// `STREAMMOE_Q38_IO_TRACE`: print each chunk's counters.
+    io_trace: bool,
 }
 
 impl<B: Q38Exec> Q38Engine<B> {
@@ -725,7 +785,7 @@ impl<B: Q38Exec> Q38Engine<B> {
         expert_size: usize,
         pf: Option<PrefetchState>,
     ) -> Result<Self> {
-        Self::with_options(b, wf, root, n_ctx, expert_size, pf, Q38PrefillIo::from_env(n_ctx))
+        Self::with_options(b, wf, root, n_ctx, expert_size, pf, Q38PrefillIo::for_root(root, n_ctx, expert_size))
     }
 
     /// [`Self::with_prefetch`] with the prefill settings `io` (what
@@ -801,12 +861,17 @@ impl<B: Q38Exec> Q38Engine<B> {
             bucket_token_idx: alloc(b, ch * k, "q38.bucket_token_idx")?,
             bucket_weights: alloc(b, ch * k, "q38.bucket_weights")?,
             logits: alloc(b, cfg.vocab, "q38.logits")?,
+            prefill_staging: alloc(b, (io.slots * io.stride).div_ceil(4), "q38.prefill_staging")?,
         };
         upload(b, bufs.inv_freq, &qsa.inv_freq())?;
         let staging_addr = b
             .pool_mut()
             .with_bytes_mut(bufs.expert_base, |s: &mut [u8]| s.as_mut_ptr() as usize)
             .map_err(|e| Q38EngineError::Other(format!("staging: {e}")))?;
+        let prefill_addr = b
+            .pool_mut()
+            .with_bytes_mut(bufs.prefill_staging, |s: &mut [u8]| s.as_mut_ptr() as usize)
+            .map_err(|e| Q38EngineError::Other(format!("prefill staging: {e}")))?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         let mut indexer = Vec::with_capacity(cfg.num_layers);
         for (l, lr) in w.layers.iter().enumerate() {
@@ -886,7 +951,54 @@ impl<B: Q38Exec> Q38Engine<B> {
             pf,
             pf_slots,
             staging_addr,
+            io,
+            pf_io_slots: io.slots,
+            prefill_addr,
+            pio: PrefillIoStats::default(),
+            pio_chunk: PrefillIoStats::default(),
+            gpu_wait_ns: std::sync::atomic::AtomicU64::new(0),
+            io_trace: trace_from_env(),
         })
+    }
+
+    /// The prefill settings the engine was built with.
+    pub fn prefill_io(&self) -> Q38PrefillIo {
+        self.io
+    }
+
+    /// Use `n` of the prefill staging slots (clamped to `1..=` the
+    /// built count): the experts read at once.
+    pub fn set_prefill_slots(&mut self, n: usize) {
+        self.pf_io_slots = n.clamp(1, self.io.slots);
+    }
+
+    pub fn prefill_slots(&self) -> usize {
+        self.pf_io_slots
+    }
+
+    /// The whole-layer read threshold ([`Q38PrefillIo::layer_read_frac`]).
+    pub fn set_layer_read_frac(&mut self, frac: f64) {
+        self.io.layer_read_frac = frac;
+    }
+
+    /// Most experts per pread ([`Q38PrefillIo::max_read`], at least 1).
+    pub fn set_max_read(&mut self, n: usize) {
+        self.io.max_read = n.max(1);
+    }
+
+    /// Prefill read counters since build or [`Self::reset_prefill_io_stats`].
+    pub fn prefill_io_stats(&self) -> PrefillIoStats {
+        self.pio
+    }
+
+    /// The last prefill chunk's counters.
+    pub fn last_chunk_io_stats(&self) -> PrefillIoStats {
+        self.pio_chunk
+    }
+
+    pub fn reset_prefill_io_stats(&mut self) {
+        self.pio = PrefillIoStats::default();
+        self.pio_chunk = PrefillIoStats::default();
     }
 
     /// Tokens consumed so far.
@@ -1242,7 +1354,10 @@ impl<B: Q38Exec> Q38Engine<B> {
     /// Run `steps` (cleared) as one pass.
     fn flush(&self, b: &B, steps: &mut Vec<Step>, label: &'static str) -> Result<()> {
         if !steps.is_empty() {
+            let t0 = std::time::Instant::now();
             run_steps(b, &self.fam, steps, label)?;
+            let ns = t0.elapsed().as_nanos() as u64;
+            self.gpu_wait_ns.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
             self.submits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             steps.clear();
         }
@@ -1329,6 +1444,97 @@ impl<B: Q38Exec> Q38Engine<B> {
         Ok(())
     }
 
+    /// Put batch `bt`'s experts of layer `l` into the prefill staging
+    /// from slot `base` on: every pread and hot-tier copy at once on
+    /// `io_pool`. `routed` are the chunk's bucket experts (ascending):
+    /// the ones read from disk are offered to the hot tier, the gaps a
+    /// whole-layer read went through are not. With `spans_ok` false (the
+    /// files' stride is not the staging's) each expert is read alone.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_batch(
+        &self,
+        l: usize,
+        bt: &super::prefill_io::PrefillBatch,
+        base: u32,
+        routed: &[i32],
+        spans_ok: bool,
+        experts: &ExpertFiles,
+        io_pool: &rayon::ThreadPool,
+    ) -> Result<()> {
+        enum Task<'a> {
+            Read(u32, u32, &'a mut [u8]),
+            Hot(u32, &'a mut [u8]),
+        }
+        let (st, es) = (self.io.stride, self.expert_size);
+        // (slot, n, first expert, from disk), in slot order.
+        let mut items: Vec<(u32, u32, u32, bool)> = bt.reads.iter().map(|r| (r.slot, r.n, r.first, true)).collect();
+        items.extend(bt.hot.iter().map(|&(e, s)| (s, 1, e, false)));
+        items.sort_unstable_by_key(|x| x.0);
+        // SAFETY: the batch's slots `base..base + used` lie inside the
+        // staging (`used <= cap <= slots in use`), no other slice of
+        // them is alive, and no GPU work reading them is in flight (the
+        // caller waited for the last pass that bound them).
+        let mut rest: &mut [u8] = unsafe { self.prefill_region(base as usize, bt.used as usize) };
+        let mut at = 0u32;
+        let mut tasks = Vec::with_capacity(items.len());
+        for (slot, n, first, disk) in items {
+            let tail = std::mem::take(&mut rest).split_at_mut((slot - at) as usize * st).1;
+            let (dst, tail) = tail.split_at_mut(n as usize * st);
+            rest = tail;
+            at = slot + n;
+            tasks.push(if disk { Task::Read(first, n, dst) } else { Task::Hot(first, dst) });
+        }
+        let hot = experts.hot_tier();
+        io_pool.install(|| {
+            tasks.into_par_iter().try_for_each(|t| -> std::result::Result<(), ExpertIoError> {
+                match t {
+                    Task::Read(first, n, dst) => {
+                        let (first, n) = (first as usize, n as usize);
+                        if !spans_ok {
+                            for i in 0..n {
+                                experts.read_expert_disk_as(ReadKind::Prefill, l, first + i, &mut dst[i * st..i * st + es])?;
+                            }
+                            return Ok(());
+                        }
+                        experts.read_span_disk(ReadKind::Prefill, l, first, n, dst)?;
+                        if let Some(h) = hot {
+                            for i in 0..n {
+                                if routed.binary_search(&((first + i) as i32)).is_ok() {
+                                    h.offer(l, first + i, &dst[i * st..i * st + es]);
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Task::Hot(e, dst) => {
+                        let e = e as usize;
+                        if hot.is_some_and(|h| h.copy_out(l, e, &mut dst[..es])) {
+                            experts.counters().record_prefill_hot(l, 1);
+                            Ok(())
+                        } else {
+                            // Evicted since planning: read it.
+                            experts.read_expert_disk_as(ReadKind::Prefill, l, e, &mut dst[..es])
+                        }
+                    }
+                }
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Prefill staging slots `first..first + n` as one byte slice.
+    ///
+    /// # Safety
+    /// As [`Self::slot`], for every slot of the range; `first + n <=`
+    /// the built slot count.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn prefill_region(&self, first: usize, n: usize) -> &mut [u8] {
+        assert!(first + n <= self.io.slots, "prefill staging: slots {first}+{n} of {}", self.io.slots);
+        let st = self.io.stride;
+        // SAFETY: forwarded; the buffer holds `io.slots · stride` bytes.
+        unsafe { std::slice::from_raw_parts_mut((self.prefill_addr + first * st) as *mut u8, n * st) }
+    }
+
     /// MoE of a chunk (`n > 1` tokens) on `mixed` into `block_out`,
     /// then inject. The routing reads back every token's router logits
     /// (one submit), then groups the tokens by expert like the batched
@@ -1391,34 +1597,56 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
             pf.record_actual(l, actual);
         }
-        let es = self.expert_size;
-        let mut start = 0;
-        while start < nb {
-            let end = (start + k).min(nb);
-            let ids = &buckets.expert_ids[start..end];
-            {
-                let this = &*self;
-                // SAFETY: slot `i` (< top_k) for the group's bucket `i`
-                // only; no GPU work is in flight (the router flush or the
-                // previous group's flush waited), and prefill issues no
-                // prefetch into the demand slots.
-                let dsts: Vec<&mut [u8]> = (0..ids.len()).map(|i| unsafe { this.slot(i) }).collect();
-                io_pool.install(|| {
-                    dsts.into_par_iter().zip(ids.par_iter()).try_for_each(|(dst, &e)| experts.read_expert(l, e as usize, dst))
-                })?;
+        // The chunk's experts into the prefill staging, batch by batch
+        // (`prefill_io`): hot-tier copies, adjacent experts one pread,
+        // or the whole layer in large preads when most of it is needed.
+        let hot = experts.hot_tier();
+        let is_hot = |e: usize| hot.is_some_and(|h| h.contains(l, e));
+        let n_disk = buckets.expert_ids.iter().filter(|&&e| !is_hot(e as usize)).count();
+        let whole = n_disk as f64 >= self.io.layer_read_frac * ne as f64;
+        // A stride the staging was not built for: expert by expert.
+        let spans_ok = experts.expert_stride() == self.io.stride;
+        let max_read = if spans_ok { self.io.max_read } else { 1 };
+        let cap = self.pf_io_slots;
+        let batches = plan_prefill_batches(&buckets.expert_ids, is_hot, whole && spans_ok, cap, max_read);
+        self.pio_chunk.layers += 1;
+        self.pio_chunk.layer_reads += (whole && spans_ok) as u64;
+        self.pio_chunk.experts += nb as u64;
+        let st = self.io.stride;
+        for (bi_n, bt) in batches.iter().enumerate() {
+            let base = 0u32;
+            let t0 = std::time::Instant::now();
+            self.stage_batch(l, bt, base, &buckets.expert_ids, spans_ok, experts, io_pool)?;
+            let io_ns = t0.elapsed().as_nanos() as u64;
+            experts.counters().record_prefill_io(io_ns);
+            let p = &mut self.pio_chunk;
+            p.io_wait_ns += io_ns;
+            p.batches += 1;
+            p.hot += bt.hot.len() as u64;
+            let read: u64 = bt.reads.iter().map(|r| r.n as u64).sum();
+            p.experts_read += read;
+            p.read_through += read + bt.hot.len() as u64 - bt.slots.len() as u64;
+            if spans_ok {
+                p.preads += bt.reads.len() as u64;
+                p.bytes += read * st as u64;
+            } else {
+                p.preads += read;
+                p.bytes += read * self.expert_size as u64;
             }
             let bu = &self.bufs;
-            let (a0, a1) = (buckets.offsets[start] as usize, buckets.offsets[end] as usize);
+            let (b0, b1) = (bt.b0, bt.b1);
+            let (a0, a1) = (buckets.offsets[b0] as usize, buckets.offsets[b1] as usize);
             let group = ExpertBuckets {
-                expert_ids: ids.to_vec(),
-                offsets: buckets.offsets[start..=end].iter().map(|&o| o - a0 as u32).collect(),
+                expert_ids: buckets.expert_ids[b0..b1].to_vec(),
+                offsets: buckets.offsets[b0..=b1].iter().map(|&o| o - a0 as u32).collect(),
                 token_idx: buckets.token_idx[a0..a1].to_vec(),
                 weights: buckets.weights[a0..a1].to_vec(),
             };
+            let slots: Vec<u32> = bt.slots.iter().map(|&s| base + s).collect();
             let mut expert_indices = vec![0u32; a1 - a0];
-            for bi in 0..ids.len() {
-                let (s, e) = (group.offsets[bi] as usize, group.offsets[bi + 1] as usize);
-                expert_indices[s..e].fill(bi as u32);
+            for (i, &s) in slots.iter().enumerate() {
+                let (r0, r1) = (group.offsets[i] as usize, group.offsets[i + 1] as usize);
+                expert_indices[r0..r1].fill(s);
             }
             upload(b, bu.bucket_token_idx, &group.token_idx)?;
             upload(b, bu.bucket_weights, &group.weights)?;
@@ -1432,10 +1660,10 @@ impl<B: Q38Exec> Q38Engine<B> {
             }));
             steps.push(Step::G(Op::MoeBatchedPermuteFuse {
                 label: "q38.moe.permute_fuse",
-                expert_base: t(bu.expert_base),
-                expert_stride: es as u64,
+                expert_base: t(bu.prefill_staging),
+                expert_stride: st as u64,
                 expert_indices: t(bu.expert_indices),
-                expert_slots: (0..ids.len() as u32).collect(),
+                expert_slots: slots,
                 bucket_input: t(bu.bucket_input),
                 bucket_gate: t(bu.bucket_gate),
                 bucket_up: t(bu.bucket_up),
@@ -1446,10 +1674,9 @@ impl<B: Q38Exec> Q38Engine<B> {
                 out_sum: t(bu.out_sum),
                 buckets: group,
             }));
-            if end < nb {
+            if bi_n + 1 < batches.len() {
                 self.flush(b, steps, "q38.moe_group")?;
             }
-            start = end;
         }
         steps.push(Step::G(Op::MoeCombineResidualNTokens {
             label: "q38.moe.combine",
@@ -1661,6 +1888,11 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         let c = self.cfg.clone();
         let nt = n as u32;
+        let t_chunk = std::time::Instant::now();
+        let gpu0 = self.gpu_wait_ns.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 1 {
+            self.pio_chunk = PrefillIoStats { chunks: 1, tokens: n as u64, ..Default::default() };
+        }
         let mut emb = vec![0.0f32; n * c.hidden];
         for (&tok, row) in tokens.iter().zip(emb.chunks_mut(c.hidden)) {
             embed_lookup(wf, tok, row).map_err(|e| Q38EngineError::Other(format!("embedding: {e}")))?;
@@ -1723,6 +1955,16 @@ impl<B: Q38Exec> Q38Engine<B> {
             out.copy_from_slice(&v);
         }
         self.pos += n;
+        if n > 1 {
+            let p = &mut self.pio_chunk;
+            p.gpu_wait_ns = self.gpu_wait_ns.load(std::sync::atomic::Ordering::Relaxed) - gpu0;
+            p.wall_ns = t_chunk.elapsed().as_nanos() as u64;
+            experts.counters().record_prefill(n as u64, p.wall_ns);
+            self.pio.add(&self.pio_chunk);
+            if self.io_trace {
+                eprintln!("[q38 prefill io] chunk at {}: {}", self.pos - n, self.pio_chunk.line());
+            }
+        }
         Ok(())
     }
 

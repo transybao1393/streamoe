@@ -69,8 +69,9 @@ pub(crate) fn check_config(config: &OpenConfig) -> Result<(), RsError> {
 /// QSA K / V → `Kv`; Gated DeltaNet state plus the host family state
 /// (indexer keys, PLE state, n-gram row cache) → `LinearState`; the
 /// decode expert staging (K demand slots + two prefetch sets) →
-/// `ExpertSlots`; everything sized by the prefill chunk →
-/// `PrefillScratch`. No KV scratch, no multi-decode buffers.
+/// `ExpertSlots`; the prefill expert staging → `PrefillStaging`;
+/// everything sized by the prefill chunk → `PrefillScratch`. No KV
+/// scratch, no multi-decode buffers.
 ///
 /// Returns the prefill settings the engine must be built with: the
 /// environment's ([`Q38PrefillIo::for_root`]), shrunk while the plan
@@ -98,7 +99,7 @@ pub(crate) fn plan(
         plan.set(Account::KvScratch, 0);
         plan.set(Account::LinearState, p.linear_state + p.family_state);
         plan.set(Account::ExpertSlots, p.expert_slots);
-        plan.set(Account::PrefillStaging, 0);
+        plan.set(Account::PrefillStaging, p.prefill_staging);
         plan.set(Account::PrefillScratch, p.scratch);
         plan.set(Account::MultiDecode, 0);
         if plan.check(cap).is_ok() || !io.shrink() {

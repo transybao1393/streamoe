@@ -736,6 +736,60 @@ impl ExpertFiles {
         Ok(())
     }
 
+    /// Read experts `first..first + n` of `layer_idx` as one contiguous
+    /// range of the layer file, padding included: `out` is `n *
+    /// expert_stride` bytes and expert `first + i` lands at `i *
+    /// expert_stride` (so a padded layout reads in one call, unlike
+    /// [`Self::read_run_disk`]). One read against the queue-depth gate,
+    /// counted as `n` reads of `kind`. No hot-tier offers: the caller
+    /// knows which of the experts it wanted.
+    pub fn read_span_disk(
+        &self,
+        kind: ReadKind,
+        layer_idx: usize,
+        first: usize,
+        n: usize,
+        out: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
+        let (es, st) = (self.expert_size, self.expert_stride);
+        if n == 0 || out.len() != n * st {
+            return Err(ExpertIoError::BadOutLen {
+                expected: n * st,
+                actual: out.len(),
+            });
+        }
+        self.read_expert_checks(layer_idx, first + n - 1, &out[..es])?;
+        let Some(file) = self.layers[layer_idx].as_ref() else {
+            return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
+        };
+        let off = (first as u64) * (st as u64);
+        let permit = self.limits.admit(out.len() as u64);
+        let tr0 = super::io_trace::now();
+        let mut done = 0usize;
+        while done < out.len() {
+            let got = file
+                .read_at(&mut out[done..], off + done as u64)
+                .map_err(|e| ExpertIoError::Io {
+                    layer: layer_idx,
+                    source: e,
+                })?;
+            if got == 0 {
+                return Err(ExpertIoError::ShortRead {
+                    layer: layer_idx,
+                    expert: first + done / st,
+                    expected: out.len(),
+                    actual: done,
+                });
+            }
+            done += got;
+        }
+        drop(permit);
+        super::io_trace::read(tr0, kind, layer_idx, n, out.len());
+        self.counters
+            .record_read(kind, layer_idx, n as u64, out.len() as u64, self.fast[layer_idx]);
+        Ok(())
+    }
+
     /// Prefill staging for one layer (plan phase 6): put every expert
     /// in `expert_ids` at its `expert_id * expert_size` slot of
     /// `staging` (the pread-mode `expert_base`). Hot-tier experts are

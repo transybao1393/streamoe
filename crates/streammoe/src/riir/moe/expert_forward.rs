@@ -1578,10 +1578,13 @@ pub fn encode_moe_batched_permute_fuse(
     gather: bool,
 ) {
     debug_assert_eq!(expert_slots.len(), buckets.expert_ids.len());
-    assert_eq!(
-        expert_stride,
-        ExpertLayout::Q4.expert_size() as u64,
-        "[moe] permute-fuse prefill has 4-bit kernels only (packed 3-bit takes MoeGatherIdFuse)"
+    // 4-bit blocks, packed or padded to a larger even stride (the
+    // Qwen3.8-Flash-Next prefill staging holds them at the file's
+    // padded stride); the kernels address expert `s` at `s · stride`.
+    assert!(
+        expert_stride == ExpertLayout::Q4.expert_size() as u64
+            || (expert_stride > ExpertLayout::Q4.expert_size() as u64 && expert_stride % 16 == 0),
+        "[moe] permute-fuse prefill has 4-bit kernels only (packed 3-bit takes MoeGatherIdFuse); stride {expert_stride}"
     );
     if gather {
         encode_moe_gather(
