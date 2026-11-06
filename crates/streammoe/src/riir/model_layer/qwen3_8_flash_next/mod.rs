@@ -45,39 +45,26 @@
 //!   attention, the indexer, graph ops, [`qsa::QsaBlock`].
 //! - [`tiny`] — tiny random-weight models matching the torch port
 //!   `tools/model_layer/qwen3_8_flash_next/core_ref.py`.
+//! - [`engine`] / [`engine_exec`] — the family in the engine:
+//!   [`engine::Q38Engine`], the decode forward on Metal or the CPU
+//!   backend (same steps op for op), which `RsCtx` runs for this family
+//!   (`riir/q38_ctx.rs`).
 //!
-//! ## Engine integration (not done yet)
+//! ## Engine integration
 //!
-//! The engine's GPU layer paths assume the qwen3_5_moe residual: one
-//! `hidden` stream, an input RMSNorm before attention, `h_mid =
-//! residual + o_proj`, a post-attention RMSNorm before the router and
-//! `h = h_mid + Σ experts + shared`. For this family each of those
-//! points changes:
-//!
-//! - input norm → attention Gated Residual: the norm is fused into the
-//!   previous layer's expert command buffer (`chain_next_norm_off`,
-//!   `linear_attn_forward.rs`) or CMD1's prelude (`prev_layer_chained`
-//!   skips it), and the batched graph pushes
-//!   `Op::RmsNormBf16NTokens` with `input_layernorm_w`. Replace with
-//!   [`gated_residual_gpu::Q38GpuKernels::encode_gated_residual_mix`]
-//!   writing the block input where the norm output went
-//!   (`buffers.normed` / `normed_id`).
-//! - `h_mid = residual + o_proj` (`post_attention_tail`, the graph's
-//!   `ResidualAddNTokens`) → `encode_inject` into the 10240-wide
-//!   stream.
-//! - post-attention norm → MoE Gated Residual; the router, experts and
-//!   shared expert then read its mixed output unchanged.
-//! - `combine` adds `h_mid` → the MoE output must come out without the
-//!   residual term (combine against zero), then `encode_inject`.
-//! - Final `model.norm` → the final mixer (`block_inject = None`),
-//!   straight into the LM head.
-//! - Gated DeltaNet output norm: the `gated_rms_norm` kernel needs a
-//!   sigmoid-gate variant ([`config::GDN_OUTPUT_GATE`]).
-//! - `LayerWeightCache::build` requires `input_layernorm.weight`; this
-//!   family needs its own cache with the Gated Residual offsets
-//!   ([`weights::gated_residual_names`]).
-//! - Hidden-state buffers that cross layers (`HiddenBuf`, snapshots,
-//!   `StageInput::Hidden` for layer ranges) become `hc · H` wide.
+//! The qwen3_5_moe GPU layer paths are not reused: they assume one
+//! `hidden` stream with input / post-attention RMSNorms and
+//! `h = h_mid + Σ experts + shared`. [`engine::Q38Engine`] builds each token from
+//! the existing graph ops (matvecs, conv / delta-net, QSA, SDPA, MoE
+//! permute-fuse and combine) plus family ops ([`engine_exec::FamOp`]:
+//! Gated Residual norm / mix / inject / expand, `1 + w` head norm,
+//! sigmoid-gated output norm), with the MoE combined against zero and
+//! injected into the `hc · H` stream. Every `1 + w` gain is applied in
+//! a kernel from the stored bf16 value. Experts stream through
+//! `ExpertFiles` (padded stride from `packed_experts/layout.json`, hot
+//! tier); PLE runs on the host. Prefill is token at a time; layer
+//! ranges, multi-token decode passes, multi-request pools, non-f32 KV
+//! and rewinding to a middle position are refused (`q38_ctx`).
 
 pub mod config;
 pub mod engine;
