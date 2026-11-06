@@ -15,8 +15,8 @@ Writes each turn's answer and its first-word time from Enter.
 
 `--compare` checks that every file has the same answers (exit 1 if
 not) and prints first-word times per file. Works against a server
-without the flag too (its `/draft` answers ok: false), which is the
-"off" baseline.
+started with `--no-prefill-while-typing` too (its `/draft` answers
+ok: false), which is the "off" baseline.
 """
 import argparse, json, random, sys, threading, time, urllib.request
 

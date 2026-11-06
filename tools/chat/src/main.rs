@@ -32,8 +32,9 @@
 //! re-executes this process with the other value, so the old model's
 //! memory is released before the new one opens and the cap holds.
 //!
-//! `--prefill-while-typing` prefills the message while it is being
-//! typed (the page posts drafts to `/draft`): see `draft.rs`.
+//! Prefill while typing (on by default with `--max-chats 1`;
+//! `--no-prefill-while-typing` turns it off) prefills the message while
+//! it is being typed (the page posts drafts to `/draft`): see `draft.rs`.
 
 mod draft;
 
@@ -777,9 +778,13 @@ fn main() {
     }
     // Prefill while typing: one checkpoint buffer, planned under the
     // cap, to undo an edit of text already prefilled.
-    let mut typing = args.iter().any(|a| a == "--prefill-while-typing");
+    // On by default; `--no-prefill-while-typing` turns it off.
+    let asked = args.iter().any(|a| a == "--prefill-while-typing");
+    let mut typing = !args.iter().any(|a| a == "--no-prefill-while-typing");
     if typing && max_chats > 1 {
-        eprintln!("[chat] --prefill-while-typing needs --max-chats 1: off");
+        if asked {
+            eprintln!("[chat] --prefill-while-typing needs --max-chats 1: off");
+        }
         typing = false;
     }
     let draft_chunk: usize = arg(&args, "--draft-chunk").map_or(16, |v| v.parse().unwrap());

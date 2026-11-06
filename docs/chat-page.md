@@ -11,7 +11,7 @@ cargo run --release -- --cap-gib 4 --n-ctx 8192
 #          --precision 4|3 (3 needs $M/root-3bit, see Setup),
 #          --max-chats 1..4 (chats served at once, see below),
 #          --spec (speculative decoding for greedy answers, see below)
-#          --prefill-while-typing [--draft-chunk N] (see below)
+#          --no-prefill-while-typing, --draft-chunk N (see below)
 # open http://127.0.0.1:8077
 ```
 
@@ -195,7 +195,8 @@ accepted every draft and was 1.13–1.14× faster. Keep it off unless the
 chats are mostly edits of pasted text.
 ## Prefill while typing
 
-`--prefill-while-typing` (off by default; `--max-chats 1` only) uses the
+Prefill while typing (on by default since 2026-11-05 with `--max-chats 1`;
+`--no-prefill-while-typing` turns it off) uses the
 time you spend typing to read the message, so the answer starts sooner
 after Enter. A **Prefill while typing** checkbox appears next to
 *Thinking* (on by default when the server has the flag). About 300 ms
@@ -254,5 +255,8 @@ is 9 tokens, and a short pass costs nearly as much as a long one, since
 each layer's experts are read either way. The smaller hot tier costs
 1–3 points of hits and up to ~4% of decode speed. The gain should be
 larger where prefill is slow per token, such as Qwen3.5-397B-A17B at
-~1 tok/s, where typing keeps up with prefill; that has not been
-measured.
+~1 tok/s. Measured there (9 GiB cap, same prompts and tool, 32 tokens,
+2026-11-05): the first word of prompts 2 and 3 came at 13.9 / 14.5 s
+instead of 20.9 / 20.8 s (−32%), with 13–14 of 26–27 prompt tokens read
+while typing; prompt 1 gained nothing, as its draft prefill was still
+running at Enter. Decode speed was unchanged (0.53–0.59 tok/s).
