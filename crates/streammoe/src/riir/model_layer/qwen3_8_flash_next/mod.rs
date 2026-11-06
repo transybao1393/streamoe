@@ -23,3 +23,6 @@
 //!
 //! Reference: Hugging Face transformers `models/qwen4_exp`. Spec and
 //! status: `docs/design-notes.md#qwen38-flash-next`.
+
+pub mod ngram;
+pub mod ple;
