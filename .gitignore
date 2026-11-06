@@ -88,6 +88,9 @@ profiles/
 traces/
 traces_*/
 routing_trace*.txt
+trace.txt
+# Chat-page measurement results (tools/chat/typing_check.py, bench clients)
+res_*.json
 # Disk timelines (STREAMMOE_IO_TRACE) and GPU timings (STREAMMOE_GPU_TIMING)
 io_trace*.txt
 iotrace*.txt
