@@ -493,6 +493,11 @@ history of `.claude/memory/`, which is no longer tracked.
 - zsh does not word-split variables (`$G commit` fails): export
   `GIT_AUTHOR_*` / `GIT_COMMITTER_*` instead. `grep --include=*.rs`
   errors as an unmatched glob; quote it or drop it.
+- Metal: per-thread arrays indexed in loops with run-time bounds
+  (`for i < head_dim / 32`) leave registers. The QSA sparse-attention
+  kernel (`qwen3_8_flash_next/qsa/gpu.rs`) ran 21.6 ms instead of
+  7.6 ms for 64 queries until `head_dim / 32` and the heads per
+  threadgroup became `#define`s compiled per shape.
 
 ### Measured dead ends — don't retry without new evidence
 

@@ -58,7 +58,14 @@
 //! - [`QsaIndexerCache::append`] + [`qsa_attend_rows`]: the host side
 //!   of the indexer and the block-selected attention, run after
 //!   [`push_qsa_pre_sdpa`] when [`qsa_needs_sparse`] says the chunk goes
-//!   over the budget (CPU only for now).
+//!   over the budget, on the CPU.
+//! - [`gpu`]: the same block-selected attention on the GPU — host
+//!   selection ([`gpu::qsa_select_rows`]) and a Metal kernel over the
+//!   per-query row lists ([`gpu::QsaGpuKernels::encode_sdpa_rows`]) in
+//!   place of [`push_qsa_sdpa`], so a prefill over the budget stays on
+//!   the GPU.
+//! - [`QsaBlock`]: every QSA layer on the CPU, the `AttnBlock` of
+//!   `layer.rs`, one token or a chunk.
 //!
 //! Only the f32 KV format is handled here.
 
@@ -67,6 +74,8 @@ use crate::riir::backend::buftype::{
     QGateBuf, QProjOutBuf, RopeInvFreqBuf, RopePosBuf, VProjOutBuf,
 };
 use crate::riir::backend::{BufId, Graph, Op, WeightRef};
+use super::gated_residual::Linear;
+use super::layer::{AttnBlock, Q38Error};
 
 unsafe extern "C" {
     fn expf(x: f32) -> f32;
@@ -759,19 +768,9 @@ pub enum QsaError {
 /// (one token at a time, text positions) and the chunked prefill entry
 /// [`Self::forward_chunk`] (any `[t, h, w]` positions).
 ///
-/// Integration (in `layer.rs`, where `AttnBlock`, `Linear` and
-/// `Q38Error` live):
-///
-/// ```ignore
-/// impl<L: Linear> QsaLinear for L { /* in_dim, out_dim, forward → Linear's */ }
-/// impl<L: Linear> AttnBlock for QsaBlock<L> {
-///     fn forward(&mut self, layer: usize, pos: usize, x: &[f32], out: &mut [f32]) -> Result<(), Q38Error> {
-///         QsaBlock::forward_checked(self, layer, pos, x, out)
-///             .map_err(|e| Q38Error::Hook { layer, msg: e.to_string() })
-///     }
-///     fn reset(&mut self) { QsaBlock::reset(self) }
-/// }
-/// ```
+/// It implements `AttnBlock` (one token: [`Self::forward_checked`];
+/// a chunk: [`Self::forward_n_checked`]), and any `Linear` is a
+/// [`QsaLinear`].
 pub struct QsaBlock<L> {
     shape: QsaShape,
     mode: QsaMode,
@@ -887,6 +886,48 @@ impl<L: QsaLinear> QsaBlock<L> {
     /// Drop all cached context (new sequence).
     pub fn reset(&mut self) {
         self.truncate(0);
+    }
+
+    /// [`Self::forward_chunk`] for `n` text tokens at `pos..pos + n`
+    /// with the cache-length check of [`Self::forward_checked`]: `pos`
+    /// must be the cache's next row. Bit-identical to `n` calls of
+    /// [`Self::forward_checked`] (the projections, norms and RoPE run
+    /// per token either way, and each query's block selection and
+    /// attention see the same cache rows).
+    pub fn forward_n_checked(&mut self, layer: usize, pos: usize, n: usize, x: &[f32], out: &mut [f32])
+        -> Result<(), QsaError> {
+        let len = self.cache(layer).map(|c| c.len()).ok_or(QsaError::NoLayer(layer))?;
+        if len != pos {
+            return Err(QsaError::Position { layer, len, pos });
+        }
+        let positions: Vec<[i32; 3]> = (pos..pos + n).map(|p| [p as i32; 3]).collect();
+        self.forward_chunk(layer, &positions, x, out)
+    }
+}
+
+/// Any q38-core [`Linear`] is a [`QsaLinear`].
+impl<L: Linear> QsaLinear for L {
+    fn in_dim(&self) -> usize {
+        Linear::in_dim(self)
+    }
+    fn out_dim(&self) -> usize {
+        Linear::out_dim(self)
+    }
+    fn forward(&self, x: &[f32], out: &mut [f32]) {
+        Linear::forward(self, x, out)
+    }
+}
+
+impl<L: QsaLinear> AttnBlock for QsaBlock<L> {
+    fn forward(&mut self, layer: usize, pos: usize, x: &[f32], out: &mut [f32]) -> Result<(), Q38Error> {
+        self.forward_checked(layer, pos, x, out).map_err(|e| Q38Error::Hook { layer, msg: e.to_string() })
+    }
+    fn forward_n(&mut self, layer: usize, pos: usize, n_tokens: usize, x: &[f32], out: &mut [f32])
+        -> Result<(), Q38Error> {
+        self.forward_n_checked(layer, pos, n_tokens, x, out).map_err(|e| Q38Error::Hook { layer, msg: e.to_string() })
+    }
+    fn reset(&mut self) {
+        QsaBlock::reset(self)
     }
 }
 
@@ -1068,6 +1109,8 @@ pub fn push_qsa_o_proj(g: &mut Graph, shape: &QsaShape, w: &QsaLayerWeights, buf
         n_tokens: n_tokens as u32,
     });
 }
+
+pub mod gpu;
 
 #[cfg(test)]
 mod tests;
