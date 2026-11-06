@@ -11,6 +11,7 @@ history of `.claude/memory/`, which is no longer tracked.
 | Issue | Impact | Plan |
 | --- | --- | --- |
 | Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) only pays on copy-heavy text. With the match-length guard (`spec_bench` default: draft only when the lookup match is ≥ 8 tokens), a3b at a 4 GiB cap, mean of 2 alternating rounds: 1.08× (packed 3-bit) / 1.12× (4-bit) over plain on five prompts, vs 1.03× / 1.02× unguarded; copy-heavy prompts 1.17–1.26×, grammar fix 0.95× / 1.00× (unguarded 0.85× / 0.91×). Output is token-identical. | A verify pass of ~4 tokens costs ~340–400 ms packed 3-bit and yields 3.8–4.0 tokens on long matches, 2.4–3.0 on short ones; break-even is ~3.3. The guard's residual loss on the grammar prompt is real (~3%): two passes on matches of exactly 8 tokens accept nothing. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; try `--backoff`. |
+| Qwen3-Next-80B-A3B (`model-qwen3-next-80b-a3b`) is checked on a tiny random model only (`tests/qnext_engine.rs`: per-token rows within 1.7e-5 of a pure-torch port of transformers, 600-token prompts, both full-attention layers). The real MLX build was not on this host; its norms are assumed to hold `1 + w` as mlx-lm writes them (`convert.py` stops if the input / post-attention norm medians are below 0.5; `--norm-offset 1` for a zero-centred checkpoint). | A real-model run may still find something the tiny model cannot show (tokenizer, long context, real-weight dtypes other than the index-implied ones). | Convert with `tools/model_layer/qwen3_next/convert.py`, run the chat tool (`--features qnext`) and a few greedy prompts against MLX. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
 | Qwen3.8-Flash-Next in the engine (`Q38Engine`, `riir/q38_ctx.rs`): refused at open: layer ranges, non-f32 KV, `max_requests > 1`, `max_decode_tokens > 1`; `memory_seq_rm` to a middle position returns `false`. Prefill runs in chunks (`STREAMMOE_Q38_CHUNK`, default 512; under a cap `q38_ctx::plan` halves the staging, then the chunk, until the plan fits). A chunk's experts go through their own prefill staging (`STREAMMOE_Q38_PREFILL_SLOTS`, default 64, at the files' padded stride, `PrefillStaging` account): adjacent experts share a pread; a layer needing at least `STREAMMOE_Q38_LAYER_READ_FRAC` of its experts from disk (default stride / (size + 512 KiB) = 0.86 real, 0.06 tiny) is read whole, gaps read through, in preads of up to `STREAMMOE_Q38_MAX_READ` (16) experts; the slots split in two halves so a batch's reads (up to 32 experts in flight) run while the GPU computes the previous batch. Counters per chunk: `Q38Engine::prefill_io_stats`, `STREAMMOE_Q38_IO_TRACE=1`. Host round trips left per layer: the router logits (to pick the experts to read) and, past the QSA budget, the chunk's indexer projection (block scoring stays on the CPU); the QSA within the budget, the MoE input rows and the PLE no longer go through the host. Expert prefetch uses the a3b `PrefetchState` in decode only (hot-tier experts are copied into the staging, not bound in place); the PLE gate / norms / conv run on the GPU at T rows (`ple_gpu.rs`; host path: `STREAMMOE_Q38_PLE=host`). Checked only on the tiny random-weight model (`model-qwen3-8-flash-next-tiny`: every golden row within 6.2e-5 relative, CPU vs Metal 2.9e-6; batched prefill vs a step per token 1.3e-6 on Metal, bit-identical on the CPU backend, past the QSA budget; prefetch and hot tier on / off bit-identical; `prefill_io_tests`: chunks 1 / 5 / 64 / 512, whole-layer read forced / off, 1 / 2 / 6 / 64 staging slots, 1–16 experts per pread, hot tier and prefetch on / off — bit-identical to a step per token on the CPU backend, 1.8e-6 on Metal and bit-identical between arms). | Expert I/O still dominates prefill on the real model: estimated ~11 tok/s from the external SSD at a 512-token chunk (~148 MB of expert reads per token, was ~850 MB at 64), only for prompts of ~512 tokens or more; a short prompt still reads most of each layer. Each layer's reads start only after its router readback (IO idle during the attention / router GPU work); in a whole-layer read the hot-tier experts inside the read range are read through, not skipped. A padded expert stride is read expert by expert by `read_run_disk` (q38 uses `read_span_disk`); the mmap-mode batched path still assumes stride = size (q38 uses pread). | Start a whole-layer read before the router (it does not depend on the routing) into a second staging; bind hot-tier experts in place (needs per-bucket buffers in the permute-fuse op); keep each layer's router readback waiting for all earlier command buffers (the prefetch's set reuse relies on it); a real-weights run. |
 | `diff_oracle`, the 10 GiB-cap tests and all a17b / Cogito model tests have not run on this host (~7 GiB reclaimable, no a17b / Cogito weights). `diff_oracle` cannot run under a cap at all: the cap check measures the whole process, and the tests hold two contexts in one process, so the second open sees the first's ~2.5 GiB (`OverBudget: footprint 5.09 GiB exceeds cap 3.00 GiB` at a 3 GiB cap with no checkpoints). | Every other a3b model suite passes: on 2026-10-26 `mlx_regression`, `smoke`, `checkpoint_restore`, `consecutive_eval_prompt`, `mrope`, `layer_range`, `requests`, `streaming`, `expert_source_equivalence`, `budget_cap`, `graph_diff_oracle`, `batched_diff_oracle`; on 2026-10-28 `vision` (cosine 1.000000 on 3 images), `engine_op_diff` (with `STREAMMOE_EXPERT_IO=mmap`) and `mmap_matches_pread` (after the fix below). Suites that open uncapped ran under `STREAMMOE_TEST_CAP_GIB=4`. | `diff_oracle` uncapped with ~8 GiB free; the 10 GiB-cap tests with 10 GiB free; a17b / Cogito where their weights are. |
@@ -305,6 +306,10 @@ history of `.claude/memory/`, which is no longer tracked.
   (`STREAMMOE_GATHER_QMM_TILE` is ignored there). A model converted at
   another group size gives wrong output, not an error — nothing checks
   the manifest's scale shapes against it yet.
+- **The batched-prefill MoE (`gather_mm_id.metal`) is instantiated for
+  top-k 8 and 10 only**: a variant with another `num_experts_per_tok`
+  panics at its first batched call (`MoeIdMap0Call: no map0 PSO for
+  k=4`). The Qwen3-Next tiny model uses k = 10 for that reason.
 - Bounded prefill staging (`prefill_staging_experts` below the expert
   count, or the capped fallback) always uses `MoeGatherIdFuse`;
   `STREAMMOE_MOE_GATHER_ID=0` is ignored there.
@@ -354,6 +359,14 @@ history of `.claude/memory/`, which is no longer tracked.
   CPU one (~1e-5 on the logits, same greedy tokens on the tests). Set
   `STREAMMOE_DECODE_SDPA=cpu` (or `gpu`) on both to compare them bit
   for bit.
+- **Batched prefill is less exact than per-token decode** on the
+  qwen3_5_moe path: its MoE runs the gather-id GEMM. On the Qwen3-Next
+  tiny model vs the f32 reference: `eval_token` rows ≤ 1.7e-5 relative,
+  `eval_prompt` 4.7e-4 – 7.5e-4 and decode after a 600-token prompt up
+  to 2.5e-3; with `STREAMMOE_MOE_GATHER_ID=0` every row is ≤ 5e-6.
+- **`memory_seq_pos_max` means two things**: the qwen3_5_moe path
+  returns the KV length (the C oracle's semantics), Qwen3.8-Flash-Next's
+  context the last position.
 - **Turbo3 is slower than Turbo4**: its 3-bit unpack costs more than
   the 0.04 GiB of extra hot tier saves. Prefer Turbo4.
 
@@ -458,9 +471,13 @@ history of `.claude/memory/`, which is no longer tracked.
 
 ### Tests and tooling
 
-- `graph_diff_oracle.rs` and `checkpoint_restore.rs` compile only with
-  `model-qwen3-6-35b-a3b`; the graph-diff kernel tests need no model
-  files, so run them under a3b even on a host without a3b weights.
+- `checkpoint_restore.rs` compiles only with `model-qwen3-6-35b-a3b`,
+  `graph_diff_oracle.rs` with it or `model-qwen3-next-80b-a3b` (not the
+  tiny build: its fixtures are sized for the a3b head counts); the
+  graph-diff kernel tests need no model files, so run them even on a
+  host without the weights.
+- `qnext_engine.rs` needs `STREAMMOE_QNEXT_TINY` (see
+  `tools/model_layer/qwen3_next/README.md`); it skips when unset.
 - `checkpoint_restore.rs` fails under a17b — expected.
 - `dequant_matvec_4bit_n_tokens_v3_n1_matches_single`
   (`batched_diff_oracle.rs`) failed since the qmv kernel landed: one-token
