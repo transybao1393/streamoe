@@ -60,8 +60,38 @@ pub enum Q38Error {
 /// order of `pos`, layer by layer.
 pub trait AttnBlock {
     fn forward(&mut self, layer: usize, pos: usize, x: &[f32], out: &mut [f32]) -> Result<(), Q38Error>;
+    /// `n_tokens` text tokens at positions `pos..pos + n_tokens` at
+    /// once (a prefill chunk of one layer): `x` / `out` are
+    /// `[n_tokens, H]`. Must equal `n_tokens` calls of
+    /// [`Self::forward`] — the default does exactly that;
+    /// [`super::qsa::QsaBlock`] runs the chunk in one pass,
+    /// bit-identical.
+    fn forward_n(&mut self, layer: usize, pos: usize, n_tokens: usize, x: &[f32], out: &mut [f32])
+        -> Result<(), Q38Error> {
+        if n_tokens == 0 || x.len() % n_tokens != 0 {
+            return Err(Q38Error::Shape(format!("AttnBlock::forward_n: {n_tokens} tokens, x {} values", x.len())));
+        }
+        forward_n_by_token(x, out, x.len() / n_tokens, |t, xt, ot| self.forward(layer, pos + t, xt, ot))
+    }
     /// Drop all cached context (new sequence).
     fn reset(&mut self);
+}
+
+/// Run `f(t, x_t, out_t)` over `T` rows of `x` / `out`, both
+/// `width` wide; checks the lengths.
+fn forward_n_by_token(
+    x: &[f32],
+    out: &mut [f32],
+    width: usize,
+    mut f: impl FnMut(usize, &[f32], &mut [f32]) -> Result<(), Q38Error>,
+) -> Result<(), Q38Error> {
+    if width == 0 || x.len() != out.len() || x.len() % width != 0 {
+        return Err(Q38Error::Shape(format!("forward_n: x {} / out {} values, row width {width}", x.len(), out.len())));
+    }
+    for (t, (xt, ot)) in x.chunks(width).zip(out.chunks_mut(width)).enumerate() {
+        f(t, xt, ot)?;
+    }
+    Ok(())
 }
 
 /// Per-layer embedding (n-gram PLE). Implemented by the PLE module.
@@ -76,6 +106,19 @@ pub trait AttnBlock {
 pub trait PleHook {
     fn forward(&mut self, layer: usize, pos: usize, token: u32, hyper: &[f32], out: &mut [f32])
         -> Result<(), Q38Error>;
+    /// `T = tokens.len()` tokens at positions `pos..pos + T` at once:
+    /// `hyper` / `out` are `[T, hc · H]`. Must equal `T` calls of
+    /// [`Self::forward`] — the default does exactly that;
+    /// [`super::ple::PleBlock`] runs the chunk in one pass,
+    /// bit-identical on the CPU.
+    fn forward_n(&mut self, layer: usize, pos: usize, tokens: &[u32], hyper: &[f32], out: &mut [f32])
+        -> Result<(), Q38Error> {
+        if tokens.is_empty() || hyper.len() % tokens.len() != 0 {
+            return Err(Q38Error::Shape(format!("PleHook::forward_n: {} tokens, hyper {} values", tokens.len(), hyper.len())));
+        }
+        let w = hyper.len() / tokens.len();
+        forward_n_by_token(hyper, out, w, |t, ht, ot| self.forward(layer, pos + t, tokens[t], ht, ot))
+    }
     /// Drop the n-gram history and conv state (new sequence).
     fn reset(&mut self);
 }

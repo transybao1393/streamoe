@@ -633,3 +633,47 @@ fn qsa_block_token_by_token_matches_reference() {
         assert_eq!(block.cache(7).unwrap().len(), 0);
     }
 }
+
+/// `AttnBlock::forward_n` on [`QsaBlock`] (chunks of a prefill, some
+/// crossing the 19-token dense limit of the tiny budget) is
+/// bit-identical to `AttnBlock::forward` token by token, in both
+/// modes, through q38-core's `Linear` (the blanket `QsaLinear`).
+#[test]
+fn qsa_block_forward_n_bit_identical_to_token_by_token() {
+    use super::super::gated_residual::DenseLinear;
+    let s = TINY;
+    let m = Model::reference(&s);
+    let lin = |w: &Vec<f32>, rows: usize, cols: usize| DenseLinear::new(rows, cols, w.clone());
+    let raw = |w: &[f32]| w.iter().map(|v| v - 1.0).collect::<Vec<f32>>();
+    let layer = || QsaLayer {
+        q_proj: lin(&m.q_proj, s.q_proj_dim(), s.hidden),
+        k_proj: lin(&m.k_proj, s.kv_dim(), s.hidden),
+        v_proj: lin(&m.v_proj, s.kv_dim(), s.hidden),
+        o_proj: lin(&m.o_proj, s.hidden, s.q_dim()),
+        idx_qk_proj: lin(&m.idx_qk_proj, s.idx_proj_dim(), s.hidden),
+        q_norm: raw(&m.q_norm),
+        k_norm: raw(&m.k_norm),
+        idx_q_norm: raw(&m.idx_q_norm),
+        idx_k_norm: raw(&m.idx_k_norm),
+    };
+    let h = s.hidden;
+    for mode in [QsaMode::Sparse, QsaMode::Dense] {
+        let mk = || QsaBlock::new(&s, mode, vec![None, None, None, Some(layer())]).unwrap();
+        let (mut one, mut many) = (mk(), mk());
+        let mut want = vec![0.0f32; N_TOTAL * h];
+        for t in 0..N_TOTAL {
+            AttnBlock::forward(&mut one, 3, t, &m.x[t * h..(t + 1) * h], &mut want[t * h..(t + 1) * h]).unwrap();
+        }
+        let mut got = vec![0.0f32; N_TOTAL * h];
+        let mut t0 = 0;
+        for n in [5usize, 9, 1, 25] {
+            let (a, b) = (t0 * h, (t0 + n) * h);
+            AttnBlock::forward_n(&mut many, 3, t0, n, &m.x[a..b], &mut got[a..b]).unwrap();
+            t0 += n;
+        }
+        assert_eq!(t0, N_TOTAL);
+        assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{mode:?}: chunked != token by token");
+        // Wrong start position is refused.
+        assert!(AttnBlock::forward_n(&mut many, 3, 3, 1, &m.x[..h], &mut vec![0.0; h]).is_err());
+    }
+}
