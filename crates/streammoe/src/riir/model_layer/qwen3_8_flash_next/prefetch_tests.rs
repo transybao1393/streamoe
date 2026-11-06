@@ -1,7 +1,8 @@
 //! [`super::engine::Q38Engine`]'s expert reads on the tiny model:
 //! speculative prefetch and the hot tier change where an expert comes
 //! from, never the logits — bit for bit, on Metal and on the CPU
-//! backend. Also the staging buffer against the memory plan.
+//! backend. Also the staging buffer against the memory plan, and the
+//! PLE on the backend ([`super::ple_gpu`]) against the host PLE.
 //!
 //! Same setup as `engine_tests` (`STREAMMOE_Q38_TINY`).
 
@@ -9,7 +10,7 @@ use std::path::Path;
 
 use super::engine::{plan_bytes_with, prefetch_slots, q38_config, Q38Engine};
 use super::engine_exec::Q38Exec;
-use super::engine_tests::{goldens, tiny_dir, Golden};
+use super::engine_tests::{goldens, rel_err, tiny_dir, Golden, TOL_GOLDEN};
 use super::qsa::QsaMode;
 use crate::riir::backend::cpu::CpuBackend;
 use crate::riir::backend::Backend;
@@ -188,4 +189,64 @@ fn staging_matches_plan() {
         // One f32 of slack, rounded up to the pool's alignment.
         assert!(got >= plan && got <= plan + 16 * 1024, "prefetch {n}: staging {got} B, plan {plan} B");
     }
+}
+
+/// The PLE on the backend vs the host PLE (`set_ple_on_host`), every
+/// position of every prompt, on Metal and on the CPU backend; the
+/// backend PLE also against the goldens. Switching mid-sequence moves
+/// the conv state along.
+#[test]
+fn ple_on_backend_matches_host_ple() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38 ple] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let wf = open_wf(&dir);
+    let ex = experts(&dir, 0);
+    let es = ex.expert_size();
+    let want: Vec<Vec<f32>> = gs
+        .iter()
+        .flat_map(|g| {
+            let v = VARIANT.vocab_size;
+            g.prefill_logits.chunks(v).chain(g.decode_logits.chunks(v)).map(|r| r.to_vec()).collect::<Vec<_>>()
+        })
+        .collect();
+    let worst = |a: &[Vec<f32>], b: &[Vec<f32>]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max(rel_err(x, y)));
+    // Metal.
+    let mut b = metal(&dir);
+    let mut e = Q38Engine::new(&mut b, &wf, &root(&dir), 64, es).unwrap();
+    e.set_qsa_mode(QsaMode::Sparse);
+    assert!(!e.ple_on_host(), "the PLE runs on the backend by default");
+    let gpu = run_all(&mut e, &mut b, &wf, &ex, &gs);
+    e.set_ple_on_host(&mut b, true).unwrap();
+    let host = run_all(&mut e, &mut b, &wf, &ex, &gs);
+    let (eg, eh) = (worst(&gpu, &host), worst(&gpu, &want));
+    // Switch paths every token: the conv state follows.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let g0 = &gs[0];
+    e.reset(&mut b).unwrap();
+    let mut mixed = Vec::new();
+    for (i, &tok) in g0.input_ids.iter().chain(&g0.decode_tokens).enumerate() {
+        e.set_ple_on_host(&mut b, i % 2 == 0).unwrap();
+        let mut l = vec![0.0f32; VARIANT.vocab_size];
+        e.step(&mut b, &wf, &ex, &pool, tok, Some(&mut l)).unwrap();
+        mixed.push(l);
+    }
+    let em = worst(&mixed, &gpu[..mixed.len()]);
+    // CPU backend, same ops.
+    let mut cb = CpuBackend::new(open_wf(&dir));
+    let mut ce = Q38Engine::new(&mut cb, &wf, &root(&dir), 64, es).unwrap();
+    ce.set_qsa_mode(QsaMode::Sparse);
+    let cpu = run_all(&mut ce, &mut cb, &wf, &ex, &gs);
+    ce.set_ple_on_host(&mut cb, true).unwrap();
+    let cpu_host = run_all(&mut ce, &mut cb, &wf, &ex, &gs);
+    let (ec, ech) = (worst(&cpu, &gpu), worst(&cpu, &cpu_host));
+    eprintln!(
+        "[q38 ple] metal backend-PLE vs host-PLE {eg:.2e}, vs goldens {eh:.2e}, switching {em:.2e}; \
+         cpu backend-PLE vs metal {ec:.2e}, vs cpu host-PLE {ech:.2e}"
+    );
+    assert!(eg <= 1e-4 && em <= 1e-4 && ech <= 1e-4, "backend PLE vs host PLE: {eg} {em} {ech}");
+    assert!(ec <= 1e-3, "cpu vs metal {ec}");
+    assert!(eh <= TOL_GOLDEN, "vs goldens {eh}");
 }

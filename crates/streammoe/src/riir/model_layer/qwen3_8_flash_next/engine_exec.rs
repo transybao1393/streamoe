@@ -75,6 +75,8 @@ pub enum FamOp {
     GatedRmsNormSigmoid { values: FBuf, z: FBuf, weight_off: u64, out: FBuf, dim: u32, n_groups: u32, eps: f32 },
     /// `dst[i] += src[i]`, `n` values.
     Add { dst: FBuf, src: FBuf, n: u32 },
+    /// The PLE gate / conv ([`super::ple_gpu`]).
+    Ple(super::ple_gpu::PleOp),
 }
 
 /// One entry of a pass.
@@ -189,6 +191,7 @@ pub struct Q38MetalFam {
     pub head_norm: ComputePipelineState,
     pub gated_norm_sigmoid: ComputePipelineState,
     pub add: ComputePipelineState,
+    pub ple: super::ple_gpu::PleGpuKernels,
 }
 
 fn grid1(n: u32, tg: u32) -> (MTLSize, MTLSize) {
@@ -223,6 +226,7 @@ impl Q38Exec for MetalBackend {
             head_norm: p("q38e_head_norm_one_plus")?,
             gated_norm_sigmoid: p("q38e_gated_rms_norm_sigmoid")?,
             add: p("q38e_add")?,
+            ple: super::ple_gpu::PleGpuKernels::new(device)?,
         })
     }
 
@@ -319,6 +323,7 @@ impl Q38Exec for MetalBackend {
                 let (g, t) = grid1(n, 256);
                 enc.dispatch_thread_groups(g, t);
             }
+            FamOp::Ple(ref p) => fam.ple.encode(enc, p, pool, wbuf),
         }
         enc.end_encoding();
     }
@@ -439,6 +444,7 @@ impl Q38Exec for CpuBackend {
                     *d += s;
                 }
             }
+            FamOp::Ple(ref p) => super::ple_gpu::apply_cpu(self, p),
         }
     }
 }

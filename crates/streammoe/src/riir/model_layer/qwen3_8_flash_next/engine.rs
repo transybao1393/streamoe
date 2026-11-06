@@ -14,7 +14,7 @@
 //! ```text
 //! hyper = expand(embed(token))                         [hc · H]
 //! per layer l:
-//!   if PLE layer: hyper += ple(hyper, token)           host (PleLayer), GPU add
+//!   if PLE layer: hyper += ple(hyper, token)           n-gram rows (host) → GPU (ple_gpu)
 //!   x, inj = gated_residual(attn_hc, hyper)            FamOp + matvecs
 //!   y = gated_deltanet(x)                              graph ops, sigmoid-gated norm (FamOp)
 //!     | qsa(x)                                         push_qsa_pre_sdpa + dense SDPA, or the
@@ -95,6 +95,7 @@ use super::config::{
 use super::engine_exec::{retag, run_steps, FBuf, FamOp, Q38Exec, Step};
 use super::ngram::{NgramConfig, NgramTable};
 use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
+use super::ple_gpu::PleOp;
 use super::qsa::{
     push_qsa_o_proj, push_qsa_pre_sdpa, push_qsa_sdpa, qsa_attend_rows, qsa_indexer_step, qsa_needs_sparse,
     QsaGraphBufs, QsaIndexerCache, QsaLayerWeights, QsaMode, QsaShape,
@@ -444,9 +445,12 @@ pub fn plan_bytes_with(n_ctx: usize, expert_size: usize, ngram_cache_bytes: u64,
             + k * (2 * h + 3 * c.moe_intermediate as u64 + 3)
             + c.vocab as u64);
     let pc = ple_config();
+    // GPU PLE: the n-gram embedding, k, v, norm_conv rows (one token).
+    let scratch = scratch + f * (pc.embed_dim + 2 * pc.hc_hidden() + pc.hidden) as u64;
+    // PLE conv state: the GPU copy and the host one (snapshots).
     let family_state = n_qsa * (n_ctx * s.idx_head_dim) as u64 * f * 5 / 4
         + n_qsa * (n_ctx * 12) as u64
-        + (pc.conv_state_rows() * pc.hc_hidden()) as u64 * f
+        + 2 * (pc.conv_state_rows() * pc.hc_hidden()) as u64 * f
         + ngram_cache_bytes;
     Q38PlanBytes { kv, linear_state, expert_slots, scratch, family_state }
 }
@@ -504,6 +508,31 @@ struct Bufs {
     logits: FBuf,
 }
 
+/// The PLE on the GPU ([`super::ple_gpu`]): weight offsets, buffers
+/// for one token, and the conv state (the state of record; the host
+/// [`PleState::conv`] is only a snapshot staging copy).
+struct PleGpu {
+    key: WeightRef,
+    value: WeightRef,
+    norm_key_off: u64,
+    norm_query_off: u64,
+    norm_conv_off: u64,
+    conv_off: u64,
+    /// `[embed]`, `[hc·H]`, `[H]`, `[hc·H]`.
+    e: FBuf,
+    k: FBuf,
+    v: FBuf,
+    n: FBuf,
+    /// `[(K-1)·D, hc·H]`.
+    state: FBuf,
+}
+
+/// `STREAMMOE_Q38_PLE=host`: run the PLE on the host (the older path:
+/// residual read back, [`PleLayer::forward`], GPU add).
+fn ple_on_host_from_env() -> bool {
+    std::env::var("STREAMMOE_Q38_PLE").is_ok_and(|v| v == "host")
+}
+
 /// Per-layer GPU state.
 enum LayerBufs {
     Gdn { conv: FBuf, delta: FBuf, conv_len: usize, delta_len: usize },
@@ -549,6 +578,10 @@ pub struct Q38Engine<B: Q38Exec> {
     indexer: Vec<Option<QsaIndexerCache>>,
     /// `(decoder layer, layer, state)` of the PLE.
     ple: Option<(usize, PleLayer, PleState)>,
+    /// The PLE's GPU weights and buffers (with a PLE layer).
+    ple_gpu: Option<PleGpu>,
+    /// Run the PLE on the host instead ([`Self::set_ple_on_host`]).
+    ple_host: bool,
     n_ctx: usize,
     expert_size: usize,
     /// Tokens consumed (the next token's position).
@@ -679,6 +712,28 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
             None => None,
         };
+        let ple_gpu = match cfg.ple_layers.first() {
+            Some(&pl) => {
+                let pc = ple_config();
+                let p = format!("model.layers.{pl}.ple");
+                let state = alloc(b, pc.conv_state_rows() * pc.hc_hidden(), "q38.ple_conv_state")?;
+                upload(b, state, &vec![0.0f32; pc.conv_state_rows() * pc.hc_hidden()])?;
+                Some(PleGpu {
+                    key: qref(wf, &format!("{p}.key_proj"))?,
+                    value: qref(wf, &format!("{p}.value_proj"))?,
+                    norm_key_off: off(wf, &format!("{p}.norm_key.weight"))?,
+                    norm_query_off: off(wf, &format!("{p}.norm_query.weight"))?,
+                    norm_conv_off: off(wf, &format!("{p}.norm_conv.weight"))?,
+                    conv_off: off(wf, &format!("{p}.conv1d.weight"))?,
+                    e: alloc(b, pc.embed_dim, "q38.ple_e")?,
+                    k: alloc(b, pc.hc_hidden(), "q38.ple_k")?,
+                    v: alloc(b, pc.hidden, "q38.ple_v")?,
+                    n: alloc(b, pc.hc_hidden(), "q38.ple_n")?,
+                    state,
+                })
+            }
+            _ => None,
+        };
         Ok(Self {
             fam,
             cfg,
@@ -689,6 +744,8 @@ impl<B: Q38Exec> Q38Engine<B> {
             layers,
             indexer,
             ple,
+            ple_gpu,
+            ple_host: ple_on_host_from_env(),
             n_ctx,
             expert_size,
             pos: 0,
@@ -796,8 +853,108 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         if let Some((_, _, st)) = self.ple.as_mut() {
             st.reset();
+            if let Some(g) = &self.ple_gpu {
+                upload(b, g.state, &st.conv)?;
+            }
         }
         self.pos = 0;
+        Ok(())
+    }
+
+    /// `true` if the PLE runs on the host (`STREAMMOE_Q38_PLE=host` or
+    /// [`Self::set_ple_on_host`]).
+    pub fn ple_on_host(&self) -> bool {
+        self.ple_host
+    }
+
+    /// Run the PLE on the host (`true`) or the backend (`false`, the
+    /// default); the conv state moves with it.
+    pub fn set_ple_on_host(&mut self, b: &mut B, on: bool) -> Result<()> {
+        if on == self.ple_host {
+            return Ok(());
+        }
+        if let (Some((_, _, st)), Some(g)) = (self.ple.as_mut(), &self.ple_gpu) {
+            if on {
+                st.conv = download(b, g.state, st.conv.len())?;
+            } else {
+                upload(b, g.state, &st.conv)?;
+            }
+        }
+        self.ple_host = on;
+        Ok(())
+    }
+
+    /// The PLE inject for `tokens` at the PLE layer: `hyper += ple(…)`.
+    ///
+    /// GPU (default): the n-gram rows are looked up on the host and
+    /// uploaded; `key_proj` / `value_proj` (graph matvecs) and the
+    /// gate / conv ([`PleOp`]) are queued on `steps` — no readback.
+    /// The upload is safe while `steps` is pending: only these steps
+    /// read `ple_e`, and the previous token's are complete. More rows
+    /// than the GPU buffers hold (one), or the host path: flush, read
+    /// the residual back, [`PleLayer::forward`] on the host (the conv
+    /// state moved down and back), GPU add.
+    fn ple_layer(
+        &mut self,
+        b: &mut B,
+        wf: &WeightFile,
+        io_pool: &rayon::ThreadPool,
+        tokens: &[i32],
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
+        let pc = ple_config();
+        let (hh, t_n) = (pc.hc_hidden(), tokens.len());
+        let (_, layer, state) = self.ple.as_mut().expect("PLE layer");
+        let gpu_state = self.ple_gpu.as_ref().filter(|_| !self.ple_host);
+        if let (Some(g), 1) = (gpu_state, t_n) {
+            let e = layer.embedding(state, tokens, Some(io_pool))?;
+            upload(b, g.e, &e)?;
+            let (ed, h) = (pc.embed_dim as u32, pc.hidden as u32);
+            steps.push(matvec("q38.ple.key_proj", g.key, g.e, g.k, ed, hh as u32));
+            steps.push(matvec("q38.ple.value_proj", g.value, g.e, g.v, ed, h));
+            steps.push(Step::F(FamOp::Ple(PleOp::Gate {
+                k: g.k,
+                x: self.bufs.hyper,
+                v: g.v,
+                u: self.bufs.ple_out,
+                norm_key_off: g.norm_key_off,
+                norm_query_off: g.norm_query_off,
+                hidden: h,
+                hc: pc.hc as u32,
+                n_tokens: 1,
+                eps: pc.eps,
+            })));
+            steps.push(Step::F(FamOp::Ple(PleOp::Conv {
+                u: self.bufs.ple_out,
+                n: g.n,
+                state: g.state,
+                x: self.bufs.hyper,
+                norm_conv_off: g.norm_conv_off,
+                conv_off: g.conv_off,
+                hidden: h,
+                hc: pc.hc as u32,
+                kernel: pc.conv_kernel as u32,
+                dilation: pc.conv_dilation as u32,
+                n_tokens: 1,
+                eps: pc.eps,
+            })));
+            return Ok(());
+        }
+        self.flush(b, steps, "q38.layer")?;
+        let hyper = download(b, self.bufs.hyper, t_n * hh)?;
+        let mut out = vec![0.0f32; t_n * hh];
+        let (pl, layer, state) = self.ple.as_mut().expect("PLE layer");
+        let gpu_state = self.ple_gpu.as_ref().filter(|_| !self.ple_host);
+        if let Some(g) = gpu_state {
+            state.conv = download(b, g.state, state.conv.len())?;
+        }
+        let w = ple_weights(wf, *pl)?;
+        layer.forward(&w, state, tokens, &hyper, &mut out, Some(io_pool))?;
+        if let Some(g) = gpu_state {
+            upload(b, g.state, &state.conv)?;
+        }
+        upload(b, self.bufs.ple_out, &out)?;
+        steps.push(Step::F(FamOp::Add { dst: self.bufs.hyper, src: self.bufs.ple_out, n: (t_n * hh) as u32 }));
         Ok(())
     }
 
@@ -1174,18 +1331,7 @@ impl<B: Q38Exec> Q38Engine<B> {
         for l in 0..c.num_layers {
             self.prefetch_dispatch(l, experts, io_pool);
             if self.ple.as_ref().is_some_and(|p| p.0 == l) {
-                self.flush(b, &mut steps, "q38.layer")?;
-                let hyper = download(b, self.bufs.hyper, c.hc_hidden())?;
-                let mut out = vec![0.0f32; c.hc_hidden()];
-                let (pl, layer, state) = self.ple.as_mut().expect("checked");
-                let w = ple_weights(wf, *pl)?;
-                layer.forward(&w, state, &[token], &hyper, &mut out, Some(io_pool))?;
-                upload(b, self.bufs.ple_out, &out)?;
-                steps.push(Step::F(FamOp::Add {
-                    dst: self.bufs.hyper,
-                    src: self.bufs.ple_out,
-                    n: c.hc_hidden() as u32,
-                }));
+                self.ple_layer(b, wf, io_pool, &[token], &mut steps)?;
             }
             let lr = self.w.layers[l].clone();
             self.hc_steps(&lr.attn_hc, &mut steps);
@@ -1281,7 +1427,14 @@ impl<B: Q38Exec> Q38Engine<B> {
         }
         if let Some((_, _, st)) = &self.ple {
             let mut ps = Vec::new();
-            st.save(&mut ps);
+            match self.ple_gpu.as_ref().filter(|_| !self.ple_host) {
+                Some(g) => {
+                    let mut st = st.clone();
+                    st.conv = download(b, g.state, st.conv.len())?;
+                    st.save(&mut ps);
+                }
+                None => st.save(&mut ps),
+            }
             out.extend_from_slice(&(ps.len() as u64).to_le_bytes());
             out.extend_from_slice(&ps);
         }
@@ -1345,6 +1498,9 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
             // Fixed size and inside `need`: cannot fail after the checks.
             st.load(&buf[o + 8..o + 8 + n])?;
+            if let Some(g) = &self.ple_gpu {
+                upload(b, g.state, &st.conv)?;
+            }
         }
         for (l, (lb, (a, bb, ix))) in self.layers.iter().zip(layer_data).enumerate() {
             match *lb {
