@@ -472,6 +472,12 @@ history of `.claude/memory/`, which is no longer tracked.
 - A cap counts the whole process, the caller's buffers included: a
   `state_save` buffer or logits rows the application holds come out
   of `runtime_overhead` unless passed as `host_buffers`.
+- `CpuBackend` ops assert exact buffer lengths (`n_tokens × dim`) in
+  debug builds, so a graph run on it needs chunk-sized scratch; its
+  `SdpaCausalTiled` arm asserted the KV buffers held exactly
+  `kv_len_total` rows, which an `n_ctx`-sized cache never does. It now
+  attends over the filled prefix, as the Metal kernel does (found by
+  the QSA graph test, `model_layer/qwen3_8_flash_next/qsa`).
 - `cargo fmt` is not a gate (the crate is ~600 hunks off rustfmt); match
   the surrounding style, don't bulk-reformat.
 - zsh does not word-split variables (`$G commit` fails): export
