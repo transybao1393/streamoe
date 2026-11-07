@@ -13,7 +13,7 @@ Every number here and in the README comes from this setup unless its
 | | Standard setup |
 | --- | --- |
 | Host | MacBook Pro, M3 Pro (11-core CPU), 18 GB RAM, internal SSD; shared with other services, 7–10 GiB reclaimable during the runs |
-| Model | Qwen3.6-35B-A3B from `mlx-community/Qwen3.6-35B-A3B-4bit`, converted as in [Setup](../README.md#setup); experts 4-bit (`root/`) or packed 3-bit (`root-3bit/`) |
+| Model | Qwen3.6-35B-A3B from `mlx-community/Qwen3.6-35B-A3B-4bit`, converted as in [Setup](../README.md#running-qwen36-35b-a3b-on-a-small-mac); experts 4-bit (`root/`) or packed 3-bit (`root-3bit/`) |
 | Engine | `tools/chat` release build, 2026-10-28 (prefill staging and scratch lent to the hot tier, hot-tier decay every 4096 picks); a fresh server per run, the KV cache reset between prompts |
 | Settings | n_ctx 4096, F32 KV, cross-layer guess with 6 experts prefetched, `attn_threads` 4, vision on (its 0.13 GiB is in the plan), thinking off, greedy (temperature 0) |
 | Prompts | *Photosynthesis* — "Explain photosynthesis to a ten-year-old in one paragraph." (120 tokens decoded) · *JavaScript* — "Write a JavaScript function that checks whether a string is a palindrome." (74) · *Hiking* — "Give me a short packing list for a weekend hiking trip." (120) |

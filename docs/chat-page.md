@@ -2,7 +2,7 @@
 
 `tools/chat` is a local chat page for trying Qwen3.6-35B-A3B under a
 memory cap (standalone crate; the engine gains no dependencies). Setup
-of the model files is in the [README](../README.md#setup).
+of the model files is in the [README](../README.md#running-qwen36-35b-a3b-on-a-small-mac).
 
 ```bash
 cd tools/chat

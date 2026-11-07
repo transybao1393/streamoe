@@ -13,7 +13,7 @@ Streaming; see [Architecture](#architecture--aegis).
 Today that means a 35-billion-parameter vision-language model —
 Qwen3.6-35B-A3B, 19 GiB at 4-bit — answering questions about images
 in **4 GiB of RAM** on a shared laptop, at **10–11 tokens per second**
-(8–14 from a 3 to a 6 GiB cap; [Speed](#speed)), making the same
+(8–14 from a 3 to a 6 GiB cap; [Speed](#running-qwen36-35b-a3b-on-a-small-mac)), making the same
 greedy choices as the MLX reference.
 
 <p align="center">
@@ -115,13 +115,23 @@ The full table, how each part was tested, and the last test run are in
 [`docs/known-issues.md`](docs/known-issues.md). Run
 `scripts/check_test_host.sh` before any tests.
 
-## Running Qwen3.6-35B-A3B on a small Mac
+## Models
+
+Each model opens with a click. Every fold has its own setup line, so
+numbers are comparable within a fold, not across folds.
+
+### Running Qwen3.6-35B-A3B on a small Mac
+
+<details>
+<summary><b>Qwen3.6-35B-A3B</b>: 3B active of 35B, 19 GiB on disk, runs in 3–6 GiB: <b>8.3–12.8 tok/s</b> with 4-bit experts, <b>9.4–14.2</b> with packed 3-bit; speed, costs, setup and the chat page</summary>
+
+<br>
 
 The model is 19 GiB at 4-bit. Under a cap streamoe keeps only the
 hottest experts in RAM and streams the rest from the SSD, so it runs in
 3–6 GiB.
 
-### Speed
+#### Speed
 
 *Standard setup: M3 Pro (18 GB RAM, shared with other apps), n_ctx
 4096, F32 KV, greedy, three chat prompts, mean of 2 runs, 2026-10-28
@@ -155,7 +165,7 @@ the 2026-10-26 build's figure for comparison:
 - Per-prompt numbers, what each feature is worth, multi-token passes
   and where a token's time goes: [`docs/benchmarks.md`](docs/benchmarks.md).
 
-#### From an external SSD
+##### From an external SSD
 
 *Setup: standard, except: model on a Kingston NV3 500 GB (QLC) in a
 USB4 enclosure (2.3–2.6 GB/s uncached reads), 4-bit experts, caps 7
@@ -178,7 +188,7 @@ brackets:
   cost.
 - Per-prompt numbers: [`docs/benchmarks.md`](docs/benchmarks.md#from-an-external-ssd).
 
-#### Against llama.cpp (mmap)
+##### Against llama.cpp (mmap)
 
 *Setup: standard, internal SSD, 4-bit experts, 2026-10-30 19:22–20:13,
 same engine build. llama.cpp b11988 (official macOS release) with
@@ -244,7 +254,7 @@ tok/s per prompt (Photosynthesis / JavaScript / Hiking):
   tokens decoded, for both engines. Answers are not compared token by
   token: the quantizations differ.
 
-### What it costs
+#### What it costs
 
 | Resource | Cost |
 | --- | --- |
@@ -253,7 +263,7 @@ tok/s per prompt (Photosynthesis / JavaScript / Hiking):
 | Page cache | None from expert reads (`F_NOCACHE`) |
 | CPU | ~0.6 cores while decoding; the GPU does the rest |
 
-### Setup
+#### Setup
 
 ```bash
 scripts/check_test_host.sh               # CPU, RAM, headroom, disk
@@ -291,7 +301,7 @@ The a3b oracle suites (`--include-ignored`) open the model *without* a
 cap and need ≥ 8 GiB reclaimable; `check_test_host.sh` says whether this
 host qualifies. On a smaller host, run the model only under a cap.
 
-### Chat page
+#### Chat page
 
 ```bash
 cd tools/chat && cargo run --release -- --cap-gib 4 --n-ctx 8192
@@ -307,7 +317,14 @@ Options, stills of an image turn and what the vision side can and
 can't read: [`docs/chat-page.md`](docs/chat-page.md). Qwen3-30B-A3B
 is not supported yet (it needs its own variant).
 
-## Running Qwen3.5-397B-A17B in 9 GiB
+</details>
+
+### Running Qwen3.5-397B-A17B in 9 GiB
+
+<details>
+<summary><b>Qwen3.5-397B-A17B</b>: 17B active of 397B, 208 GiB on disk, runs in 9 GiB from an external SSD: <b>0.53 tok/s</b> (2026-11-05)</summary>
+
+<br>
 
 Qwen3.5-397B-A17B has 397 billion parameters (17 billion active per
 token). At 4-bit it is **208 GiB** on disk: 203 GiB of experts (60
@@ -361,7 +378,7 @@ once per prompt instead of once per 512-token chunk. Same setup, a
 Its 0.31 GiB window comes out of the hot tier, so it pays only for
 prompts longer than 512 tokens.
 
-### With a bigger cap (predicted)
+#### With a bigger cap (predicted)
 
 *Not measured.* This Mac has 18 GB, so caps above ~10 GiB need a
 larger Mac. The prediction combines two measured things:
@@ -409,7 +426,9 @@ at 9 GiB; at bigger caps the gap closes (84.1% vs 83.8% at 120 GiB).
 Details, plus notes on prefill, prefetch, a DGX Spark and
 Qwen3.8-Flash-Next: [`docs/design-notes.md`](docs/design-notes.md).
 
-## Running Qwen3.8-Flash-Next in 6 GiB
+</details>
+
+### Running Qwen3.8-Flash-Next in 6 GiB
 
 <details>
 <summary><b>Qwen3.8-Flash-Next</b>: 6B active of 125B, 103 GiB on disk, runs in 6 GiB from an external SSD: <b>1.41 tok/s</b>, prompts at <b>22 tok/s</b> (first real run, 2026-11-07)</summary>
@@ -510,7 +529,7 @@ prompt reads each layer once.
 
 </details>
 
-## Running Qwen3-Next-80B-A3B in 6 GiB
+### Running Qwen3-Next-80B-A3B in 6 GiB
 
 <details>
 <summary><b>Qwen3-Next-80B-A3B</b>: 3B active of 80B, 42 GiB on disk, runs in 6 GiB from an external SSD: <b>4.6 tok/s</b>, prompts at <b>46 tok/s</b>; with packed 3-bit experts <b>6.3 tok/s</b> in 6 GiB and <b>8.5 tok/s</b> in 9 GiB, the fastest large model on this Mac (2026-11-07)</summary>

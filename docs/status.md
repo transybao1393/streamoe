@@ -52,7 +52,7 @@ let mut ctx = Ctx::open_with(&weights, &manifest, &vocab, &experts_root, false, 
 Run `scripts/check_test_host.sh` first; it says which tier (unit /
 kernel, or model) this host can run. The model suites need the a3b
 files (`STREAMMOE_SMOKE_ARTIFACTS`, `STREAMMOE_SMOKE_ROOT`; see
-[Setup](../README.md#setup)). Suites that open the model uncapped take
+[Setup](../README.md#running-qwen36-35b-a3b-on-a-small-mac)). Suites that open the model uncapped take
 `STREAMMOE_TEST_CAP_GIB=4` to run under a cap on a small host:
 
 ```bash
