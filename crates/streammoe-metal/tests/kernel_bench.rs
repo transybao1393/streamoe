@@ -562,6 +562,7 @@ fn bench_per_expert_vs_gather_real_distribution() {
                     n_tokens: total,
                     stride_w: stride_bytes,
                     stride_s: stride_bytes / 2,
+                    bits: 4,
                 },
             );
         };
@@ -692,6 +693,7 @@ fn bench_gather_qmm_a3b_moe() {
                     n_tokens,
                     stride_w: stride_bytes,
                     stride_s: stride_bytes / 2,
+                    bits: 4,
                 },
             );
         };

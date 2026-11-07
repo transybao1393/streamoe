@@ -134,7 +134,7 @@ use crate::riir::io::prefetch::{mask_hot, PrefetchState};
 use crate::riir::moe::expert_forward::MAX_K;
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu_with, ExpertBuckets};
-use crate::riir::variants::{MROPE_SECTION, RMS_NORM_EPS, ROPE_THETA, VARIANT};
+use crate::riir::variants::{ExpertLayout, MROPE_SECTION, RMS_NORM_EPS, ROPE_THETA, VARIANT};
 
 /// Errors of the family engine.
 #[derive(Debug, thiserror::Error)]
@@ -742,6 +742,10 @@ pub struct Q38Engine<B: Q38Exec> {
     ple_host: bool,
     n_ctx: usize,
     expert_size: usize,
+    /// Expert weight width, from `expert_size`
+    /// ([`ExpertLayout::from_expert_size`]): 4, or 3 for packed 3-bit
+    /// experts (`tools/pack_experts.py`).
+    expert_bits: u32,
     /// Rows of the per-token buffers ([`prefill_chunk`]).
     max_chunk: usize,
     /// Tokens per prefill chunk, `<= max_chunk` ([`Self::set_prefill_chunk`]).
@@ -815,6 +819,9 @@ impl<B: Q38Exec> Q38Engine<B> {
     ) -> Result<Self> {
         let pf_slots = pf.as_ref().map_or(0, |p| prefetch_slots(p.max_experts()));
         let pf = pf.filter(|_| pf_slots > 0);
+        let expert_bits = ExpertLayout::from_expert_size(expert_size as u64)
+            .ok_or_else(|| Q38EngineError::Other(format!("expert size {expert_size} B matches no expert layout")))?
+            .bits;
         let cfg = q38_config();
         let qsa = qsa_shape();
         let w = Q38Weights::load(wf)?;
@@ -962,6 +969,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             ple_host: ple_on_host_from_env(),
             n_ctx,
             expert_size,
+            expert_bits,
             max_chunk: ch,
             chunk: ch,
             pos: 0,
@@ -1718,6 +1726,7 @@ impl<B: Q38Exec> Q38Engine<B> {
                 label: "q38.moe.permute_fuse",
                 expert_base: t(bu.prefill_staging),
                 expert_stride: st as u64,
+                bits: self.expert_bits,
                 expert_indices: t(eidx),
                 expert_slots: slots,
                 bucket_input: t(bu.bucket_input),
@@ -1882,6 +1891,7 @@ impl<B: Q38Exec> Q38Engine<B> {
             label: "q38.moe.permute_fuse",
             expert_base: t(bu.expert_base),
             expert_stride: self.expert_size as u64,
+            bits: self.expert_bits,
             expert_indices: t(bu.expert_indices),
             expert_slots,
             bucket_input: t(bu.bucket_input),

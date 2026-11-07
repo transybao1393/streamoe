@@ -1130,6 +1130,7 @@ impl Backend for CpuBackend {
             Op::MoeBatchedPermuteFuse {
                 expert_base,
                 expert_stride,
+                bits,
                 expert_slots,
                 bucket_input,
                 buckets,
@@ -1144,14 +1145,23 @@ impl Backend for CpuBackend {
                 let input_buf = self.read_f32(*bucket_input);
                 let mut out_buf = self.write_f32(*out_sum);
                 let base = self.read_bytes(*expert_base);
-                let expert_size = VARIANT.expert_size_4bit();
-                let blob_refs: Vec<&[u8]> = expert_slots
+                // Packed 3-bit experts are rewritten as 4-bit nibbles
+                // (same codes, same affine) for the 4-bit CPU matvec.
+                let layout = crate::riir::variants::ExpertLayout { bits: *bits };
+                let expert_size = layout.expert_size();
+                let blobs: Vec<std::borrow::Cow<[u8]>> = expert_slots
                     .iter()
                     .map(|&slot| {
                         let off = slot as usize * *expert_stride as usize;
-                        &base[off..off + expert_size]
+                        let blob = &base[off..off + expert_size];
+                        match layout.bits {
+                            4 => std::borrow::Cow::Borrowed(blob),
+                            3 => std::borrow::Cow::Owned(crate::riir::moe::moe_cpu::q3_expert_to_q4(blob)),
+                            b => panic!("[cpu] permute-fuse: no {b}-bit experts"),
+                        }
                     })
                     .collect();
+                let blob_refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_ref()).collect();
                 let rows = *buckets.offsets.last().unwrap_or(&0) as usize;
                 moe_permute_fuse_cpu(&VARIANT, &blob_refs, &input_buf[..rows * VARIANT.hidden_dim], buckets, &mut out_buf)
                     .expect("moe permute-fuse");

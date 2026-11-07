@@ -85,3 +85,11 @@ instantiate_kernel(
 instantiate_kernel(
     "affine_gather_qmm_rhs_float_gs_32_b_4_t_true",
     affine_gather_qmm_rhs, float, 32, 4, 32, 32, 32, 2, 2, true, bfloat16_t)
+
+// streammoe-metal: packed 3-bit experts (8 weights per 3 bytes, MLX's
+// layout; tools/pack_experts.py), gathered GEMM at group size 32 — the
+// Qwen3.8-Flash-Next permute-fuse MoE runs it for 3-bit experts (the
+// gs-64 models take streammoe_mm_id for those). BM=32 tile only.
+instantiate_kernel(
+    "affine_gather_qmm_rhs_float_gs_32_b_3_t_true",
+    affine_gather_qmm_rhs, float, 32, 3, 32, 32, 32, 2, 2, true, bfloat16_t)
