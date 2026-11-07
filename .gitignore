@@ -130,3 +130,7 @@ docs/dev/
 # Drive benchmarks (fio job output, write-probe and fold-probe files)
 fio_*.json
 *_probe.bin
+
+# Small scratch files (< 50 MB: run scripts, prompt ids, logs). Larger
+# temporary files and all model files go on the external SSD.
+tmp/
