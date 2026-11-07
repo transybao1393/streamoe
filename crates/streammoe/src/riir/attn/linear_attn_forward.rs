@@ -1512,7 +1512,11 @@ pub(in crate::riir) fn post_attention_tail(
         &intermediates,
         gpu_combine,
         chain_next_norm_off,
-    )
+    )?;
+    if chain_next_norm_off.is_some() {
+        cross_early_prefetch(prefetch, moe, buffer_pool, deferred, pool, expert_files, wf, layer_idx + 1, k_active);
+    }
+    Ok(())
 }
 
 /// Whether decode should commit each layer's first command buffer
@@ -1554,17 +1558,69 @@ pub(in crate::riir) fn layer_prefetch(
     if !prefetch.mode().is_pread() || prefetch.in_flight_for(layer_idx) {
         return;
     }
+    // The cross guess ranks MAX_K candidates, so that after the hot
+    // tier's experts are dropped there are still enough to read.
     let cross = prefetch
         .cross_mut()
-        .and_then(|c| c.guess(wf, layer_idx, k_active));
-    let Some(mut predicted) = cross.or_else(|| prefetch.predict_for(layer_idx)) else {
-        return;
+        .and_then(|c| c.guess(wf, layer_idx, crate::riir::moe::expert_forward::MAX_K));
+    let (mut predicted, n) = match cross {
+        Some(g) => (g, crate::riir::moe::expert_forward::MAX_K),
+        None => match prefetch.predict_for(layer_idx) {
+            Some(g) => (g, prefetch.max_experts().min(k_active)),
+            None => return,
+        },
     };
     // Experts already in the hot tier bind from RAM; don't spend SSD
-    // bandwidth prefetching them.
-    crate::riir::io::prefetch::mask_hot(expert_files.hot_tier(), layer_idx, &mut predicted[..k_active]);
+    // bandwidth prefetching them. The cross guess reads its strongest
+    // `max_experts` non-resident candidates; the previous-token guess
+    // only its first `max_experts` minus the resident ones (topping it
+    // up from the weaker picks costs more in wasted reads than it hits:
+    // docs/design-notes.md, "Cross-layer guess").
+    crate::riir::io::prefetch::mask_hot_compact(expert_files.hot_tier(), layer_idx, &mut predicted, n);
     let data_prefetch = moe.data_prefetch_slots_mut_array(buffer_pool, layer_idx % 2);
     prefetch.dispatch(layer_idx, predicted, k_active, data_prefetch, pool, expert_files);
+}
+
+/// `STREAMMOE_CROSS_EARLY=1` (default off, read once): issue the next
+/// layer's cross-layer prefetch right after this layer's expert
+/// dispatch is committed, instead of at the top of the next layer, so
+/// the reads also run under this layer's expert compute and the
+/// encoding of the next layer's attention. Qwen3-Next 3-bit at 6 GiB,
+/// 6 guesses: 4.94 tok/s early vs 5.08 at the top of the layer
+/// (within noise), so it stays opt-in. The Flash-Next engine always
+/// issues its cross guess early (its own code path).
+pub(in crate::riir) fn cross_early_from_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STREAMMOE_CROSS_EARLY").is_ok_and(|v| v == "1"))
+}
+
+/// The early cross-layer prefetch ([`cross_early_from_env`]) of
+/// `next_layer`, from the residual this layer's dispatch snapshotted.
+/// No-op without the cross-layer guesser, with lookahead (which
+/// already issued it) or when off. `next_layer` writes set
+/// `next_layer % 2`, which layer `next_layer - 2`'s expert dispatch
+/// read: every in-flight dispatch but the newest (this layer's, which
+/// reads the other set) is waited for first.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::riir) fn cross_early_prefetch(
+    prefetch: &mut crate::riir::io::prefetch::PrefetchState,
+    moe: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
+    deferred: &crate::riir::moe::deferred::DeferredRing,
+    pool: &rayon::ThreadPool,
+    expert_files: &ExpertFiles,
+    wf: &WeightFile,
+    next_layer: usize,
+    k_active: usize,
+) {
+    if prefetch.cross_mut().is_none() || prefetch.lookahead() || !cross_early_from_env() {
+        return;
+    }
+    if !prefetch.cross_mut().is_some_and(|c| c.can_guess(next_layer)) {
+        return;
+    }
+    deferred.wait_all_but_newest();
+    layer_prefetch(prefetch, moe, buffer_pool, pool, expert_files, wf, next_layer, k_active);
 }
 
 /// Lookahead prefetch (plan phase 6 overlap): issue `next_layer`'s
@@ -1595,10 +1651,11 @@ pub(in crate::riir) fn lookahead_prefetch(
     let Some(mut predicted) = prefetch.predict_for(next_layer) else {
         return;
     };
-    crate::riir::io::prefetch::mask_hot(
+    crate::riir::io::prefetch::mask_hot_compact(
         expert_files.hot_tier(),
         next_layer,
-        &mut predicted[..k_active],
+        &mut predicted,
+        prefetch.max_experts().min(k_active),
     );
     deferred.wait_in_place();
     let data_prefetch = moe.data_prefetch_slots_mut_array(buffer_pool, next_layer % 2);
@@ -2206,6 +2263,20 @@ pub(in crate::riir) fn moe_dispatch_per_token(
         expert_files.record_pick(layer_idx, idx as usize, 1);
     }
     crate::riir::io::routing_trace::record(layer_idx, indices);
+    if crate::riir::io::guess_trace::enabled() {
+        // SAFETY: shared-storage buffer of `hidden_dim` f32s; CMD2+3,
+        // which wrote it, has completed (the routing came from it).
+        let h_mid = unsafe {
+            std::slice::from_raw_parts(
+                buffer_pool.handle(buffers.h_mid).contents() as *const f32,
+                v.hidden_dim,
+            )
+        };
+        let hot = expert_files.hot_tier();
+        crate::riir::io::guess_trace::record(layer_idx, h_mid, indices, weights, v.num_experts, |e| {
+            hot.is_some_and(|h| h.contains(layer_idx, e))
+        });
+    }
 
     if gpu_combine {
         // Bindings layout: one `(&Buffer, byte_offset)` per active

@@ -219,3 +219,88 @@ fn state_save_load_continues_on_goldens() {
     ctx.state_load(&snap).unwrap();
     assert_eq!(run(&mut ctx), first, "state_load");
 }
+
+/// Speculative prefetch only chooses which experts are read early:
+/// prefetch off, the previous-token guess and the cross-layer guess
+/// (layer L+1's router on layer L's residual; with
+/// `STREAMMOE_CROSS_EARLY=1` issued right after L's expert dispatch),
+/// with and without
+/// a hot tier, give bit-identical logits over the 40-token prompt and
+/// its decode tokens. The cross guess is scored on every layer after
+/// the first and its reads are used.
+#[test]
+fn prefetch_guesses_do_not_change_logits() {
+    use streammoe::PrefetchGuess::{CrossLayer, PrevToken};
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[qnext_engine] STREAMMOE_QNEXT_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let g = &gs[1];
+    let model = dir.join("streammoe");
+    let a = model.join("artifacts");
+    let toks: Vec<i32> = g.ids.iter().chain(&g.decode).copied().collect();
+    let mut base: Option<Vec<Vec<f32>>> = None;
+    // (label, prefetch experts, guess, hot-tier bytes)
+    let arms = [
+        ("off", 0, PrevToken, 0u64),
+        ("prev 4", 4, PrevToken, 0),
+        ("cross 4", 4, CrossLayer, 0),
+        ("cross all", 16, CrossLayer, 0),
+        ("cross 4 + hot tier", 4, CrossLayer, 4 << 20),
+    ];
+    for (label, n, guess, hot) in arms {
+        let cfg = OpenConfig {
+            n_ctx: 64,
+            mem_cap: Some(2 * GIB),
+            hot_tier_bytes: Some(hot),
+            prefetch_experts: Some(n),
+            prefetch_guess: guess,
+            ..OpenConfig::default()
+        };
+        let mut ctx = Ctx::open_with(
+            &a.join("model_weights.bin"),
+            &a.join("model_weights.json"),
+            &a.join("vocab.bin"),
+            &model.join("root"),
+            false,
+            &cfg,
+        )
+        .expect("open the tiny model");
+        let v = ctx.n_vocab();
+        ctx.reset_expert_io_stats();
+        let rows: Vec<Vec<f32>> = toks
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let mut l = vec![0.0f32; v];
+                ctx.eval_token(t, i, 0, &mut l).unwrap();
+                l
+            })
+            .collect();
+        let st = ctx.expert_io_stats();
+        eprintln!(
+            "[qnext_engine] {label}: prefetch reads {} used {}, demand {}, guess prev {:?} cross {:?}",
+            st.prefetch.reads,
+            st.prefetch_hits,
+            st.demand.reads,
+            st.guess_prev.accuracy(),
+            st.guess_cross.accuracy()
+        );
+        if guess == CrossLayer {
+            let layers = streammoe::riir::VARIANT.num_layers as u64;
+            assert_eq!(st.guess_cross.layers, toks.len() as u64 * (layers - 1), "{label}");
+            assert!(st.prefetch_hits > 0, "{label}: no prefetch hits");
+        }
+        if n == 0 {
+            assert_eq!(st.prefetch.reads, 0, "{label}");
+        }
+        match &base {
+            None => base = Some(rows),
+            Some(want) => assert!(
+                rows.iter().zip(want).all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())),
+                "{label}: logits differ from prefetch off"
+            ),
+        }
+    }
+}

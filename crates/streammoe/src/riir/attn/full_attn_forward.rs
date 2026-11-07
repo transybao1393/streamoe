@@ -757,7 +757,21 @@ pub(in crate::riir) fn full_attn_layer_forward(
         &intermediates,
         gpu_combine,
         chain_next_norm_off,
-    )
+    )?;
+    if chain_next_norm_off.is_some() {
+        crate::riir::attn::linear_attn_forward::cross_early_prefetch(
+            prefetch,
+            moe,
+            buffer_pool,
+            deferred,
+            pool,
+            expert_files,
+            wf,
+            layer_idx + 1,
+            k_active,
+        );
+    }
+    Ok(())
 }
 
 /// Batched full-attention layer forward for chunked prefill.

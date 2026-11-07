@@ -4,6 +4,7 @@ pub mod expert_io;
 pub mod expert_io_mode;
 pub mod gpu_lm_head;
 pub mod guess;
+pub mod guess_trace;
 pub mod hot_tier;
 pub mod io_limit;
 pub mod io_stats;
