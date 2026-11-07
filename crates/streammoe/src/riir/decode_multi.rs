@@ -335,9 +335,10 @@ impl RsCtx<MetalBackend> {
             // path does it (guessed from the pass's last token).
             let prefetch_set = layer_idx % 2;
             if prefetch.mode().is_pread() && !prefetch.in_flight_for(layer_idx) {
-                let cross = prefetch.cross_mut().and_then(|c| c.guess(wf, layer_idx, k_active));
-                if let Some(mut predicted) = cross.or_else(|| prefetch.predict_for(layer_idx)) {
-                    io::prefetch::mask_hot(experts.hot_tier(), layer_idx, &mut predicted[..k_active]);
+                let max_k = crate::riir::moe::expert_forward::MAX_K;
+                let cross = prefetch.cross_mut().and_then(|c| c.guess(wf, layer_idx, max_k)).map(|g| (g, max_k));
+                if let Some((mut predicted, n)) = cross.or_else(|| prefetch.predict_for(layer_idx).map(|g| (g, prefetch.max_experts().min(k_active)))) {
+                    io::prefetch::mask_hot_compact(experts.hot_tier(), layer_idx, &mut predicted, n);
                     let data_prefetch = moe_buffers.data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
                     prefetch.dispatch(layer_idx, predicted, k_active, data_prefetch, io_pool, experts);
                 }

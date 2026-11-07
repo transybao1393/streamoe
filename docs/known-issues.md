@@ -12,9 +12,9 @@ history of `.claude/memory/`, which is no longer tracked.
 | --- | --- | --- |
 | Speculative decoding (prompt lookup + `eval_tokens` + `rewind_tokens`) only pays on copy-heavy text. With the match-length guard (`spec_bench` default: draft only when the lookup match is ≥ 8 tokens), a3b at a 4 GiB cap, mean of 2 alternating rounds: 1.08× (packed 3-bit) / 1.12× (4-bit) over plain on five prompts, vs 1.03× / 1.02× unguarded; copy-heavy prompts 1.17–1.26×, grammar fix 0.95× / 1.00× (unguarded 0.85× / 0.91×). Output is token-identical. | A verify pass of ~4 tokens costs ~340–400 ms packed 3-bit and yields 3.8–4.0 tokens on long matches, 2.4–3.0 on short ones; break-even is ~3.3. The guard's residual loss on the grammar prompt is real (~3%): two passes on matches of exactly 8 tokens accept nothing. | Cut the pass cost (it grows with T mostly in disk wait and per-token GPU work — see the multi-column matvec dead end); fewer wrong-draft expert reads; try `--backoff`. |
 | `qsa::tests::graph::graph_cpu_and_metal_match_cpu_path` (`model-qwen3-8-flash-next` lib) failed once in 9 full-suite runs on 2026-11-07 (190 of 191 passed); it passed 5/5 alone and 3/3 in the full suite right after. Its Metal error is normally 3.9e-7–6.9e-7 against a 2e-5 bound. | Flaky under the parallel lib run; cause not found (likely GPU contention with other Metal tests). | Rerun before calling a run red; if it recurs, capture the failing `[qsa graph]` line with `--nocapture` and run the suite with `--test-threads=1`. |
-| Qwen3-Next-80B-A3B (`model-qwen3-next-80b-a3b`) is checked against a reference on a tiny random model only (`tests/qnext_engine.rs`: per-token rows within 1.7e-5 of a pure-torch port of transformers, 600-token prompts, both full-attention layers). On the real MLX build (2026-11-07) the converter's norm check passed (norms hold `1 + w`, as mlx-lm writes them) and greedy answers are correct ("The capital of France is Paris.", a coherent summary of a 979-token text); no logit-level comparison exists at full size. | A real-model difference in long contexts or rare tokens would only show as worse answers. | Compare a few greedy prompts against MLX on a host that fits it. Prefetch is right for 1.6% of guesses here and measured no faster off than on (3.76 vs 3.83 tok/s); the chat page's default (prefetch 6, cross-layer guess) ran at 0.4–0.5 tok/s for this model, so run it with `--prefetch 0 --guess prev`. Packed 3-bit experts: KL 0.048 vs 4-bit, 6/6 scored tasks, 1.7× faster at 6 GiB. |
+| Qwen3-Next-80B-A3B (`model-qwen3-next-80b-a3b`) is checked against a reference on a tiny random model only (`tests/qnext_engine.rs`: per-token rows within 1.7e-5 of a pure-torch port of transformers, 600-token prompts, both full-attention layers). On the real MLX build (2026-11-07) the converter's norm check passed (norms hold `1 + w`, as mlx-lm writes them) and greedy answers are correct ("The capital of France is Paris.", a coherent summary of a 979-token text); no logit-level comparison exists at full size. | A real-model difference in long contexts or rare tokens would only show as worse answers. | Compare a few greedy prompts against MLX on a host that fits it. Decode prefetch: use the cross-layer guess with 4 experts (`--guess cross --prefetch 4` on the chat page; `prefetch_guess: CrossLayer`, `prefetch_experts: Some(4)` in `OpenConfig`): 85% of its top 10 are picked, and decode at 6 GiB went 4.77 → 6.23 tok/s (3-bit) and 3.96 → 4.44 (4-bit) against prefetch off; the previous-token guess is right for 17% of the experts it reads and gains nothing (design-notes, "Cross-layer guess on Qwen3-Next and Flash-Next"). The chat page's 0.4–0.5 tok/s with prefetch 6 + cross guess did not reproduce in the decode runner; rerun it with a server log if it shows up again. Packed 3-bit experts: KL 0.048 vs 4-bit, 6/6 scored tasks, 1.7× faster at 6 GiB. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
-| Qwen3.8-Flash-Next in the engine (`Q38Engine`, `riir/q38_ctx.rs`): refused at open: layer ranges, non-f32 KV, `max_requests > 1`, `max_decode_tokens > 1`; `memory_seq_rm` to a middle position returns `false`. Prefill runs in chunks (`STREAMMOE_Q38_CHUNK`, default 512; under a cap `q38_ctx::plan` halves the staging, then the chunk, until the plan fits). A chunk's experts go through their own prefill staging (`STREAMMOE_Q38_PREFILL_SLOTS`, default 64, at the files' padded stride, `PrefillStaging` account): adjacent experts share a pread; a layer needing at least `STREAMMOE_Q38_LAYER_READ_FRAC` of its experts from disk (default stride / (size + 512 KiB) = 0.86 real, 0.06 tiny) is read whole, gaps read through, in preads of up to `STREAMMOE_Q38_MAX_READ` (16) experts; the slots split in two halves so a batch's reads (up to 32 experts in flight) run while the GPU computes the previous batch. Counters per chunk: `Q38Engine::prefill_io_stats`, `STREAMMOE_Q38_IO_TRACE=1`. Host round trips left per layer: the router logits (to pick the experts to read) and, past the QSA budget, the chunk's indexer projection (block scoring stays on the CPU); the QSA within the budget, the MoE input rows and the PLE no longer go through the host. Expert prefetch uses the a3b `PrefetchState` in decode only (hot-tier experts are copied into the staging, not bound in place); the PLE gate / norms / conv run on the GPU at T rows (`ple_gpu.rs`; host path: `STREAMMOE_Q38_PLE=host`). Checked only on the tiny random-weight model (`model-qwen3-8-flash-next-tiny`: every golden row within 6.2e-5 relative, CPU vs Metal 2.9e-6; batched prefill vs a step per token 1.3e-6 on Metal, bit-identical on the CPU backend, past the QSA budget; prefetch and hot tier on / off bit-identical; `prefill_io_tests`: chunks 1 / 5 / 64 / 512, whole-layer read forced / off, 1 / 2 / 6 / 64 staging slots, 1–16 experts per pread, hot tier and prefetch on / off — bit-identical to a step per token on the CPU backend, 1.8e-6 on Metal and bit-identical between arms). | Expert I/O still dominates prefill on the real model: estimated ~11 tok/s from the external SSD at a 512-token chunk (~148 MB of expert reads per token, was ~850 MB at 64), only for prompts of ~512 tokens or more; a short prompt still reads most of each layer. Each layer's reads start only after its router readback (IO idle during the attention / router GPU work); in a whole-layer read the hot-tier experts inside the read range are read through, not skipped. A padded expert stride is read expert by expert by `read_run_disk` (q38 uses `read_span_disk`); the mmap-mode batched path still assumes stride = size (q38 uses pread). | Start a whole-layer read before the router (it does not depend on the routing) into a second staging; bind hot-tier experts in place (needs per-bucket buffers in the permute-fuse op); keep each layer's router readback waiting for all earlier command buffers (the prefetch's set reuse relies on it); a real-weights run. |
+| Qwen3.8-Flash-Next in the engine (`Q38Engine`, `riir/q38_ctx.rs`): refused at open: layer ranges, non-f32 KV, `max_requests > 1`, `max_decode_tokens > 1`; `memory_seq_rm` to a middle position returns `false`. Prefill runs in chunks (`STREAMMOE_Q38_CHUNK`, default 512) grouped into layer-major windows (`STREAMMOE_Q38_WINDOW`, default 4,096 tokens; `STREAMMOE_Q38_LAYER_MAJOR=0` off): each layer runs the window's chunks, then its experts once for every window row (`Q38Engine::forward_window`; window buffers 60 KB per token in `PrefillScratch`; under a cap `q38_ctx::plan` halves the window, then turns it off, then halves the staging, then the chunk, until the plan fits). A chunk's experts go through their own prefill staging (`STREAMMOE_Q38_PREFILL_SLOTS`, default 64, at the files' padded stride, `PrefillStaging` account): adjacent experts share a pread; a layer needing at least `STREAMMOE_Q38_LAYER_READ_FRAC` of its experts from disk (default stride / (size + 512 KiB) = 0.86 real, 0.06 tiny) is read whole, gaps read through, in preads of up to `STREAMMOE_Q38_MAX_READ` (16) experts; the slots split in two halves so a batch's reads (up to 32 experts in flight) run while the GPU computes the previous batch. Counters per chunk: `Q38Engine::prefill_io_stats`, `STREAMMOE_Q38_IO_TRACE=1`. Host round trips left per layer: the router logits (to pick the experts to read) and, past the QSA budget, the chunk's indexer projection (block scoring stays on the CPU); the QSA within the budget, the MoE input rows and the PLE no longer go through the host. Expert prefetch uses the a3b `PrefetchState` in decode only (hot-tier experts are copied into the staging, not bound in place); with `PrefetchGuess::CrossLayer` the guess is layer L+1's router on layer L's MoE input, computed on the GPU, and read as soon as layer L's reads land (real model, 4-bit, 6 GiB: 1.46 tok/s vs 1.09 prefetch off; the previous-token guess ~1.0); the PLE gate / norms / conv run on the GPU at T rows (`ple_gpu.rs`; host path: `STREAMMOE_Q38_PLE=host`). Checked only on the tiny random-weight model (`model-qwen3-8-flash-next-tiny`: every golden row within 6.2e-5 relative, CPU vs Metal 2.9e-6; batched prefill vs a step per token 1.3e-6 on Metal, bit-identical on the CPU backend, past the QSA budget; prefetch and hot tier on / off bit-identical; `prefill_io_tests`: chunks 1 / 5 / 64 / 512, whole-layer read forced / off, 1 / 2 / 6 / 64 staging slots, 1–16 experts per pread, hot tier and prefetch on / off — bit-identical to a step per token on the CPU backend, 1.8e-6 on Metal and bit-identical between arms). | Expert I/O still dominates prefill on the real model (6 GiB cap, external SSD): the routing is not uniform — a 512-token chunk reaches ~300 of 512 experts per layer (58%), so the whole-layer read never fires chunk by chunk; layer-major windows read each layer once per window: 983 tokens 46.4 → 30.5 s, 1,908 tokens 105.5 → 39 s (48–49 tok/s), same output (design-notes, Layer-major prefill). Each layer's reads still start only after its router readback (IO idle during the attention / router GPU work, ~8 s of GPU wait per 1,908-token window). Measured dead end: reading a layer's first 64 experts early, during that GPU work (`STREAMMOE_Q38_EARLY_READ=64`, off by default) — within noise in layer-major prefill (+0.7% to +9%), slower chunk-major, and decode after it ~13% slower in all three runs (cause not found); in a whole-layer read the hot-tier experts inside the read range are read through, not skipped. A padded expert stride is read expert by expert by `read_run_disk` (q38 uses `read_span_disk`); the mmap-mode batched path still assumes stride = size (q38 uses pread). | A whole-layer read before the router pays only where a window reaches ≳ 86% of a layer (it reached 78% at 1,908 tokens); a larger staging so routed experts read ahead of the router are not overwritten; bind hot-tier experts in place (needs per-bucket buffers in the permute-fuse op); keep each layer's router readback waiting for all earlier command buffers (the prefetch's set reuse relies on it); a real-weights run. |
 | `diff_oracle`, the 10 GiB-cap tests and all a17b / Cogito model tests have not run on this host (~7 GiB reclaimable, no a17b / Cogito weights). `diff_oracle` cannot run under a cap at all: the cap check measures the whole process, and the tests hold two contexts in one process, so the second open sees the first's ~2.5 GiB (`OverBudget: footprint 5.09 GiB exceeds cap 3.00 GiB` at a 3 GiB cap with no checkpoints). | Every other a3b model suite passes: on 2026-10-26 `mlx_regression`, `smoke`, `checkpoint_restore`, `consecutive_eval_prompt`, `mrope`, `layer_range`, `requests`, `streaming`, `expert_source_equivalence`, `budget_cap`, `graph_diff_oracle`, `batched_diff_oracle`; on 2026-10-28 `vision` (cosine 1.000000 on 3 images), `engine_op_diff` (with `STREAMMOE_EXPERT_IO=mmap`) and `mmap_matches_pread` (after the fix below). Suites that open uncapped ran under `STREAMMOE_TEST_CAP_GIB=4`. | `diff_oracle` uncapped with ~8 GiB free; the 10 GiB-cap tests with 10 GiB free; a17b / Cogito where their weights are. |
 | Vision reads small or short printed text unreliably ("STOP" → "SOM" / "Form", "HELLO 2026" → "HILLCO" at 128–160 image tokens); scenes, colors, layout and counting are right. | Not an engine bug: on the same image embeddings, MLX (mlx_vlm, 4-bit) has the same top tokens ("F", "S", "T" for "STOP"); the engine follows MLX layer by layer (cosine ≥ 0.99 at layer 32, 0.96 on the last token at layer 40, bf16 vs f32); positions equal mlx_vlm's `get_rope_index`; the encoder matches transformers exactly and mlx_vlm to 0.997; all 92 160 packed expert tensors are byte-identical to the safetensors. | Use larger images. Re-check against a bf16 / 8-bit checkpoint if text reading matters. |
 | Decode kernels run 3–4× slower than in isolation (a3b, 4 GiB cap: GPU busy ~87 of ~143 ms/token; LM head 9–11 ms vs 2.8 ms). | Reproduced without the model (`tests/matvec_decode_bench.rs`, `matvec_decode_load_pattern`): ~1 ms GPU bursts separated by ~1 ms CPU gaps leave the GPU in a slow state. A spin kernel on a second queue during the gaps restores speed when the GPU is slow but costs 8–15 ms/token when it is not. | Fewer, longer GPU bursts per token; non-blocking keep-alive in the engine; wire `dequant_matvec_4bit_qmv` (+37–55% bandwidth in isolation) into `encode_matvec`. |
@@ -202,6 +202,21 @@ history of `.claude/memory/`, which is no longer tracked.
   chat at a 4 GiB cap, 4-bit → packed 3-bit: forward 118 → 89,
   146 → 115, 121 → 97 ms/token; first word 1.57 → 1.11, 1.38 → 0.92,
   1.36 → 0.90 s; hot tier 719 → 997 slots in the same memory.
+- **Qwen3.8-Flash-Next had 4-bit experts only**: its MoE (prefill and
+  decode) runs `Op::MoeBatchedPermuteFuse`, whose kernels and CPU path
+  assumed 4-bit, and the requant / pack tools hardcoded the 35B-A3B
+  shapes. The op now carries `bits` (a padded stride cannot tell the
+  layouts apart: the tiny model's 4-bit and packed experts both sit at
+  32,768 B); 3-bit always takes the gather GEMM
+  (`affine_gather_qmm_rhs` instantiated at b 3, gs 32, BM=32
+  tile), the CPU backend rewrites packed experts as nibbles; the tools
+  read shapes and the padded stride from `layout.json`. Packed 2.34 MiB
+  vs 2.93 MiB per expert (−20%: the group-32 scales do not shrink).
+  Tiny model: packed == nibble 3-bit bit for bit, CPU and Metal,
+  chunked prefill, a step per token, hot tier (`packed3_tests`,
+  `q38_engine::ctx_packed_3bit_matches_nibbles_under_cap`). Not yet
+  converted or run at full size; steps in
+  `tools/model_layer/qwen3_8_flash_next/README.md`.
 - **Old popularity held the hot tier for ~200 tokens**: counters
   halved every 65536 picks, ~205 tokens on a3b (40 layers × 8 picks),
   so after a topic change the previous topic's experts still beat the
@@ -245,6 +260,22 @@ history of `.claude/memory/`, which is no longer tracked.
   → 14.5 / 11.3 / 15.2). The `io` wait counter grows 2–7 ms per token
   (the routing now arrives sooner after the prefetch starts, so more of
   its reads are still in flight) while forward time falls 4–12 ms.
+- **Decode prefetch guessed wrong on Qwen3-Next and Flash-Next**
+  (2026-11-07). The previous-token guess minus hot-tier experts is
+  mostly the rare picks that don't repeat: 17% of its reads used on
+  Qwen3-Next, 27% on Flash-Next. The cross-layer guess (next layer's
+  router on this layer's residual) is right far more often (top-10
+  overlap 85% / 62%); it now reads its strongest `prefetch_experts`
+  candidates not in the hot tier, its CPU gate matvec is vectorized
+  (1.49 → 0.34 ms per layer), and the Flash-Next engine computes it on
+  the GPU. 6 GiB cap, external SSD, 48 tokens, medians of 3–11 runs,
+  prefetch off → cross 4, output identical: Qwen3-Next 3-bit 4.77 →
+  6.23 tok/s, 4-bit 3.96 → 4.44, Flash-Next 1.09 → 1.46. Bit-identical
+  logits: q38 `prefetch_tests` (cross arms on Metal and CPU),
+  `qnext_engine::prefetch_guesses_do_not_change_logits`, a3b
+  `streaming` 7/7. Opt-in: `prefetch_guess` stays `PrevToken` in
+  `OpenConfig` (the chat page defaults to the cross guess). See
+  [`design-notes.md`](design-notes.md#cross-layer-guess-on-qwen3-next-and-flash-next).
 - **Prefill staged a layer's experts, then computed — never both at
   once.** `OpenConfig::prefill_overlap_groups` (env
   `STREAMMOE_PREFILL_OVERLAP=<n>`; on by default with n = 8 since
@@ -272,6 +303,59 @@ history of `.claude/memory/`, which is no longer tracked.
   6 GiB 1.170 → 0.989 s (−15%) and 15.19 → 12.84 s (−15%, 109.4 →
   129.4 tok/s). n = 2 and 4 gained less (one sweep run at 4 GiB). The
   397B (bounded, 64-slot groups) has not been measured with it.
+- **A long prompt read each layer's experts once per prefill chunk.**
+  Under a cap prompts prefill in chunks of 512, each through every
+  layer before the next, so a 4-chunk prompt staged most experts of
+  every layer four times. Layer-major prefill
+  (`OpenConfig::layer_major`; on by default since 2026-11-07, env
+  `STREAMMOE_LAYER_MAJOR=0` turns it off) runs a window of up to
+  `layer_major_chunks` chunks (default 4, env
+  `STREAMMOE_LAYER_MAJOR_CHUNKS`) layer by layer: each layer runs all
+  of the window's chunks in order (KV rows and linear-attn recurrence
+  still advance chunk by chunk) before the next layer, and the chunks'
+  hidden rows wait in a window buffer. Full staging keeps the layer's
+  staged experts across its chunks and stages only new ones
+  (`MoeGraphScratch::keep_staged`); bounded staging runs the chunks'
+  attention first, then stages the union of their experts once in
+  groups and runs each group for every chunk (`moe_window_forward`),
+  each chunk keeping its own boundary rows and `down_mid` until its
+  combine. Same rows, same combine order: logits, state and decode are
+  bit-identical (`tests/layer_major.rs`: full staging, staging first
+  and overlap 8; bounded 64 and 16 slots, staging first and double
+  buffered; windows of 4, 2 + 2 and 3 + 1 chunks). Memory
+  (`Account::LayerMajor`, lent to the hot tier during decode like the
+  prefill scratch), at chunk 512 and 4 chunks: the window's hidden
+  rows, a3b 16 MiB / a17b 32 MiB; bounded staging adds 3 chunk sets of
+  40 / 96 MiB (a17b total 320 MiB). A capped open that cannot fit the
+  window lowers it, then turns it off, and logs it. a3b 4-bit, 4 GiB
+  cap, n_ctx 4096, F32 KV, internal SSD, a 2062-token prompt, fresh
+  server per run, 2 runs each, 2026-11-05: prefill 14.0 / 14.0 →
+  7.7 / 7.7 s (147 → 269 tok/s, −45%), staging I/O 10.6 → 3.5 s, prefill
+  disk reads 55,890 → 18,887 MiB; output text and peak (3.63 GiB)
+  identical. The 397B (bounded, 9 GiB cap, external SSD, 2,062
+  tokens, 2026-11-06): first word 368 → 135 s, same answer; its
+  0.31 GiB window comes out of the hot tier's plan (305 → 257 slots,
+  lent back during decode; decode 0.43 → 0.42 tok/s). Qwen3-Next-80B
+  packed 3-bit (6 GiB cap, external SSD, 2026-11-07): 979 tokens
+  18.2 → 12.2 s, 1,998 tokens 36.1 → 17.0 s (prefill disk reads
+  65,811 → 21,530 MiB), output identical in 18 runs, decode unchanged
+  (see the next entry). Made the default after those runs.
+- **Layer-major prefill skewed the hot tier toward late layers (fixed
+  2026-11-07).** The tier halves every popularity counter each 4096
+  recorded picks. Chunk by chunk, each layer adds 512 × top-k picks
+  per chunk, about one halving per layer; layer-major adds a whole
+  window's picks per layer at once (4 × 512 × 10 = 20,480 on
+  Qwen3-Next, five halvings), so by the end of the window the early
+  layers' counts were near zero and admission favored the late
+  layers' experts. `HotTier::hold_decay` / `release_decay` now hold
+  the halvings for the window and apply them at its end. Qwen3-Next
+  3-bit, 6 GiB, 1,998 tokens, 32 decode tokens: hot hits 10,613 →
+  10,932, demand reads 4,747 → 4,428 (chunk by chunk: 10,669 /
+  4,691); 979 tokens: 11,739 / 3,621 vs chunk by chunk 10,973 /
+  4,387. Logits never depended on it. Decode tok/s on this shared host
+  swings 2–6 tok/s run to run with other agents' load (the same
+  chunk-major run measured 5.0 and 2.0); compare hot hits and demand
+  reads, not tok/s, unless the host is quiet.
 
 ## Precautions
 
@@ -298,6 +382,14 @@ history of `.claude/memory/`, which is no longer tracked.
   `STREAMMOE_MOE_GATHER_ID=0` fallbacks and the per-expert decode
   fallback (hidden > 4096, Cogito) have 4-bit kernels only. Every
   layer file must hold the same layout (`ExpertIoError::MixedLayouts`).
+  Qwen3.8-Flash-Next's permute-fuse MoE runs packed 3-bit through the
+  gather GEMM whatever `STREAMMOE_MOE_GATHER` says (its per-bucket
+  matvec fallback is 4-bit only).
+- **Qwen3.8-Flash-Next reads `ngram.mfng` from the experts
+  directory**, so a `root-3bit/` made by the tools needs the n-gram
+  table next to its `packed_experts/` (`ln root/ngram.mfng
+  root-3bit/`); without it the open fails. Padded experts need their
+  `layout.json` too: the tools copy it with the new size and stride.
 - **Quantization group size is compile-time, per variant and per
   bits** (`variants::group_size_for_bits`): 4-bit / packed 3-bit use
   `GROUP_SIZE` (64; 32 under `model-qwen3-8-flash-next`), 8-bit use
@@ -521,6 +613,18 @@ history of `.claude/memory/`, which is no longer tracked.
 
 - Predicting the next experts from a moving router score or recency:
   ties the previous-token guess (±1 pt) or loses.
+- Topping up the previous-token prefetch from its weaker picks (read
+  the first N of its picks not in the hot tier): on Flash-Next 26% of
+  those reads were used and decode fell 1.01 → 0.42 tok/s. A
+  transition table learned online over 47 tokens: 10% / 33% precision
+  (Qwen3-Next / Flash-Next) at 4 reads per layer, vs 45% / 69% for the
+  cross guess. Boosting the previous token's picks inside the cross
+  ranking: lower precision on both.
+- On the shared host, within noise (2026-11-07, Qwen3-Next and
+  Flash-Next at 6 GiB): a thread pool of the prefetch's own
+  (`STREAMMOE_PREFETCH_THREADS`) and issuing the qwen3_5_moe path's
+  cross prefetch right after the expert dispatch
+  (`STREAMMOE_CROSS_EARLY=1`); both stay opt-in.
 - LRU or short-retention hot tiers: LFU wins.
 - A 64-slot recent-read window: 0 hits in the engine (~145 slot fills
   per token).

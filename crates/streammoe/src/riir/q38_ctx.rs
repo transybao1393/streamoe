@@ -142,6 +142,8 @@ impl RsCtx<MetalBackend> {
         let mut pf = PrefetchState::new(crate::riir::variants::VARIANT.num_layers, ExpertIoMode::Pread);
         pf.set_max_experts(self.prefetch.max_experts());
         pf.set_lookahead(self.prefetch.lookahead());
+        pf.set_guess(self.prefetch.guess());
+        pf.set_threads_from_env();
         let Self { backend, wf, q38, n_ctx, .. } = self;
         let b = backend.as_mut().expect("just built");
         let io = q38.io.unwrap_or_else(|| Q38PrefillIo::for_root(&q38.root, *n_ctx, es));

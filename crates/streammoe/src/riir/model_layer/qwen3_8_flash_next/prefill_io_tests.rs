@@ -78,6 +78,8 @@ fn io(dir: &Path, es: usize) -> Q38PrefillIo {
     let mut io = Q38PrefillIo::for_root(&root(dir), N_CTX, es);
     io.chunk = 512;
     io.slots = 64;
+    // Chunk-major (layer-major arms set their window, `io_lm`).
+    io.window = 0;
     io
 }
 
@@ -327,4 +329,214 @@ fn prefill_buffers_match_plan() {
         seen.push((io.chunk, io.slots));
     }
     assert_eq!(seen, vec![(512, 64), (512, 32), (512, 16), (256, 16), (128, 16), (64, 16), (64, 8), (64, 4), (64, 2)]);
+}
+
+// --- Layer-major windows and early reads ---------------------------------
+
+/// A layer-major / early-read arm: the read arm, then the window
+/// (tokens; 0 = chunk-major) and the early read (experts; 0 = off).
+#[derive(Clone, Copy)]
+struct LmArm {
+    label: &'static str,
+    arm: Arm,
+    window: usize,
+    early: usize,
+}
+
+const fn lm(label: &'static str, chunk: usize, slots: usize, frac: f64, max_read: usize, window: usize, early: usize) -> LmArm {
+    LmArm { label, arm: (label, chunk, slots, frac, max_read), window, early }
+}
+
+/// Built with 512-row buffers and a 576-row window (`io_lm`).
+const LM_ARMS: [LmArm; 8] = [
+    lm("window 560 (512 + 48), layer read, 64 slots", 512, 64, 0.0, 16, 560, 0),
+    lm("window 560 of chunk 64, expert reads, 2 slots", 64, 2, 2.0, 16, 560, 0),
+    lm("windows 256 of chunk 64 (last 48 as a chunk), layer read, 6 slots, 2/pread", 64, 6, 0.0, 2, 256, 0),
+    lm("window 560 of chunk 5, expert reads, 4 slots", 5, 4, 2.0, 16, 560, 0),
+    lm("chunk 512, early read 8, expert reads, 64 slots", 512, 64, 2.0, 16, 0, 8),
+    lm("chunk 64, early read 3, 4 slots (both halves)", 64, 4, 2.0, 2, 0, 3),
+    lm("window 560 of chunk 64, early read 3, 4 slots, layer read", 64, 4, 0.0, 16, 560, 3),
+    lm("window 560 of chunk 5, early read 1, 2 slots", 5, 2, 2.0, 16, 560, 1),
+];
+
+/// Built with 64-row buffers: the window is clamped to the bucket
+/// scratch (64 · top_k = 192 rows), so batches are cut by rows.
+const LM_ROW_ARMS: [LmArm; 3] = [
+    lm("rows: window 192 of chunk 64, layer read, 64 slots", 64, 64, 0.0, 16, 192, 0),
+    lm("rows: window 192 of chunk 64, early read 8, 64 slots", 64, 64, 2.0, 16, 192, 8),
+    lm("rows: window 192 of chunk 32, expert reads, 2 slots", 32, 2, 2.0, 1, 192, 0),
+];
+
+fn io_lm(dir: &Path, es: usize, chunk: usize, window: usize) -> Q38PrefillIo {
+    let mut io = io(dir, es);
+    io.chunk = chunk;
+    io.window = window;
+    io
+}
+
+fn set_lm<B: Q38Exec>(e: &mut Q38Engine<B>, a: &LmArm) {
+    set_arm(e, &a.arm);
+    e.set_layer_major_window(a.window);
+    e.set_early_read(a.early, 0);
+}
+
+/// The counters of a layer-major / early arm.
+fn check_lm_counters(a: &LmArm, hot: bool, st: &PrefillIoStats) {
+    let (label, chunk, _, frac, _) = a.arm;
+    assert!(st.chunks > 0 && st.layers == st.chunks * VARIANT.num_layers as u64, "{label}");
+    if a.window > 0 {
+        // Fewer passes than chunks.
+        assert!(st.chunks < PROMPT.div_ceil(chunk) as u64, "{label}: {} passes", st.chunks);
+    }
+    if frac == 0.0 {
+        assert_eq!(st.layer_reads, st.layers, "{label}: every layer read whole");
+    } else {
+        assert_eq!(st.layer_reads, 0, "{label}");
+    }
+    if a.early > 0 {
+        assert_eq!(st.early, st.layers * a.early as u64, "{label}: every layer read early");
+    } else {
+        assert_eq!(st.early, 0, "{label}");
+        if frac != 0.0 {
+            assert_eq!(st.read_through, 0, "{label}");
+        }
+    }
+    assert_eq!(st.experts, st.hot + st.experts_read - st.read_through, "{label}");
+    if !hot {
+        assert_eq!(st.hot, 0, "{label}");
+    }
+}
+
+/// CPU backend: layer-major windows and early reads, hot tier and
+/// prefetch off and on, equal a step per token bit for bit (the same
+/// rows go through the same ops; experts add in ascending order).
+#[test]
+fn layer_major_and_early_read_bit_identical_cpu() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38 layer-major] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let wf = open_wf(&dir);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let mut want: Option<Run> = None;
+    for (hot, pf) in [(0usize, false), (12, true)] {
+        let ex = experts(&dir, hot);
+        let es = ex.expert_size();
+        for (chunk, arms) in [(512usize, &LM_ARMS[..]), (64, &LM_ROW_ARMS[..])] {
+            let mut b = CpuBackend::new(open_wf(&dir));
+            let io = io_lm(&dir, es, chunk, N_CTX);
+            let mut e = Q38Engine::with_options(&mut b, &wf, &root(&dir), N_CTX, es, prefetch(pf), io).unwrap();
+            e.set_qsa_mode(QsaMode::Sparse);
+            if want.is_none() {
+                want = Some(run(&mut e, &mut b, &wf, &ex, &pool, true));
+            }
+            let w = want.as_ref().unwrap();
+            for (ai, a) in arms.iter().enumerate() {
+                if hot > 0 && ai % 2 == 1 {
+                    continue;
+                }
+                set_lm(&mut e, a);
+                e.reset_prefill_io_stats();
+                let got = run(&mut e, &mut b, &wf, &ex, &pool, false);
+                let st = e.prefill_io_stats();
+                eprintln!("[q38 layer-major] cpu hot {hot} pf {pf} {}: {}", a.label, st.line());
+                assert!(same_bits(&got, w), "cpu hot {hot} prefetch {pf} {}: differs from per-token", a.label);
+                check_lm_counters(a, hot > 0, &st);
+            }
+        }
+    }
+}
+
+/// Metal: every layer-major / early arm within [`TOL_CPU_METAL`] of a
+/// step per token, and against chunk-major prefill with the same read
+/// settings (reported: bit-identical or not).
+#[test]
+fn layer_major_and_early_read_match_metal() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38 layer-major] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let wf = open_wf(&dir);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let mut worst = (0.0f32, 0.0f32);
+    let mut identical = 0;
+    let mut total = 0;
+    for (hot, pf) in [(0usize, false), (12, true)] {
+        let ex = experts(&dir, hot);
+        let es = ex.expert_size();
+        for (chunk, arms) in [(512usize, &LM_ARMS[..]), (64, &LM_ROW_ARMS[..])] {
+            let mut b = metal(&dir);
+            let io = io_lm(&dir, es, chunk, N_CTX);
+            let mut e = Q38Engine::with_options(&mut b, &wf, &root(&dir), N_CTX, es, prefetch(pf), io).unwrap();
+            e.set_qsa_mode(QsaMode::Sparse);
+            let reference = run(&mut e, &mut b, &wf, &ex, &pool, true);
+            for a in arms {
+                // Chunk-major with the same read settings.
+                set_lm(&mut e, &LmArm { window: 0, early: 0, ..*a });
+                let base = run(&mut e, &mut b, &wf, &ex, &pool, false);
+                set_lm(&mut e, a);
+                e.reset_prefill_io_stats();
+                let s0 = e.submits();
+                let got = run(&mut e, &mut b, &wf, &ex, &pool, false);
+                let st = e.prefill_io_stats();
+                let (err, _) = compare(&got, &reference);
+                let (err_base, _) = compare(&got, &base);
+                let same = same_bits(&got, &base);
+                eprintln!(
+                    "[q38 layer-major] metal hot {hot} pf {pf} {}: vs per-token {err:.3e}, vs chunk-major {err_base:.3e} \
+                     (bit-identical: {same}), {} submits; {}",
+                    a.label,
+                    e.submits() - s0,
+                    st.line()
+                );
+                assert!(err <= TOL_CPU_METAL, "metal hot {hot} prefetch {pf} {}: rel err {err}", a.label);
+                assert!(err_base <= TOL_CPU_METAL, "metal {}: vs chunk-major {err_base}", a.label);
+                check_lm_counters(a, hot > 0, &st);
+                worst = (worst.0.max(err), worst.1.max(err_base));
+                identical += same as usize;
+                total += 1;
+            }
+        }
+    }
+    eprintln!(
+        "[q38 layer-major] metal worst: vs per-token {:.3e}, vs chunk-major {:.3e}; bit-identical to chunk-major in \
+         {identical}/{total} arms",
+        worst.0, worst.1
+    );
+}
+
+/// The window buffers are in the plan's scratch; the window is clamped
+/// to `n_ctx` and the bucket scratch, and shrinks first under a cap.
+#[test]
+fn layer_major_buffers_match_plan() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38 layer-major] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let wf = open_wf(&dir);
+    let ex = experts(&dir, 0);
+    let es = ex.expert_size();
+    let k = super::engine::q38_config().top_k;
+    for (chunk, window, rows) in [(512usize, 4096usize, N_CTX), (64, 4096, 64 * k), (512, 512, 0)] {
+        let io = io_lm(&dir, es, chunk, window);
+        assert_eq!(io.window_rows(N_CTX), rows, "chunk {chunk} window {window}");
+        let mut b = metal(&dir);
+        let e = Q38Engine::with_options(&mut b, &wf, &root(&dir), N_CTX, es, None, io).unwrap();
+        assert_eq!(e.layer_major_window(), rows);
+        let plan = plan_bytes_io(N_CTX, es, 0, 0, &io);
+        let plan_off = plan_bytes_io(N_CTX, es, 0, 0, &Q38PrefillIo { window: 0, ..io });
+        let by = b.pool().bytes_by_label();
+        let win: u64 = by.iter().filter(|x| x.0.starts_with("q38.win_")).map(|x| x.1).sum();
+        eprintln!(
+            "[q38 layer-major] chunk {chunk} window {window}: {rows} rows, buffers {win} B, plan +{} B",
+            plan.scratch - plan_off.scratch
+        );
+        assert!(win <= plan.scratch - plan_off.scratch + 3 * 16 * 1024, "window buffers {win} B over the plan");
+    }
+    let mut io = io_lm(&dir, es, 512, 4096);
+    let mut seen = vec![(io.window, io.slots)];
+    while io.shrink() && io.slots == 64 {
+        seen.push((io.window, io.slots));
+    }
+    assert_eq!(seen, vec![(4096, 64), (2048, 64), (1024, 64), (0, 64)]);
 }

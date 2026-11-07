@@ -234,7 +234,32 @@ pub struct OpenConfig {
     /// [`DEFAULT_PREFILL_OVERLAP_GROUPS`] (on since 2026-11-05: first
     /// word −15% on a3b).
     pub prefill_overlap_groups: Option<usize>,
+    /// Layer-major prefill: a prompt longer than one prefill chunk runs
+    /// layer by layer over a window of up to
+    /// [`Self::layer_major_chunks`] chunks (each layer runs its chunks
+    /// in order before the next layer starts), instead of chunk by
+    /// chunk through every layer. Each layer's routed experts are then
+    /// read once per window — the union over its chunks — rather than
+    /// once per chunk. Outputs are bit-identical. Costs the window's
+    /// hidden rows, plus with bounded staging each extra chunk's MoE
+    /// rows (planned as `layer_major`; lent to the hot tier during
+    /// decode like the prefill scratch). `None` (default): env
+    /// `STREAMMOE_LAYER_MAJOR` (`0` = off), else on. A prompt of one
+    /// chunk or less prefills as before either way.
+    pub layer_major: Option<bool>,
+    /// Prefill chunks per layer-major window
+    /// ([`Self::layer_major`]); a longer prompt runs as several
+    /// windows. Must be ≥ 2. `None`: env
+    /// `STREAMMOE_LAYER_MAJOR_CHUNKS`, else
+    /// [`DEFAULT_LAYER_MAJOR_CHUNKS`]. Clamped to the chunks `n_ctx`
+    /// holds; a capped open that cannot fit the window lowers it (to
+    /// 2, then off) and says so.
+    pub layer_major_chunks: Option<usize>,
 }
+
+/// Default [`OpenConfig::layer_major_chunks`]: 2048 tokens at the
+/// capped chunk of 512.
+pub const DEFAULT_LAYER_MAJOR_CHUNKS: usize = 4;
 
 /// Prefill overlap groups when neither the config nor the env sets
 /// them: n = 8 beat 2 and 4 on a3b at a 4 GiB cap.
@@ -267,6 +292,8 @@ impl Default for OpenConfig {
             prefill_staging_experts: None,
             embed_stream: true,
             prefill_overlap_groups: None,
+            layer_major: None,
+            layer_major_chunks: None,
         }
     }
 }
@@ -279,6 +306,22 @@ impl OpenConfig {
                 .unwrap_or(DEFAULT_PREFILL_OVERLAP_GROUPS)
         });
         n.min(crate::riir::attn::linear_attn_forward::MOE_INDEX_SETS)
+    }
+
+    /// Prefill chunks per layer-major window, or 0 when layer-major
+    /// prefill is off ([`Self::layer_major`], with the env fallbacks),
+    /// before clamping to `n_ctx` and the cap.
+    pub fn resolved_layer_major_chunks(&self) -> usize {
+        let on = self.layer_major.unwrap_or_else(|| {
+            std::env::var("STREAMMOE_LAYER_MAJOR").map_or(true, |v| v != "0")
+        });
+        if !on {
+            return 0;
+        }
+        self.layer_major_chunks
+            .or_else(|| std::env::var("STREAMMOE_LAYER_MAJOR_CHUNKS").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(DEFAULT_LAYER_MAJOR_CHUNKS)
+            .max(2)
     }
 
     /// Check field ranges. Returns a human-readable reason on failure.
@@ -307,6 +350,9 @@ impl OpenConfig {
         }
         if self.prefill_staging_experts == Some(0) {
             return Err("prefill_staging_experts must be ≥ 1".into());
+        }
+        if self.layer_major_chunks.is_some_and(|c| c < 2) {
+            return Err("layer_major_chunks must be ≥ 2".into());
         }
         if self.io_queue_depth == Some(0) {
             return Err("io_queue_depth must be ≥ 1".into());

@@ -19,6 +19,7 @@ external SSD (Kingston NV3 in a USB4 enclosure, ~2.3–2.6 GB/s) under a
 - [Experts a prompt drags in](#experts-a-prompt-drags-in)
 - [Prefill lifecycle](#prefill-lifecycle)
 - [Right and wrong guesses](#right-and-wrong-guesses)
+- [Cross-layer guess on Qwen3-Next and Flash-Next](#cross-layer-guess-on-qwen3-next-and-flash-next)
 - [Splitting expert math between CPU and GPU](#splitting-expert-math-between-cpu-and-gpu)
 - [Expert layout on disk](#expert-layout-on-disk)
 - [On a 128 GB DGX Spark](#on-a-128-gb-dgx-spark)
@@ -170,7 +171,7 @@ Ideas, biggest first:
 
 | # | Idea | Helps | Status |
 | --- | --- | --- | --- |
-| 1 | **Layer-major prefill**: run each layer over every chunk before the next layer, so its experts are read once per prompt instead of once per chunk | Long prompts. Measured, 2,062 tokens: −45% prefill on the 35B, **2.7× faster on the 397B** (below) | Built, opt-in, bit-identical, branch `worktree-agent-a75d0afb8b2779274` at `98a6263` |
+| 1 | **Layer-major prefill**: run each layer over every chunk before the next layer, so its experts are read once per prompt instead of once per chunk | Long prompts. Measured, 2,062 tokens: −45% prefill on the 35B, **2.7× faster on the 397B** (below) | Default since 2026-11-07 (`STREAMMOE_LAYER_MAJOR=0` turns it off), bit-identical; Qwen3-Next 1,998 tokens 36.1 → 17.0 s |
 | 2 | Prefill while typing | Chat | Done; chat default since 2026-11-05 |
 | 3 | Probation for prompt experts | Decode after a long prompt | Measured: loses (above) |
 | 4 | Chunkwise batched linear attention | Long prompts on the 35B (compute-bound at 108–128 tok/s) | Not started |
@@ -183,7 +184,8 @@ the prompt's hidden rows (2,000 × 4,096 × 4 B ≈ 32 MB) plus a running
 sum. Prompts under 512 tokens are one chunk and gain nothing.
 
 **Layer-major, measured.** Switches: `OpenConfig::layer_major` /
-`STREAMMOE_LAYER_MAJOR=1`, and `layer_major_chunks` /
+`STREAMMOE_LAYER_MAJOR` (on by default since 2026-11-07; `0` turns it
+off), and `layer_major_chunks` /
 `STREAMMOE_LAYER_MAJOR_CHUNKS` (window, default 4 chunks). Within a
 window each layer runs all its chunks before the next layer. With full
 staging (35B) later chunks stage only experts not already staged. With
@@ -231,6 +233,26 @@ lent slots are emptied at every prefill). On short chat the price is a
 slightly smaller tier for no prefill gain; layer-major pays only for
 prompts over 512 tokens. Evidence:
 `docs/dev/a17b-evidence/layermajor-20261106-1449/`.
+
+*Setup: Qwen3-Next-80B-A3B, packed 3-bit experts, M3 Pro 18 GB, model
+on the external SSD (Kingston NV3, USB4), 6 GiB cap, n_ctx 4096,
+prefetch off, no checkpoints, greedy, 32 tokens; a 979-token prompt
+(the warehouse summary) and a 1,998-token one (the start of
+`docs/known-issues.md`, "summarize in two sentences"); 2026-11-07,
+builds `9c67937` and `4966de6` (decay hold); 3–6 runs per arm,
+alternating, other agents on the host.* Output tokens identical in all
+18 runs.
+
+| | 979 tokens, chunk-major | 979, layer-major | 1,998, chunk-major | 1,998, layer-major |
+| --- | --- | --- | --- | --- |
+| Prefill | 18.2 s (53.7 tok/s) | **12.2 s (80.4 tok/s)** | 36.1 s (55.3 tok/s) | **17.0 s (118 tok/s)** |
+| Prefill disk reads | 34,047 MiB | 20,163 MiB | 65,811 MiB | 21,530 MiB |
+| Decode hot hits / demand reads (32 tokens, last pair) | 10,973 / 4,387 | 11,739 / 3,621 | 10,669 / 4,691 | 10,912 / 4,448 |
+| Decode (last pair, quiet host) | 5.37 tok/s | 6.18 tok/s | 4.98 tok/s | 5.13 tok/s |
+
+A 2-chunk window on the 1,998-token prompt (2 + 2) gave 23.2 s and
+37,675 MiB, between the two. The window costs 0.02 GiB of the plan
+here (full staging), lent back to the hot tier during decode.
 
 ## Right and wrong guesses
 
@@ -283,6 +305,107 @@ thinking off, `--prefetch 6`, cross-layer guess, three standard prompts
 - Model suites with all three switches on: `streaming` 7/7,
   `budget_cap` 11/11, `mlx_regression` 1/1, `batched_diff_oracle` 33/33
   (2026-11-06), as with them off.
+
+## Cross-layer guess on Qwen3-Next and Flash-Next
+
+**Replayed, then measured** (2026-11-07). The question: which guess
+lets decode prefetch read the next layer's experts early and have them
+used, on Qwen3-Next-80B-A3B and Qwen3.8-Flash-Next (512 experts, top
+10, 48 layers each)?
+
+**Why the previous-token guess fails here.** The engine drops guesses
+already in the hot tier, and the previous token's picks of a layer are
+by then mostly in the tier (they were just read and admitted). What is
+left is the rare pick, and it rarely repeats: on Qwen3-Next the
+previous-token guess reads ~5 experts per token and 17% of them are
+used (the "1.6%" in the first report was hits over all demand reads).
+Topping the guess up from the weaker picks (read the first N non-hot
+ones) doesn't help: 26% of those reads were used on Flash-Next and
+decode fell 1.01 → 0.42 tok/s. That top-up is kept for the cross guess
+only.
+
+**Replay.** `STREAMMOE_GUESS_TRACE` logs, per decode layer, the
+residual a guess starts from, the picks and the hot-tier residency;
+`tools/sim_prefetch_guess.py` replays guessers at N reads per layer,
+skipping hot-tier experts as the engine does. *Setup: 979-token prompt
+(`b.ids`), 47 greedy decode tokens, 6 GiB cap, layers 2–47; Qwen3-Next
+packed 3-bit (2,387 hot slots, 104 of 460 picks per token not hot),
+Flash-Next 4-bit (683 hot slots, 313 of 460 not hot).* hits / reads
+per token, and the share of non-hot picks covered:
+
+| Guess | N | Qwen3-Next | Flash-Next |
+| --- | --- | --- | --- |
+| previous token | 4 | 0.8 / 4.7 (17%), covers 1% | 44.8 / 167.9 (27%), 14% |
+| cross: L's router on L−1's residual | 1 | 34.0 / 46 (74%), 33% | 38.0 / 46 (83%), 12% |
+| cross | 2 | 57.6 / 92 (63%), 56% | 72.2 / 92 (79%), 23% |
+| cross | 4 | 83.2 / 184 (45%), 80% | 126.3 / 184 (69%), 40% |
+| cross | 6 | 94.0 / 276 (34%), 91% | 163.9 / 276 (59%), 52% |
+| cross from L−2 (two ahead) | 4 | 77.8 / 184 (42%), 75% | 107.0 / 184 (58%), 34% |
+| transition table learned online | 4 | 15.6 / 160 (10%), 15% | 59.2 / 181 (33%), 19% |
+| cross, router probability ≥ 0.01 | 6 | 84.2 / 133 (63%), 81% | 92.9 / 112 (83%), 30% |
+| perfect guess | 4 | 90.3 / 90.3, 87% | 176.6 / 176.6, 56% |
+
+In the engine the cross guess's top 10 overlaps the router's picks by
+85% on Qwen3-Next (previous token 38%) and 62% on Flash-Next (32%).
+Two layers ahead is nearly as good (more time to read, not tried in
+the engine); 47 tokens are too few for a transition table; boosting
+the previous token's picks inside the cross ranking only lost.
+
+**What runs.** Qwen3-Next (qwen3_5_moe path) already had
+`CrossLayerGuesser` on the CPU; it now ranks 16 candidates and reads
+the strongest `prefetch_experts` that are not in the hot tier (it used
+to drop resident ones from its top `prefetch_experts`, often leaving
+1–2), and its 512 × 2048 8-bit gate matvec is vectorized (1.49 →
+0.34 ms per layer, ~72 → ~16 ms per token). Flash-Next's engine runs
+layer L+1's router on layer L's MoE input on the GPU, in the router's
+command buffer (one more matvec, 4 KiB more readback), and issues the
+reads as soon as layer L's own reads land, so they also run under layer
+L's expert compute.
+
+**Measured.** *Setup: real models from the external SSD, 6 GiB cap,
+`b.ids` prompt, 48 greedy tokens, decode tok/s over steps 3–48, n_ctx
+4096, checkpoints off, runner `tmp/qnrun` / `tmp/q38run` (Ctx +
+`eval_token`); prefetch 4 per layer unless noted. The host was shared
+with other agents: single runs swing up to 2× (a pf0 run at 1.79 next
+to 5.83), so each cell lists every run and the comparison is the
+median; output tokens identical in every run of a model (19 Qwen3-Next
+3-bit, 15 4-bit, 13 Flash-Next runs).*
+
+| Model | Prefetch off | Previous token | Cross 4 | Cross 6 |
+| --- | --- | --- | --- | --- |
+| Qwen3-Next 3-bit | 4.69, 4.77, 5.83 → **4.77** | 4.82, 6.03, 4.86 → **4.86** | 5.43, 5.53, 6.36, 6.23, 6.26 → **6.23** | 4.94, 5.08 |
+| Qwen3-Next 4-bit | 4.03, 3.52, 4.07, 3.93, 3.96 → **3.96** | 3.99, 4.07, 3.98, 2.12, 2.01, 2.02 → **3.0** | 4.45, 4.39, 4.47, 3.54, 3.22, 4.53, 4.41, 4.44, 4.46, 4.46, 4.44 → **4.44** | 4.18 |
+| Flash-Next 4-bit | 1.01, 1.09, 1.17 → **1.09** | 0.80, 1.22 → ~1.0 | 1.34, 1.46, 1.46, 1.46 → **1.46** | 1.30, 1.23 |
+
+Left out as host-load outliers (a whole run at about half speed):
+Qwen3-Next 3-bit pf0 1.79 and cross 3.76, 4-bit pf0 2.70 (a build ran
+alongside) and cross 2.41. The 4-bit previous-token guess fell to ~2.0
+in 3 of 6 runs, in two different batches, while the arms around it
+held; it is kept in its median and is worth a closer look. Cross 4
+against prefetch off: **+31%** (3-bit), **+12%** (4-bit), **+34%**
+(Flash-Next). It reads more bytes than it
+saves (Qwen3-Next 3-bit: 7.3k prefetch reads, 4.1k used, demand reads
+5.8k → 1.6k per 46 tokens) but moves most reads off the critical
+path. Six guesses read too many wrong ones on these disks; 4 is the
+better setting. `STREAMMOE_PREFETCH_MIN_P=0.01` with 6 guesses read
+12% fewer bytes than cross 6 at the speed of cross 4 (5.44, one run).
+
+Tried and left opt-in (within noise): issuing the qwen3_5_moe path's
+cross prefetch right after a layer's expert dispatch instead of at the
+top of the next layer (`STREAMMOE_CROSS_EARLY=1`: 4.94 vs 5.08 tok/s,
+3-bit, cross 6), and a thread pool of the prefetch's own so demand
+reads never queue behind guesses (`STREAMMOE_PREFETCH_THREADS=4`:
+Qwen3-Next 4-bit cross 4.44 / 4.46 own vs 4.44 / 4.46 shared,
+previous token 4.07 / 3.98 vs 3.99; Flash-Next 1.460 vs 1.463).
+
+**The chat page's 8× slowdown** (0.4 vs 3.6 tok/s with its default
+`--prefetch 6`, cross guess; recorded without a setup or log) did not
+reproduce: in the decode runner the cross guess was faster than
+prefetch off in every clean batch, on both precisions. What the old
+code did cost: the serial gate matvec (~72 ms per token, now ~16) and
+6 guesses instead of 4 (−6% here). The half-speed runs above show the
+host alone can halve a run; a chat-page run with a server log is
+needed to say more.
 
 ## Splitting expert math between CPU and GPU
 
@@ -444,8 +567,13 @@ to its router; with `prefetch_lookahead`, layer L+1's go out right
 after layer L's router readback. A routed expert found in the set binds
 that slot directly. Settings and defaults are the context's (all K
 uncapped, 4 under a cap, `prefetch_experts = 0` turns it off); the plan
-counts the `2P` extra slots. Not used: the cross-layer guesser (GQA
-only) and switches A/B/C (on a separate branch, not merged here).
+counts the `2P` extra slots. With `PrefetchGuess::CrossLayer` (no
+lookahead) the guess for layer L+1 is layer L+1's router run on layer
+L's MoE input, on the GPU in layer L's router command buffer, and its
+reads go out as soon as layer L's own reads land: see [Cross-layer
+guess on Qwen3-Next and
+Flash-Next](#cross-layer-guess-on-qwen3-next-and-flash-next). Not
+used: switches A/B/C (on a separate branch, not merged here).
 Everything in flight is drained at the end of each token.
 
 Measured on the tiny model (4 layers × 8 experts, top 3; 13 + 8 tokens
@@ -602,3 +730,97 @@ arithmetic at 64 (5.7× fewer bytes per token). Only for prompts of
 ~512 tokens or more: a 100-token prompt still reaches ~440 experts per
 layer (~2.6 tok/s). Next: start a whole-layer read before the router
 (it does not depend on the routing).
+
+**Measured: the real routing is not uniform.** A 512-token chunk of the
+real model reaches ~300 of a layer's 512 experts (58%; 14,353 over 48
+layers), not ~all of them, so the whole-layer read (threshold 0.86)
+never fires in chunk-major prefill, and each 512-token chunk still
+reads ~41–44 GiB (~82 MiB per token). The reads run at ~2.3 GB/s and take
+85–90% of a chunk's wall time (io wait 19–25 s of 23–28 s).
+
+### Layer-major prefill and early reads
+
+**Layer-major windows** (`Q38Engine::forward_window`; on by default,
+`STREAMMOE_Q38_LAYER_MAJOR=0` turns it off; window
+`STREAMMOE_Q38_WINDOW` tokens, default 4,096, clamped to `n_ctx` and to
+`chunk · top_k` rows). A prompt longer than a chunk runs in windows;
+per layer:
+
+1. per 512-token chunk, in order: its hyper rows from the window
+   buffer (layer 0: the embeddings), the PLE, attention / Gated
+   DeltaNet and the MoE Gated Residual as in chunk-major prefill, the
+   hyper and MoE input rows back to the window, the router (one submit;
+   the logits are read back and routed);
+2. the routed experts once for every window row: buckets over the
+   window (`build_expert_buckets` on all its rows), batches through the
+   prefill staging as before, rows gathered from the window's MoE input
+   rows, sums scattered into the window's sum rows;
+3. per chunk: the MoE Gated Residual again (same rows, same kernels:
+   the same mix and inject weights, so nothing extra is stored), the
+   shared expert, the combine with the chunk's sums, the inject, the
+   hyper rows back.
+
+The Gated DeltaNet and PLE conv state, the QSA caches and the indexer
+see the chunks in order, exactly as in chunk-major prefill; the window
+only changes which experts are staged together. Window buffers: `[W,
+hc·H]` hyper, `[W, H]` MoE input, `[W, H]` sums (60 KB per token, 252 MB
+at 4,096 on the real model) plus the host routing, counted in the
+plan's `PrefillScratch`; under a cap the window halves down to two
+chunks, then turns off, before the staging or the chunk shrink. A
+batch is capped at the bucket scratch's rows (`chunk · top_k`;
+`plan_prefill_batches_rows`). New family op: `FamOp::CopyRows`.
+
+**Early reads** (`STREAMMOE_Q38_EARLY_READ=n`, off by default; only for
+passes of `STREAMMOE_Q38_EARLY_MIN` = 256 tokens or more). The step the
+note above proposed, generalised: instead of a whole-layer read (which
+never fires on the real routing), a layer's experts `0..n` (n ≤ the
+staging slots, 64) are read on a scoped thread into slots `0..n` while
+the GPU runs the layer's attention and router — the one stretch of a
+layer where the IO idles. The router pass is committed without waiting,
+the host waits for the passes before it (the previous layer's expert
+batches, the staging's last readers), starts the read, then waits for
+the router. After the routing, the buckets of experts `< n` run first
+from those slots (no reads); the rest are planned as before, halves
+alternating.
+
+**Correctness.** Same rows through the same ops, experts added in
+ascending order: on the tiny model (560-token prompt past the QSA
+budget; 11 arms: windows of 2–112 chunks, the last window run as a
+chunk, row-capped batches, early reads of 1–8 experts, whole-layer and
+expert reads, 2–64 slots; hot tier and prefetch off / on) the CPU
+backend is bit-identical to a step per token and Metal bit-identical to
+chunk-major prefill in 22/22 arms (1.8e-6 from a step per token). On the
+real model every arm gave the same 16 output tokens and the same first
+logit bits.
+
+**Real model** (`model-qwen3-8-flash-next`, 4-bit, external SSD).
+Setup: M3 Pro 18 GB, cap 6 GiB, `n_ctx` 4,096, checkpoints off, prefetch
+default, chunk 512, 64 staging slots, greedy, 16 generated tokens
+(decode over the last 14), `q38run`; 2026-11-07, other agents' jobs on
+the host.
+
+| Prompt | Arm | Prefill | Prompt tok/s | Expert reads (GiB) | Decode tok/s | Output |
+| --- | --- | --- | --- | --- | --- | --- |
+| 983 | chunk-major (before) | 46.4 s | 21.2 | 85.6 | 1.07 | – |
+| 983 | layer-major | **30.5 s** | **32.3** | 48.9 | 0.56 ¹ | same |
+| 983 | early read 64, chunk-major | 69.6 s ² | 14.1 | 92.7 | 1.00 | same |
+| 983 | layer-major + early 64 | 30.3 s | 32.5 | 51.7 | 1.02 | same |
+| 1,908 | chunk-major (before) | 105.5 s | 18.1 | 174.1 | 1.19 | – |
+| 1,908 | layer-major | **39.1 / 38.7 s** | **48.8 / 49.2** | 55.0 | 1.20 / 1.18 | same |
+| 1,908 | layer-major + early 64 | 35.6 / 37.8 s | 53.6 / 50.5 | 57.0 | 1.07 / 1.03 | same |
+
+¹ Two 6 s host stalls in the last decode steps (swap on the shared host
+at the time); decode does not run the new code. ² The first chunk
+stalled ~20 s outside reads and GPU waits; the second chunk alone was
+25.6 s against 23.8 s.
+
+A window reaches 355 (983 tokens) and 398 (1,908 tokens) of a layer's
+512 experts against ~300–320 per 512-token chunk, so a layer is read
+~1.7× / ~3.2× less. Layer-major is now the default. The early read is
+not: it reads ~20–30% unrouted experts (+749–1,296 read through per
+pass), its gain was within run-to-run noise in layer-major prefill
+(+9% and +2.5% at 1,908 tokens, +0.7% at 983) and negative in
+chunk-major prefill, and decode after it was ~13% slower in all three
+early runs (cause not found; the hot tier's admission order differs).
+What is left of the IO-idle stretch is ~8 s of GPU wait per 1,908-token
+window (attention, routers, the last batch of each layer).

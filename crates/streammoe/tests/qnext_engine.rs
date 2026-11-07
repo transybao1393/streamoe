@@ -219,3 +219,153 @@ fn state_save_load_continues_on_goldens() {
     ctx.state_load(&snap).unwrap();
     assert_eq!(run(&mut ctx), first, "state_load");
 }
+
+/// Speculative prefetch only chooses which experts are read early:
+/// prefetch off, the previous-token guess and the cross-layer guess
+/// (layer L+1's router on layer L's residual; with
+/// `STREAMMOE_CROSS_EARLY=1` issued right after L's expert dispatch),
+/// with and without
+/// a hot tier, give bit-identical logits over the 40-token prompt and
+/// its decode tokens. The cross guess is scored on every layer after
+/// the first and its reads are used.
+#[test]
+fn prefetch_guesses_do_not_change_logits() {
+    use streammoe::PrefetchGuess::{CrossLayer, PrevToken};
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[qnext_engine] STREAMMOE_QNEXT_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let g = &gs[1];
+    let model = dir.join("streammoe");
+    let a = model.join("artifacts");
+    let toks: Vec<i32> = g.ids.iter().chain(&g.decode).copied().collect();
+    let mut base: Option<Vec<Vec<f32>>> = None;
+    // (label, prefetch experts, guess, hot-tier bytes)
+    let arms = [
+        ("off", 0, PrevToken, 0u64),
+        ("prev 4", 4, PrevToken, 0),
+        ("cross 4", 4, CrossLayer, 0),
+        ("cross all", 16, CrossLayer, 0),
+        ("cross 4 + hot tier", 4, CrossLayer, 4 << 20),
+    ];
+    for (label, n, guess, hot) in arms {
+        let cfg = OpenConfig {
+            n_ctx: 64,
+            mem_cap: Some(2 * GIB),
+            hot_tier_bytes: Some(hot),
+            prefetch_experts: Some(n),
+            prefetch_guess: guess,
+            ..OpenConfig::default()
+        };
+        let mut ctx = Ctx::open_with(
+            &a.join("model_weights.bin"),
+            &a.join("model_weights.json"),
+            &a.join("vocab.bin"),
+            &model.join("root"),
+            false,
+            &cfg,
+        )
+        .expect("open the tiny model");
+        let v = ctx.n_vocab();
+        ctx.reset_expert_io_stats();
+        let rows: Vec<Vec<f32>> = toks
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let mut l = vec![0.0f32; v];
+                ctx.eval_token(t, i, 0, &mut l).unwrap();
+                l
+            })
+            .collect();
+        let st = ctx.expert_io_stats();
+        eprintln!(
+            "[qnext_engine] {label}: prefetch reads {} used {}, demand {}, guess prev {:?} cross {:?}",
+            st.prefetch.reads,
+            st.prefetch_hits,
+            st.demand.reads,
+            st.guess_prev.accuracy(),
+            st.guess_cross.accuracy()
+        );
+        if guess == CrossLayer {
+            let layers = streammoe::riir::VARIANT.num_layers as u64;
+            assert_eq!(st.guess_cross.layers, toks.len() as u64 * (layers - 1), "{label}");
+            assert!(st.prefetch_hits > 0, "{label}: no prefetch hits");
+        }
+        if n == 0 {
+            assert_eq!(st.prefetch.reads, 0, "{label}");
+        }
+        match &base {
+            None => base = Some(rows),
+            Some(want) => assert!(
+                rows.iter().zip(want).all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())),
+                "{label}: logits differ from prefetch off"
+            ),
+        }
+    }
+}
+
+/// Layer-major prefill (`OpenConfig::layer_major`) is bit-identical to
+/// chunk-by-chunk prefill on this family too: the 600-token golden
+/// prompt in chunks of 64 (windows of 4 + 4 + 2 chunks), full staging
+/// and bounded staging (16 of the 32 experts, double-buffered) — the
+/// prefill logits, the saved state and the decode after it — and it
+/// stages fewer experts.
+#[test]
+fn layer_major_matches_chunk_major() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[qnext_engine] STREAMMOE_QNEXT_TINY unset: skipped");
+        return;
+    };
+    let gs = goldens(&dir);
+    let g = gs.iter().max_by_key(|g| g.ids.len()).unwrap();
+    let model = dir.join("streammoe");
+    let a = model.join("artifacts");
+    let run = |staging: Option<usize>, overlap: usize, lm: bool| -> (Vec<Vec<f32>>, Vec<u8>, u64) {
+        let cfg = OpenConfig {
+            n_ctx: 640,
+            mem_cap: Some(2 * GIB),
+            max_checkpoints: 0,
+            prefill_chunk: Some(64),
+            prefill_staging_experts: staging,
+            prefill_overlap_groups: Some(overlap),
+            layer_major: Some(lm),
+            layer_major_chunks: lm.then_some(4),
+            ..OpenConfig::default()
+        };
+        let mut ctx = Ctx::open_with(
+            &a.join("model_weights.bin"),
+            &a.join("model_weights.json"),
+            &a.join("vocab.bin"),
+            &model.join("root"),
+            false,
+            &cfg,
+        )
+        .expect("open the tiny model");
+        let mut logits = vec![0.0f32; ctx.n_vocab()];
+        ctx.reset_expert_io_stats();
+        ctx.eval_prompt(&g.ids, 0, 0, &mut logits).unwrap();
+        let st = ctx.expert_io_stats();
+        let staged: u64 = st.per_layer.iter().map(|l| l.prefill_reads + l.prefill_hot).sum();
+        let mut state = vec![0u8; ctx.state_size()];
+        let len = ctx.state_save(&mut state).unwrap();
+        state.truncate(len);
+        let mut rows = vec![logits.clone()];
+        for (k, &tok) in g.decode.iter().enumerate() {
+            ctx.eval_token(tok, g.ids.len() + k, 0, &mut logits).unwrap();
+            rows.push(logits.clone());
+        }
+        (rows, state, staged)
+    };
+    for (staging, overlap) in [(None, 0), (Some(16), 1)] {
+        let (base_rows, base_state, base_staged) = run(staging, overlap, false);
+        let (rows, state, staged) = run(staging, overlap, true);
+        eprintln!("[qnext_engine] layer-major, staging {staging:?}: staged {staged} experts, chunk-major {base_staged}");
+        for (i, (x, y)) in rows.iter().zip(&base_rows).enumerate() {
+            let diff = x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+            assert_eq!(diff, 0, "staging {staging:?} row {i}: {diff} logits differ");
+        }
+        assert!(state == base_state, "staging {staging:?}: state differs");
+        assert!(staged < base_staged, "staging {staging:?}: staged {staged} vs {base_staged}");
+    }
+}

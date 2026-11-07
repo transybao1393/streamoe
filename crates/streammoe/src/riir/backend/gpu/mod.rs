@@ -1322,6 +1322,7 @@ impl Backend for MetalBackend {
             Op::MoeBatchedPermuteFuse {
                 expert_base,
                 expert_stride,
+                bits,
                 expert_indices,
                 expert_slots,
                 bucket_input,
@@ -1343,6 +1344,7 @@ impl Backend for MetalBackend {
                     &self.moe_bucket_accumulate_pso,
                     self.pool.handle(*expert_base),
                     *expert_stride,
+                    crate::riir::variants::ExpertLayout { bits: *bits },
                     self.pool.handle(*expert_indices),
                     expert_slots,
                     self.pool.handle(*bucket_input),

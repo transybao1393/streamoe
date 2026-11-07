@@ -138,6 +138,15 @@ impl DeferredRing {
         }
     }
 
+    /// [`Self::wait_in_place`] for every dispatch but the newest: the
+    /// early cross-layer prefetch writes the set the one before it read.
+    pub fn wait_all_but_newest(&self) {
+        let n = self.states.len();
+        for s in self.states.iter().take(n.saturating_sub(1)) {
+            s.cmd_buffer.wait_until_completed();
+        }
+    }
+
     /// Remove and return the oldest in-flight dispatch (FIFO). Caller
     /// is responsible for `wait_until_completed` + readback as needed.
     pub(crate) fn pop_oldest(&mut self) -> Option<DeferredState> {

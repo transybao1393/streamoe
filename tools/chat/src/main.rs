@@ -608,6 +608,8 @@ impl Chat {
             // cores busy (process CPU time / wall) in each phase.
             "prefill_ms": (st0.prefill_ns - st_pre.prefill_ns) as f64 / 1e6,
             "prefill_io_ms": (st0.prefill_io_ns - st_pre.prefill_io_ns) as f64 / 1e6,
+            // Expert bytes prefill staging read from disk this turn.
+            "prefill_disk_mib": (st0.prefill.bytes - st_pre.prefill.bytes) as f64 / (1u64 << 20) as f64,
             "prefill_cpu_cores": t.cpu_pre_cores,
             "decode_cpu_cores": (cpu_secs() - t.cpu_dec0) / decode_s.max(1e-9),
         });
@@ -816,7 +818,11 @@ fn main() {
         Some("prev") => PrefetchGuess::PrevToken,
         Some(o) => panic!("--guess {o}: expected cross|prev"),
     };
-    cfg.prefetch_experts = Some(arg(&args, "--prefetch").map_or(6, |v| v.parse().unwrap()));
+    // Qwen3-Next and Qwen3.8-Flash-Next read 4 ahead: at a 6 GiB cap 6
+    // was slower than 4 on both (Qwen3-Next 3-bit 6.23 vs ~5.0 tok/s,
+    // Flash-Next 1.46 vs 1.23-1.30; docs/design-notes.md).
+    let prefetch_default = if cfg!(any(feature = "qnext", feature = "q38")) { 4 } else { 6 };
+    cfg.prefetch_experts = Some(arg(&args, "--prefetch").map_or(prefetch_default, |v| v.parse().unwrap()));
 
     let art = base.join("artifacts");
     let precisions: Vec<u32> =
