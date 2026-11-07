@@ -602,3 +602,97 @@ arithmetic at 64 (5.7× fewer bytes per token). Only for prompts of
 ~512 tokens or more: a 100-token prompt still reaches ~440 experts per
 layer (~2.6 tok/s). Next: start a whole-layer read before the router
 (it does not depend on the routing).
+
+**Measured: the real routing is not uniform.** A 512-token chunk of the
+real model reaches ~300 of a layer's 512 experts (58%; 14,353 over 48
+layers), not ~all of them, so the whole-layer read (threshold 0.86)
+never fires in chunk-major prefill, and each 512-token chunk still
+reads ~41–44 GiB (~82 MiB per token). The reads run at ~2.3 GB/s and take
+85–90% of a chunk's wall time (io wait 19–25 s of 23–28 s).
+
+### Layer-major prefill and early reads
+
+**Layer-major windows** (`Q38Engine::forward_window`; on by default,
+`STREAMMOE_Q38_LAYER_MAJOR=0` turns it off; window
+`STREAMMOE_Q38_WINDOW` tokens, default 4,096, clamped to `n_ctx` and to
+`chunk · top_k` rows). A prompt longer than a chunk runs in windows;
+per layer:
+
+1. per 512-token chunk, in order: its hyper rows from the window
+   buffer (layer 0: the embeddings), the PLE, attention / Gated
+   DeltaNet and the MoE Gated Residual as in chunk-major prefill, the
+   hyper and MoE input rows back to the window, the router (one submit;
+   the logits are read back and routed);
+2. the routed experts once for every window row: buckets over the
+   window (`build_expert_buckets` on all its rows), batches through the
+   prefill staging as before, rows gathered from the window's MoE input
+   rows, sums scattered into the window's sum rows;
+3. per chunk: the MoE Gated Residual again (same rows, same kernels:
+   the same mix and inject weights, so nothing extra is stored), the
+   shared expert, the combine with the chunk's sums, the inject, the
+   hyper rows back.
+
+The Gated DeltaNet and PLE conv state, the QSA caches and the indexer
+see the chunks in order, exactly as in chunk-major prefill; the window
+only changes which experts are staged together. Window buffers: `[W,
+hc·H]` hyper, `[W, H]` MoE input, `[W, H]` sums (60 KB per token, 252 MB
+at 4,096 on the real model) plus the host routing, counted in the
+plan's `PrefillScratch`; under a cap the window halves down to two
+chunks, then turns off, before the staging or the chunk shrink. A
+batch is capped at the bucket scratch's rows (`chunk · top_k`;
+`plan_prefill_batches_rows`). New family op: `FamOp::CopyRows`.
+
+**Early reads** (`STREAMMOE_Q38_EARLY_READ=n`, off by default; only for
+passes of `STREAMMOE_Q38_EARLY_MIN` = 256 tokens or more). The step the
+note above proposed, generalised: instead of a whole-layer read (which
+never fires on the real routing), a layer's experts `0..n` (n ≤ the
+staging slots, 64) are read on a scoped thread into slots `0..n` while
+the GPU runs the layer's attention and router — the one stretch of a
+layer where the IO idles. The router pass is committed without waiting,
+the host waits for the passes before it (the previous layer's expert
+batches, the staging's last readers), starts the read, then waits for
+the router. After the routing, the buckets of experts `< n` run first
+from those slots (no reads); the rest are planned as before, halves
+alternating.
+
+**Correctness.** Same rows through the same ops, experts added in
+ascending order: on the tiny model (560-token prompt past the QSA
+budget; 11 arms: windows of 2–112 chunks, the last window run as a
+chunk, row-capped batches, early reads of 1–8 experts, whole-layer and
+expert reads, 2–64 slots; hot tier and prefetch off / on) the CPU
+backend is bit-identical to a step per token and Metal bit-identical to
+chunk-major prefill in 22/22 arms (1.8e-6 from a step per token). On the
+real model every arm gave the same 16 output tokens and the same first
+logit bits.
+
+**Real model** (`model-qwen3-8-flash-next`, 4-bit, external SSD).
+Setup: M3 Pro 18 GB, cap 6 GiB, `n_ctx` 4,096, checkpoints off, prefetch
+default, chunk 512, 64 staging slots, greedy, 16 generated tokens
+(decode over the last 14), `q38run`; 2026-11-07, other agents' jobs on
+the host.
+
+| Prompt | Arm | Prefill | Prompt tok/s | Expert reads (GiB) | Decode tok/s | Output |
+| --- | --- | --- | --- | --- | --- | --- |
+| 983 | chunk-major (before) | 46.4 s | 21.2 | 85.6 | 1.07 | – |
+| 983 | layer-major | **30.5 s** | **32.3** | 48.9 | 0.56 ¹ | same |
+| 983 | early read 64, chunk-major | 69.6 s ² | 14.1 | 92.7 | 1.00 | same |
+| 983 | layer-major + early 64 | 30.3 s | 32.5 | 51.7 | 1.02 | same |
+| 1,908 | chunk-major (before) | 105.5 s | 18.1 | 174.1 | 1.19 | – |
+| 1,908 | layer-major | **39.1 / 38.7 s** | **48.8 / 49.2** | 55.0 | 1.20 / 1.18 | same |
+| 1,908 | layer-major + early 64 | 35.6 / 37.8 s | 53.6 / 50.5 | 57.0 | 1.07 / 1.03 | same |
+
+¹ Two 6 s host stalls in the last decode steps (swap on the shared host
+at the time); decode does not run the new code. ² The first chunk
+stalled ~20 s outside reads and GPU waits; the second chunk alone was
+25.6 s against 23.8 s.
+
+A window reaches 355 (983 tokens) and 398 (1,908 tokens) of a layer's
+512 experts against ~300–320 per 512-token chunk, so a layer is read
+~1.7× / ~3.2× less. Layer-major is now the default. The early read is
+not: it reads ~20–30% unrouted experts (+749–1,296 read through per
+pass), its gain was within run-to-run noise in layer-major prefill
+(+9% and +2.5% at 1,908 tokens, +0.7% at 983) and negative in
+chunk-major prefill, and decode after it was ~13% slower in all three
+early runs (cause not found; the hot tier's admission order differs).
+What is left of the IO-idle stretch is ~8 s of GPU wait per 1,908-token
+window (attention, routers, the last batch of each layer).
