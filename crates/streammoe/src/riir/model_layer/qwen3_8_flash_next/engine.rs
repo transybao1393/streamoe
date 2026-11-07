@@ -90,6 +90,20 @@
 //! halves so one batch's reads run while the GPU computes the previous
 //! batch (committed without waiting).
 //!
+//! **Layer-major windows** (`STREAMMOE_Q38_LAYER_MAJOR=1`, window
+//! `STREAMMOE_Q38_WINDOW` tokens, default 4096): a prompt longer than a
+//! chunk runs in windows; each layer runs the window's chunks in order
+//! (attention, router) before its experts run once for every window
+//! row ([`Q38Engine::forward_window`]), so a layer is read once per
+//! window, not once per chunk. The window's hyper rows, MoE input rows
+//! and expert sums wait in window buffers (60 KB per token on the real
+//! model, in the plan's scratch).
+//!
+//! **Early reads** (`STREAMMOE_Q38_EARLY_READ=n` experts): a layer's
+//! experts `0..n` go into the staging while the GPU runs the layer's
+//! attention and router, when the IO would otherwise idle; after the
+//! routing their buckets run first from there.
+//!
 //! ## Not supported yet
 //!
 //! - Layer ranges (`OpenConfig::layer_range` other than the whole
@@ -116,7 +130,7 @@ use super::ple::{PleConfig, PleError, PleLayer, PleState, PleWeights};
 use super::qsa::gpu::{qsa_select_rows, QsaRowLists};
 use super::ple_gpu::PleOp;
 use super::prefill_io::{
-    default_layer_read_frac, env_f64, env_usize, plan_prefill_batches, staging_stride, trace_from_env,
+    default_layer_read_frac, env_f64, env_usize, plan_prefill_batches_rows, staging_stride, trace_from_env,
     PrefillIoStats, DEFAULT_MAX_READ, DEFAULT_PREFILL_SLOTS,
 };
 use crate::riir::io::io_stats::ReadKind;
@@ -242,6 +256,22 @@ pub fn prefill_chunk(n_ctx: usize) -> usize {
         .unwrap_or(DEFAULT_PREFILL_CHUNK)
         .min(n_ctx)
         .max(1)
+}
+
+/// Default tokens of a layer-major window (`STREAMMOE_Q38_WINDOW`) when
+/// `STREAMMOE_Q38_LAYER_MAJOR=1`: eight 512-token chunks.
+pub const DEFAULT_LAYER_MAJOR_WINDOW: usize = 4096;
+
+/// Tokens of a layer-major prefill window from the environment: 0 (off)
+/// unless `STREAMMOE_Q38_LAYER_MAJOR=1`; then `STREAMMOE_Q38_WINDOW`
+/// or [`DEFAULT_LAYER_MAJOR_WINDOW`] (the engine clamps it,
+/// [`Q38PrefillIo::window_rows`]).
+pub fn layer_major_window_from_env() -> usize {
+    let on = std::env::var("STREAMMOE_Q38_LAYER_MAJOR").is_ok_and(|v| v == "1");
+    if !on {
+        return 0;
+    }
+    env_usize("STREAMMOE_Q38_WINDOW").unwrap_or(DEFAULT_LAYER_MAJOR_WINDOW)
 }
 
 /// Most rows one query of a chunk attends to through the QSA row lists
@@ -456,6 +486,13 @@ pub struct Q38PrefillIo {
     /// Most experts per pread (`STREAMMOE_Q38_MAX_READ`, default
     /// [`DEFAULT_MAX_READ`]).
     pub max_read: usize,
+    /// Tokens of a layer-major window (0: off;
+    /// [`layer_major_window_from_env`]): a prompt longer than a chunk
+    /// runs each layer over the window's chunks before the next layer,
+    /// so a layer's experts are read once per window
+    /// ([`Q38Engine::forward_window`]). Sizes the window buffers
+    /// ([`Self::window_rows`]).
+    pub window: usize,
 }
 
 impl Q38PrefillIo {
@@ -470,7 +507,18 @@ impl Q38PrefillIo {
             layer_read_frac: env_f64("STREAMMOE_Q38_LAYER_READ_FRAC")
                 .unwrap_or_else(|| default_layer_read_frac(expert_size, stride)),
             max_read: env_usize("STREAMMOE_Q38_MAX_READ").unwrap_or(DEFAULT_MAX_READ).max(1),
+            window: layer_major_window_from_env(),
         }
+    }
+
+    /// Rows of the layer-major window buffers for an `n_ctx` context:
+    /// [`Self::window`] clamped to `n_ctx` and to the bucket scratch
+    /// (`chunk · top_k` rows: one expert's bucket holds at most a row
+    /// per window token), 0 when it does not exceed one chunk (off).
+    pub fn window_rows(&self, n_ctx: usize) -> usize {
+        let ch = self.chunk.min(n_ctx).max(1);
+        let w = self.window.min(n_ctx).min(ch * q38_config().top_k);
+        if w > ch { w } else { 0 }
     }
 
     /// [`Self::from_env`] for the converted model at `root` (its
@@ -484,11 +532,14 @@ impl Q38PrefillIo {
         (self.slots * self.stride) as u64
     }
 
-    /// One step smaller, for a plan over the cap: the staging halved
-    /// down to 16 slots, then the chunk down to 64 tokens, then the
-    /// staging down to 2. `false` when nothing is left to shrink.
+    /// One step smaller, for a plan over the cap: a layer-major window
+    /// halved down to two chunks, then turned off; then the staging
+    /// halved down to 16 slots, then the chunk down to 64 tokens, then
+    /// the staging down to 2. `false` when nothing is left to shrink.
     pub fn shrink(&mut self) -> bool {
-        if self.slots > 16 {
+        if self.window > 0 {
+            self.window = if self.window > 2 * self.chunk { (self.window / 2).max(2 * self.chunk) } else { 0 };
+        } else if self.slots > 16 {
             self.slots = (self.slots / 2).max(16);
         } else if self.chunk > 64 {
             self.chunk = (self.chunk / 2).max(64);
@@ -597,7 +648,11 @@ pub fn plan_bytes_io(
         * rows
         * (h + c.num_experts as u64 + s.idx_proj_dim() as u64 + pc.embed_dim as u64 + 6 * k
             + if ple_on_host_from_env() { 2 * hc } else { 0 });
-    let scratch = scratch + qsa_rows + host;
+    // A layer-major window: the hyper rows, the MoE input rows and the
+    // routed sums of every window token (GPU), its routing (host).
+    let wr = io.window_rows(n_ctx) as u64;
+    let window = f * wr * (hc + 2 * h + 4 * k);
+    let scratch = scratch + qsa_rows + host + window;
     // PLE conv state: the GPU copy and the host one (snapshots).
     let family_state = n_qsa * (n_ctx * s.idx_head_dim) as u64 * f * 5 / 4
         + n_qsa * (n_ctx * 12) as u64
@@ -664,6 +719,12 @@ struct Bufs {
     /// Prefill expert staging ([`Q38PrefillIo::slots`] slots,
     /// [`Q38PrefillIo::stride`] apart).
     prefill_staging: FBuf,
+    /// Layer-major window ([`Q38PrefillIo::window_rows`] rows; one
+    /// float when off): `[W, hc·H]` hyper rows, `[W, H]` MoE input
+    /// rows, `[W, H]` routed-expert sums.
+    win_hyper: FBuf,
+    win_mixed: FBuf,
+    win_outsum: FBuf,
 }
 
 /// The PLE on the GPU ([`super::ple_gpu`]): weight offsets, buffers
@@ -776,7 +837,25 @@ pub struct Q38Engine<B: Q38Exec> {
     gpu_wait_ns: std::sync::atomic::AtomicU64,
     /// `STREAMMOE_Q38_IO_TRACE`: print each chunk's counters.
     io_trace: bool,
+    /// Rows of the layer-major window buffers (0: none).
+    win_rows: usize,
+    /// Tokens per layer-major window in use (`<= win_rows`; at most a
+    /// chunk: off; [`Self::set_layer_major_window`]).
+    win: usize,
+    /// Experts `0..early_read` of a layer read into the prefill staging
+    /// while the GPU runs the layer's attention (before the router
+    /// readback), `STREAMMOE_Q38_EARLY_READ` (0: off;
+    /// [`Self::set_early_read`]).
+    early_read: usize,
+    /// Fewest tokens of a chunk / window for the early read
+    /// (`STREAMMOE_Q38_EARLY_MIN`, default [`DEFAULT_EARLY_MIN`]).
+    early_min: usize,
 }
+
+/// Default fewest tokens for an early read ([`Q38Engine::set_early_read`]):
+/// below this a pass routes to too few of a layer's experts for a read
+/// of its first ones to pay off.
+pub const DEFAULT_EARLY_MIN: usize = 256;
 
 impl<B: Q38Exec> Q38Engine<B> {
     /// Build the engine on `b`: weight offsets from `wf`, the n-gram
@@ -830,6 +909,8 @@ impl<B: Q38Exec> Q38Engine<B> {
             &QsaRowLists { n_tokens: ch, max_rows: mr, counts: vec![0; ch], rows: vec![0; ch * mr], n_sparse: 0 },
         );
         let vt = cfg.linear_v_heads * cfg.linear_value_dim;
+        // Layer-major window rows (0: off).
+        let win = io.window_rows(n_ctx);
         let bufs = Bufs {
             hyper: alloc(b, ch * hc, "q38.hyper")?,
             emb: alloc(b, ch * h, "q38.emb")?,
@@ -881,6 +962,9 @@ impl<B: Q38Exec> Q38Engine<B> {
             ],
             logits: alloc(b, cfg.vocab, "q38.logits")?,
             prefill_staging: alloc(b, (io.slots * io.stride).div_ceil(4), "q38.prefill_staging")?,
+            win_hyper: alloc(b, win * hc, "q38.win_hyper")?,
+            win_mixed: alloc(b, win * h, "q38.win_mixed")?,
+            win_outsum: alloc(b, win * h, "q38.win_outsum")?,
         };
         upload(b, bufs.inv_freq, &qsa.inv_freq())?;
         let staging_addr = b
@@ -977,7 +1061,29 @@ impl<B: Q38Exec> Q38Engine<B> {
             pio_chunk: PrefillIoStats::default(),
             gpu_wait_ns: std::sync::atomic::AtomicU64::new(0),
             io_trace: trace_from_env(),
+            win_rows: win,
+            win,
+            early_read: env_usize("STREAMMOE_Q38_EARLY_READ").unwrap_or(0),
+            early_min: env_usize("STREAMMOE_Q38_EARLY_MIN").unwrap_or(DEFAULT_EARLY_MIN),
         })
+    }
+
+    /// Tokens per layer-major window (clamped to the window buffers'
+    /// rows; 0 or at most a chunk turns layer-major prefill off).
+    pub fn set_layer_major_window(&mut self, n: usize) {
+        self.win = n.min(self.win_rows);
+    }
+
+    pub fn layer_major_window(&self) -> usize {
+        self.win
+    }
+
+    /// Read experts `0..n` of each layer early (0: off); clamped to
+    /// the staging slots in use when it runs. Only for passes of at
+    /// least `min_tokens` tokens.
+    pub fn set_early_read(&mut self, n: usize, min_tokens: usize) {
+        self.early_read = n;
+        self.early_min = min_tokens;
     }
 
     /// The prefill settings the engine was built with.
@@ -1575,33 +1681,18 @@ impl<B: Q38Exec> Q38Engine<B> {
         unsafe { std::slice::from_raw_parts_mut((self.prefill_addr + first * st) as *mut u8, n * st) }
     }
 
-    /// MoE of a chunk (`n > 1` tokens) on `mixed` into `block_out`,
-    /// then inject. The routing reads back every token's router logits
-    /// (one submit), then groups the tokens by expert like the batched
-    /// prefill of the other families (`build_expert_buckets`, one
-    /// `Op::MoeBatchedPermuteFuse` per batch): the experts the chunk
-    /// picked go into the prefill staging batch by batch
-    /// ([`plan_prefill_batches`]: hot-tier copies, runs of adjacent
-    /// experts in one pread, the whole layer when most of it is
-    /// needed), each batch adding its buckets into `out_sum` in
-    /// ascending expert order. With two or more staging slots, batch i
-    /// uses half i % 2 and its pass is committed without waiting, so
-    /// batch i + 1's reads run under it.
-    fn moe_layer_n(
-        &mut self,
-        b: &mut B,
-        l: usize,
-        n: usize,
-        experts: &ExpertFiles,
-        io_pool: &rayon::ThreadPool,
-        steps: &mut Vec<Step>,
-    ) -> Result<()> {
-        let c = self.cfg.clone();
-        let m = self.w.layers[l].moe;
-        let bu = &self.bufs;
-        let (h, si, k, ne) = (c.hidden as u32, c.shared_intermediate as u32, c.top_k, c.num_experts);
-        let nt = n as u32;
-        steps.push(matvec_n("q38.moe.router", m.router, bu.mixed, bu.router_logits, h, ne as u32, nt));
+    /// The router logits of `nt` rows of `mixed` (queued).
+    fn router_steps(&self, l: usize, nt: u32, steps: &mut Vec<Step>) {
+        let c = &self.cfg;
+        let (m, bu) = (self.w.layers[l].moe, &self.bufs);
+        steps.push(matvec_n("q38.moe.router", m.router, bu.mixed, bu.router_logits, c.hidden as u32, c.num_experts as u32, nt));
+    }
+
+    /// The shared expert and its gate on `nt` rows of `mixed` (queued).
+    fn shared_steps(&self, l: usize, nt: u32, steps: &mut Vec<Step>) {
+        let c = &self.cfg;
+        let (m, bu) = (self.w.layers[l].moe, &self.bufs);
+        let (h, si) = (c.hidden as u32, c.shared_intermediate as u32);
         steps.push(matvec_n("q38.moe.shared_expert_gate", m.shared_gate, bu.mixed, bu.shared_gate, h, 1, nt));
         steps.push(matvec_n("q38.moe.shared_gate_proj", m.gate, bu.mixed, bu.s_gate, h, si, nt));
         steps.push(matvec_n("q38.moe.shared_up_proj", m.up, bu.mixed, bu.s_up, h, si, nt));
@@ -1613,25 +1704,168 @@ impl<B: Q38Exec> Q38Engine<B> {
             total: si * nt,
         }));
         steps.push(matvec_n("q38.moe.shared_down_proj", m.down, bu.s_act, bu.s_down, si, h, nt));
-        self.flush(b, steps, "q38.layer")?;
+    }
 
-        // Router (host): softmax, top-k, renormalized, per token.
-        let mut scores = download(b, bu.router_logits, n * ne)?;
+    /// `block_out = out_sum + sigmoid(g) · shared` over `nt` rows
+    /// (against zero: this family's MoE output carries no residual
+    /// term), then the inject (queued).
+    fn combine_steps(&self, nt: u32, steps: &mut Vec<Step>) {
+        let bu = &self.bufs;
+        steps.push(Step::G(Op::MoeCombineResidualNTokens {
+            label: "q38.moe.combine",
+            h_mid: t(bu.zeros),
+            moe_sum: t(bu.out_sum),
+            shared_out: t(bu.s_down),
+            shared_gate: t(bu.shared_gate),
+            hidden_out: t(bu.block_out),
+            n_tokens: nt,
+            dim: self.cfg.hidden as u32,
+        }));
+        steps.push(self.inject_step(nt));
+    }
+
+    /// Softmax, top-k, renormalized, of the router logits of `n` rows
+    /// (the pass that computed them has completed) into `idx` / `wts`
+    /// (`[n, top_k]`).
+    fn route_rows(&self, b: &B, n: usize, idx: &mut [i32], wts: &mut [f32]) -> Result<()> {
+        let (k, ne) = (self.cfg.top_k, self.cfg.num_experts);
+        let mut scores = download(b, self.bufs.router_logits, n * ne)?;
+        for ((s, i), w) in scores.chunks_mut(ne).zip(idx.chunks_mut(k)).zip(wts.chunks_mut(k)) {
+            moe_router_cpu_with(s, k, self.cfg.norm_topk_prob, i, w)?;
+        }
+        Ok(())
+    }
+
+    /// Experts `0..n` of a layer the early read of a pass of `n_tokens`
+    /// tokens covers (0: none): [`Self::set_early_read`], at most both
+    /// staging halves, only with two or more slots and span reads.
+    fn early_experts(&self, n_tokens: usize, experts: &ExpertFiles) -> usize {
+        if self.early_read == 0
+            || n_tokens < self.early_min
+            || self.pf_io_slots < 2
+            || experts.expert_stride() != self.io.stride
+        {
+            return 0;
+        }
+        self.early_read.min(2 * (self.pf_io_slots / 2)).min(self.cfg.num_experts)
+    }
+
+    /// The early read of layer `l`'s experts `0..e0` (`None` for 0).
+    fn early_job<'e>(
+        &self,
+        l: usize,
+        e0: usize,
+        experts: &'e ExpertFiles,
+        io_pool: &'e rayon::ThreadPool,
+    ) -> Option<EarlyJob<'e>> {
+        (e0 > 0).then_some(EarlyJob {
+            experts,
+            pool: io_pool,
+            layer: l,
+            n: e0,
+            addr: self.prefill_addr,
+            stride: self.io.stride,
+            max_read: self.io.max_read,
+        })
+    }
+
+    /// Run `steps` (ending in a layer's router) and wait for them. With
+    /// an early read: commit them, wait for every pass before them (the
+    /// previous layer's expert batches, the staging's last readers),
+    /// start the read on a scoped thread, then wait for the router —
+    /// the read runs under the attention / router GPU work, when the IO
+    /// is otherwise idle.
+    fn router_flush<'s, 'e: 's>(
+        &self,
+        b: &B,
+        steps: &mut Vec<Step>,
+        sc: &'s std::thread::Scope<'s, 'e>,
+        job: Option<EarlyJob<'e>>,
+    ) -> Result<Option<std::thread::ScopedJoinHandle<'s, EarlyOut>>> {
+        let Some(job) = job else {
+            self.flush(b, steps, "q38.layer")?;
+            return Ok(None);
+        };
+        self.flush_nowait(b, steps, "q38.layer")?;
+        self.wait_passes(b, 1)?;
+        let h = sc.spawn(move || job.run());
+        self.wait_passes(b, 0)?;
+        Ok(Some(h))
+    }
+
+    /// MoE of a chunk (`n > 1` tokens) on `mixed` into `block_out`,
+    /// then inject: the router and the shared expert (one submit, the
+    /// router logits read back), the routed experts
+    /// ([`Self::moe_experts`]), the combine.
+    fn moe_layer_n(
+        &mut self,
+        b: &mut B,
+        l: usize,
+        n: usize,
+        experts: &ExpertFiles,
+        io_pool: &rayon::ThreadPool,
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
+        let k = self.cfg.top_k;
+        let nt = n as u32;
+        self.router_steps(l, nt, steps);
+        self.shared_steps(l, nt, steps);
+        let e0 = self.early_experts(n, experts);
         let mut idx = vec![0i32; n * k];
         let mut wts = vec![0.0f32; n * k];
-        for ((s, i), w) in scores.chunks_mut(ne).zip(idx.chunks_mut(k)).zip(wts.chunks_mut(k)) {
-            moe_router_cpu_with(s, k, c.norm_topk_prob, i, w)?;
-        }
-        let buckets = build_expert_buckets(&idx, &wts, n, k, ne);
+        let early = std::thread::scope(|sc| -> Result<Option<EarlyDone>> {
+            let h = self.router_flush(b, steps, sc, self.early_job(l, e0, experts, io_pool))?;
+            self.route_rows(b, n, &mut idx, &mut wts)?;
+            join_early(h, e0)
+        })?;
+        let (src, out_sum) = (self.bufs.mixed, self.bufs.out_sum);
+        self.moe_experts(b, l, n, &idx, &wts, src, out_sum, early, experts, io_pool, steps)?;
+        self.combine_steps(nt, steps);
+        Ok(())
+    }
+
+    /// The routed experts of `n` rows (routing `idx` / `wts`, `[n, k]`)
+    /// of `src` (`[n, H]`) into `out_sum` (`[n, H]`, zeroed first).
+    /// Groups the rows by expert like the batched prefill of the other
+    /// families (`build_expert_buckets`, one `Op::MoeBatchedPermuteFuse`
+    /// per batch): the experts go into the prefill staging batch by
+    /// batch ([`plan_prefill_batches_rows`]: hot-tier copies, runs of
+    /// adjacent experts in one pread, the whole layer when most of it
+    /// is needed; at most the bucket scratch's rows per batch), each
+    /// batch adding its buckets into `out_sum` in ascending expert
+    /// order. With two or more staging slots, batches alternate halves
+    /// and their passes are committed without waiting, so batch i + 1's
+    /// reads run under batch i. `early`: experts `0..early.n` are in
+    /// staging slots `0..early.n` already (an early read), their
+    /// buckets run first from there, without reads.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(
+        &mut self,
+        b: &mut B,
+        l: usize,
+        n: usize,
+        idx: &[i32],
+        wts: &[f32],
+        src: FBuf,
+        out_sum: FBuf,
+        early: Option<EarlyDone>,
+        experts: &ExpertFiles,
+        io_pool: &rayon::ThreadPool,
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
+        let c = self.cfg.clone();
+        let (h, k, ne) = (c.hidden as u32, c.top_k, c.num_experts);
+        let nt = n as u32;
+        let buckets = build_expert_buckets(idx, wts, n, k, ne);
         let nb = buckets.expert_ids.len();
         for bi in 0..nb {
             let cnt = buckets.offsets[bi + 1] - buckets.offsets[bi];
             experts.record_pick(l, buckets.expert_ids[bi] as usize, cnt);
         }
-        steps.push(Step::G(Op::ZeroBuffer { label: "q38.moe.out_sum_zero", buf: t(bu.out_sum), n_bytes: nt * h * 4 }));
+        steps.push(Step::G(Op::ZeroBuffer { label: "q38.moe.out_sum_zero", buf: t(out_sum), n_bytes: nt * h * 4 }));
         if let Some(pf) = self.pf.as_mut() {
-            // The next decode token's guess: the chunk's last token's
-            // picks, strongest first.
+            // The next decode token's guess: the last row's picks,
+            // strongest first.
             let (li, lw) = (&idx[(n - 1) * k..], &wts[(n - 1) * k..]);
             let mut order: Vec<usize> = (0..k).collect();
             order.sort_by(|&a, &b| lw[b].total_cmp(&lw[a]));
@@ -1641,9 +1875,6 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
             pf.record_actual(l, actual);
         }
-        // The chunk's experts into the prefill staging, batch by batch
-        // (`prefill_io`): hot-tier copies, adjacent experts one pread,
-        // or the whole layer in large preads when most of it is needed.
         let hot = experts.hot_tier();
         let is_hot = |e: usize| hot.is_some_and(|h| h.contains(l, e));
         let n_disk = buckets.expert_ids.iter().filter(|&&e| !is_hot(e as usize)).count();
@@ -1651,20 +1882,94 @@ impl<B: Q38Exec> Q38Engine<B> {
         // A stride the staging was not built for: expert by expert.
         let spans_ok = experts.expert_stride() == self.io.stride;
         let max_read = if spans_ok { self.io.max_read } else { 1 };
-        // With two or more slots, two halves: batch i reads into half
-        // i % 2 while the GPU runs batch i - 1 from the other one.
+        // With two or more slots, two halves: batch i reads into one
+        // half while the GPU runs batch i - 1 from the other one.
         let overlap = self.pf_io_slots >= 2;
         let cap = if overlap { self.pf_io_slots / 2 } else { self.pf_io_slots };
-        let batches = plan_prefill_batches(&buckets.expert_ids, is_hot, whole && spans_ok, cap, max_read);
+        let max_rows = self.max_chunk * k;
+        let rows: Vec<u32> = buckets.offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        let st = self.io.stride;
+        // (batch, staging half). Early-read experts first: slot = expert.
+        let e0 = early.map_or(0, |d| d.n);
+        let split = buckets.expert_ids.partition_point(|&e| (e as usize) < e0);
+        let mut batches: Vec<(super::prefill_io::PrefillBatch, usize)> = Vec::new();
+        if e0 > 0 {
+            for (lo, hi) in [(0, e0.min(cap)), (cap, e0)] {
+                if lo >= hi {
+                    continue;
+                }
+                let lo_b = buckets.expert_ids.partition_point(|&e| (e as usize) < lo);
+                let hi_b = buckets.expert_ids.partition_point(|&e| (e as usize) < hi);
+                let mut b0 = lo_b;
+                while b0 < hi_b {
+                    // Cut by the bucket scratch's rows (one bucket at least).
+                    let (mut b1, mut r) = (b0, 0usize);
+                    while b1 < hi_b && (b1 == b0 || r + rows[b1] as usize <= max_rows) {
+                        r += rows[b1] as usize;
+                        b1 += 1;
+                    }
+                    let slots = buckets.expert_ids[b0..b1].iter().map(|&e| e as u32 - lo as u32).collect();
+                    let bt = super::prefill_io::PrefillBatch {
+                        b0,
+                        b1,
+                        slots,
+                        reads: Vec::new(),
+                        hot: Vec::new(),
+                        used: (hi - lo) as u32,
+                    };
+                    batches.push((bt, lo / cap));
+                    b0 = b1;
+                }
+            }
+            // Routed experts among them offered to the hot tier, as a
+            // read would.
+            if let Some(hc) = hot {
+                let addr = self.prefill_addr;
+                let es = self.expert_size;
+                io_pool.install(|| {
+                    buckets.expert_ids[..split].par_iter().for_each(|&e| {
+                        // SAFETY: the early read is joined and no GPU
+                        // work writes the staging; read-only views.
+                        let s = unsafe { std::slice::from_raw_parts((addr + e as usize * st) as *const u8, es) };
+                        hc.offer(l, e as usize, s);
+                    })
+                });
+            }
+        }
+        let rest = plan_prefill_batches_rows(
+            &buckets.expert_ids[split..],
+            is_hot,
+            whole && spans_ok,
+            cap,
+            max_read,
+            &rows[split..],
+            max_rows,
+        );
+        let mut half = batches.last().map_or(0, |x| 1 - x.1);
+        for mut bt in rest {
+            bt.b0 += split;
+            bt.b1 += split;
+            batches.push((bt, if overlap { half } else { 0 }));
+            half = 1 - half;
+        }
         self.pio_chunk.layers += 1;
         self.pio_chunk.layer_reads += (whole && spans_ok) as u64;
         self.pio_chunk.experts += nb as u64;
-        let st = self.io.stride;
-        for (bi_n, bt) in batches.iter().enumerate() {
-            let half = if overlap { bi_n % 2 } else { 0 };
+        if let Some(d) = early {
+            let p = &mut self.pio_chunk;
+            p.early += d.n as u64;
+            p.experts_read += d.n as u64;
+            p.read_through += (d.n - split) as u64;
+            p.preads += d.preads;
+            p.bytes += (d.n * st) as u64;
+            p.io_wait_ns += d.wait_ns;
+        }
+        let n_batches = batches.len();
+        for (bi_n, (bt, half)) in batches.iter().enumerate() {
             let base = (half * cap) as u32;
             if overlap {
-                // Batch i - 2 last read this half and its metadata set.
+                // Batch i - 2 last read this half's slots (batches
+                // alternate halves) or this metadata set.
                 self.wait_passes(b, 1)?;
             }
             let t0 = std::time::Instant::now();
@@ -1677,7 +1982,10 @@ impl<B: Q38Exec> Q38Engine<B> {
             p.hot += bt.hot.len() as u64;
             let read: u64 = bt.reads.iter().map(|r| r.n as u64).sum();
             p.experts_read += read;
-            p.read_through += read + bt.hot.len() as u64 - bt.slots.len() as u64;
+            if !bt.reads.is_empty() || !bt.hot.is_empty() {
+                // (An early-read batch has neither: counted above.)
+                p.read_through += read + bt.hot.len() as u64 - bt.slots.len() as u64;
+            }
             if spans_ok {
                 p.preads += bt.reads.len() as u64;
                 p.bytes += read * st as u64;
@@ -1700,18 +2008,13 @@ impl<B: Q38Exec> Q38Engine<B> {
                 let (r0, r1) = (group.offsets[i] as usize, group.offsets[i + 1] as usize);
                 expert_indices[r0..r1].fill(s);
             }
+            let set = if overlap { bi_n % 2 } else { 0 };
             let [tok, wts, eidx] =
-                if half == 0 { [bu.bucket_token_idx, bu.bucket_weights, bu.expert_indices] } else { bu.meta_b };
+                if set == 0 { [bu.bucket_token_idx, bu.bucket_weights, bu.expert_indices] } else { bu.meta_b };
             upload(b, tok, &group.token_idx)?;
             upload(b, wts, &group.weights)?;
             upload(b, eidx, &expert_indices)?;
-            steps.push(Step::F(FamOp::GatherRows {
-                src: bu.mixed,
-                idx: tok,
-                dst: bu.bucket_input,
-                width: h,
-                n_rows: (a1 - a0) as u32,
-            }));
+            steps.push(Step::F(FamOp::GatherRows { src, idx: tok, dst: bu.bucket_input, width: h, n_rows: (a1 - a0) as u32 }));
             // The bucket scratch is shared by every batch: the GPU runs
             // the passes in order, so only host writes need the halves.
             steps.push(Step::G(Op::MoeBatchedPermuteFuse {
@@ -1727,28 +2030,17 @@ impl<B: Q38Exec> Q38Engine<B> {
                 bucket_out: t(bu.bucket_out),
                 bucket_token_idx: t(tok),
                 bucket_weights: t(wts),
-                out_sum: t(bu.out_sum),
+                out_sum: t(out_sum),
                 buckets: group,
             }));
             if overlap {
                 // In flight while the next batch reads; the next
                 // `flush` waits for all of them.
                 self.flush_nowait(b, steps, "q38.moe_group")?;
-            } else if bi_n + 1 < batches.len() {
+            } else if bi_n + 1 < n_batches {
                 self.flush(b, steps, "q38.moe_group")?;
             }
         }
-        steps.push(Step::G(Op::MoeCombineResidualNTokens {
-            label: "q38.moe.combine",
-            h_mid: t(bu.zeros),
-            moe_sum: t(bu.out_sum),
-            shared_out: t(bu.s_down),
-            shared_gate: t(bu.shared_gate),
-            hidden_out: t(bu.block_out),
-            n_tokens: nt,
-            dim: h,
-        }));
-        steps.push(self.inject_step(nt));
         Ok(())
     }
 
@@ -2028,9 +2320,164 @@ impl<B: Q38Exec> Q38Engine<B> {
         Ok(())
     }
 
+    /// `tokens` (more than a chunk, at most the window buffers' rows,
+    /// [`Self::set_layer_major_window`]) at the next positions, layer
+    /// by layer: each layer runs the window's chunks in order before
+    /// the next layer, so its experts are read once per window instead
+    /// of once per chunk. Per layer:
+    ///
+    /// 1. per chunk: its hyper rows from the window (layer 0: the
+    ///    embeddings), the attention part and the MoE Gated Residual
+    ///    as [`Self::forward_chunk`] runs them, the hyper rows and the
+    ///    MoE input rows back to the window, the router (one submit,
+    ///    the logits read back and routed);
+    /// 2. the routed experts of every window row at once
+    ///    ([`Self::moe_experts`]: buckets over the window, from the
+    ///    window's MoE input rows into its sums);
+    /// 3. per chunk: the MoE Gated Residual again (same rows, same
+    ///    bits: the mix and inject weights), the shared expert, the
+    ///    combine with the chunk's sums, the inject, the rows back.
+    ///
+    /// The Gated DeltaNet / PLE conv state, the QSA caches and the
+    /// indexer see the chunks in order, as in chunk-major prefill. The
+    /// last token's logits into `logits` when given.
+    pub fn forward_window(
+        &mut self,
+        b: &mut B,
+        wf: &WeightFile,
+        experts: &ExpertFiles,
+        io_pool: &rayon::ThreadPool,
+        tokens: &[i32],
+        logits: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let n = tokens.len();
+        let ch = self.chunk;
+        if n <= ch || n > self.win_rows {
+            return Err(Q38EngineError::Other(format!(
+                "layer-major window of {n} tokens: chunk {ch}, window buffers {}",
+                self.win_rows
+            )));
+        }
+        if self.pos + n > self.n_ctx {
+            return Err(Q38EngineError::Other(format!("context full ({} tokens)", self.n_ctx)));
+        }
+        let c = self.cfg.clone();
+        let (h, hc, k) = (c.hidden, c.hc_hidden(), c.top_k);
+        let t_win = std::time::Instant::now();
+        let gpu0 = self.gpu_wait_ns.load(std::sync::atomic::Ordering::Relaxed);
+        self.pio_chunk = PrefillIoStats { chunks: 1, tokens: n as u64, ..Default::default() };
+        let pos0 = self.pos;
+        let spans: Vec<(usize, usize)> = (0..n).step_by(ch).map(|s| (s, (s + ch).min(n))).collect();
+        let (hyper, mixed, out_sum, emb) = (self.bufs.hyper, self.bufs.mixed, self.bufs.out_sum, self.bufs.emb);
+        let (w_hyper, w_mixed, w_sum) = (self.bufs.win_hyper, self.bufs.win_mixed, self.bufs.win_outsum);
+        let copy = |src: FBuf, src_off: usize, dst: FBuf, dst_off: usize, n: usize| {
+            Step::F(FamOp::CopyRows { src, src_off: src_off as u64, dst, dst_off: dst_off as u64, n: n as u32 })
+        };
+        let mut idx = vec![0i32; n * k];
+        let mut wts = vec![0.0f32; n * k];
+        let mut steps = Vec::new();
+        for l in 0..c.num_layers {
+            let lr = self.w.layers[l].clone();
+            let e0 = self.early_experts(n, experts);
+            let early = std::thread::scope(|sc| -> Result<Option<EarlyDone>> {
+                let mut hd = None;
+                for (ci, &(s, e)) in spans.iter().enumerate() {
+                    let (m, nt) = (e - s, (e - s) as u32);
+                    self.pos = pos0 + s;
+                    if l == 0 {
+                        // The previous chunk's expand ran in its router
+                        // submit: `emb` is free.
+                        let mut rows = vec![0.0f32; m * h];
+                        for (&tok, row) in tokens[s..e].iter().zip(rows.chunks_mut(h)) {
+                            embed_lookup(wf, tok, row).map_err(|e| Q38EngineError::Other(format!("embedding: {e}")))?;
+                        }
+                        upload(b, emb, &rows)?;
+                        steps.push(Step::F(FamOp::HcExpand {
+                            h: emb,
+                            hyper,
+                            hidden: h as u32,
+                            hc: c.hc_count as u32,
+                            n_tokens: nt,
+                        }));
+                    } else {
+                        steps.push(copy(w_hyper, s * hc, hyper, 0, m * hc));
+                    }
+                    if self.ple.as_ref().is_some_and(|p| p.0 == l) {
+                        self.ple_layer(b, wf, io_pool, &tokens[s..e], &mut steps)?;
+                    }
+                    self.hc_steps(&lr.attn_hc, nt, &mut steps);
+                    match &lr.attn {
+                        AttnRefs::Gdn(g) => self.gdn_steps(g, &self.layers[l], nt, &mut steps),
+                        AttnRefs::Qsa(_) => self.qsa_layer(b, l, m, &mut steps)?,
+                    }
+                    steps.push(self.inject_step(nt));
+                    self.hc_steps(&lr.mlp_hc, nt, &mut steps);
+                    steps.push(copy(hyper, 0, w_hyper, s * hc, m * hc));
+                    steps.push(copy(mixed, 0, w_mixed, s * h, m * h));
+                    self.router_steps(l, nt, &mut steps);
+                    let job = if ci == 0 { self.early_job(l, e0, experts, io_pool) } else { None };
+                    if let Some(x) = self.router_flush(b, &mut steps, sc, job)? {
+                        hd = Some(x);
+                    }
+                    self.route_rows(b, m, &mut idx[s * k..e * k], &mut wts[s * k..e * k])?;
+                }
+                join_early(hd, e0)
+            })?;
+            self.moe_experts(b, l, n, &idx, &wts, w_mixed, w_sum, early, experts, io_pool, &mut steps)?;
+            for &(s, e) in &spans {
+                let (m, nt) = (e - s, (e - s) as u32);
+                steps.push(copy(w_hyper, s * hc, hyper, 0, m * hc));
+                self.hc_steps(&lr.mlp_hc, nt, &mut steps);
+                self.shared_steps(l, nt, &mut steps);
+                steps.push(copy(w_sum, s * h, out_sum, 0, m * h));
+                self.combine_steps(nt, &mut steps);
+                steps.push(copy(hyper, 0, w_hyper, s * hc, m * hc));
+            }
+        }
+        // `hyper` holds the last chunk's rows: final mixer → LM head on
+        // its last row.
+        let (s_last, e_last) = *spans.last().expect("a window has chunks");
+        if logits.is_some() {
+            let mixer = self.w.mixer;
+            let nt = (e_last - s_last) as u32;
+            self.hc_steps(&mixer, nt, &mut steps);
+            steps.push(Step::G(Op::MatvecNTokens {
+                label: "q38.lm_head",
+                weight: self.w.lm_head,
+                input: t(mixed),
+                input_off: ((e_last - s_last - 1) * h * 4) as u64,
+                output: t(self.bufs.logits),
+                output_off: 0,
+                in_dim: h as u32,
+                out_dim: c.vocab as u32,
+                n_tokens: 1,
+            }));
+        }
+        self.flush(b, &mut steps, "q38.tail")?;
+        self.drain_pending_index(b)?;
+        self.drain_prefetch();
+        if let Some(out) = logits {
+            let v = download(b, self.bufs.logits, c.vocab)?;
+            out.copy_from_slice(&v);
+        }
+        self.pos = pos0 + n;
+        let p = &mut self.pio_chunk;
+        p.gpu_wait_ns = self.gpu_wait_ns.load(std::sync::atomic::Ordering::Relaxed) - gpu0;
+        p.wall_ns = t_win.elapsed().as_nanos() as u64;
+        experts.counters().record_prefill(n as u64, p.wall_ns);
+        self.pio.add(&self.pio_chunk);
+        if self.io_trace {
+            eprintln!("[q38 prefill io] window at {pos0} ({} chunks): {}", spans.len(), self.pio_chunk.line());
+        }
+        Ok(())
+    }
+
     /// `tokens` at the next positions in chunks of
-    /// [`Self::prefill_chunk`] tokens ([`Self::forward_chunk`]); the
-    /// last one's logits into `logits` when given.
+    /// [`Self::prefill_chunk`] tokens ([`Self::forward_chunk`]), or with
+    /// a layer-major window ([`Self::set_layer_major_window`]) in
+    /// windows of that many tokens ([`Self::forward_window`]; a window
+    /// of one chunk or less runs as a chunk); the last one's logits
+    /// into `logits` when given.
     pub fn eval(
         &mut self,
         b: &mut B,
@@ -2042,6 +2489,19 @@ impl<B: Q38Exec> Q38Engine<B> {
     ) -> Result<()> {
         if self.pos + tokens.len() > self.n_ctx {
             return Err(Q38EngineError::Other(format!("context full ({} tokens)", self.n_ctx)));
+        }
+        if self.win > self.chunk && tokens.len() > self.chunk {
+            let wins = tokens.chunks(self.win);
+            let last = wins.len().saturating_sub(1);
+            for (i, w) in wins.enumerate() {
+                let out = if i == last { logits.as_deref_mut() } else { None };
+                if w.len() > self.chunk {
+                    self.forward_window(b, wf, experts, io_pool, w, out)?;
+                } else {
+                    self.forward_chunk(b, wf, experts, io_pool, w, out)?;
+                }
+            }
+            return Ok(());
         }
         let chunks = tokens.chunks(self.chunk);
         let last = chunks.len().saturating_sub(1);
@@ -2226,6 +2686,58 @@ pub const Q38_STATE_VERSION: u32 = 1;
 /// `addr` is the start of the engine's staging buffer (alive, never
 /// moved, at least `(i + 1) · es` bytes); no other live slice of slot
 /// `i` and no GPU work reading it in flight.
+/// An early read ([`Q38Engine::router_flush`]): layer `layer`'s experts
+/// `0..n` into prefill staging slots `0..n` (at `addr`, `stride` apart)
+/// in preads of up to `max_read` experts, all in flight on `pool`.
+struct EarlyJob<'a> {
+    experts: &'a ExpertFiles,
+    pool: &'a rayon::ThreadPool,
+    layer: usize,
+    n: usize,
+    addr: usize,
+    stride: usize,
+    max_read: usize,
+}
+
+/// An early read's preads (or its error).
+type EarlyOut = std::result::Result<u64, ExpertIoError>;
+
+impl EarlyJob<'_> {
+    fn run(self) -> EarlyOut {
+        let step = self.max_read.max(1);
+        let spans: Vec<(usize, usize)> = (0..self.n).step_by(step).map(|f| (f, step.min(self.n - f))).collect();
+        let (addr, st) = (self.addr, self.stride);
+        self.pool.install(|| {
+            spans.par_iter().try_for_each(|&(f, n)| {
+                // SAFETY: slots `f..f + n`, disjoint between spans and
+                // inside the staging (`n <=` the slots in use); no GPU
+                // work reads or writes the staging (the caller waited
+                // for every expert pass) and the host touches it only
+                // after the join.
+                let dst = unsafe { std::slice::from_raw_parts_mut((addr + f * st) as *mut u8, n * st) };
+                self.experts.read_span_disk(ReadKind::Prefill, self.layer, f, n, dst)
+            })
+        })?;
+        Ok(spans.len() as u64)
+    }
+}
+
+/// A finished early read: experts `0..n` are in the staging.
+#[derive(Debug, Clone, Copy)]
+struct EarlyDone {
+    n: usize,
+    preads: u64,
+    /// Host time blocked in the join.
+    wait_ns: u64,
+}
+
+fn join_early(h: Option<std::thread::ScopedJoinHandle<'_, EarlyOut>>, n: usize) -> Result<Option<EarlyDone>> {
+    let Some(h) = h else { return Ok(None) };
+    let t0 = std::time::Instant::now();
+    let preads = h.join().map_err(|_| Q38EngineError::Other("early read thread panicked".into()))??;
+    Ok(Some(EarlyDone { n, preads, wait_ns: t0.elapsed().as_nanos() as u64 }))
+}
+
 unsafe fn slot_at<'a>(addr: usize, es: usize, i: usize) -> &'a mut [u8] {
     // SAFETY: the caller's contract.
     unsafe { std::slice::from_raw_parts_mut((addr + i * es) as *mut u8, es) }
