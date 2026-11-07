@@ -244,7 +244,8 @@ pub struct OpenConfig {
     /// hidden rows, plus with bounded staging each extra chunk's MoE
     /// rows (planned as `layer_major`; lent to the hot tier during
     /// decode like the prefill scratch). `None` (default): env
-    /// `STREAMMOE_LAYER_MAJOR` (`1` = on), else off.
+    /// `STREAMMOE_LAYER_MAJOR` (`0` = off), else on. A prompt of one
+    /// chunk or less prefills as before either way.
     pub layer_major: Option<bool>,
     /// Prefill chunks per layer-major window
     /// ([`Self::layer_major`]); a longer prompt runs as several
@@ -312,7 +313,7 @@ impl OpenConfig {
     /// before clamping to `n_ctx` and the cap.
     pub fn resolved_layer_major_chunks(&self) -> usize {
         let on = self.layer_major.unwrap_or_else(|| {
-            std::env::var("STREAMMOE_LAYER_MAJOR").is_ok_and(|v| v == "1")
+            std::env::var("STREAMMOE_LAYER_MAJOR").map_or(true, |v| v != "0")
         });
         if !on {
             return 0;
