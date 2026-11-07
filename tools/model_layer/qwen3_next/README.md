@@ -50,6 +50,41 @@ dtype or shape differs from the plan, and on zero-centred norms
 rather than mlx-lm's `1 + w`; `--norm-offset 1` converts such a
 checkpoint).
 
+## Packed 3-bit experts
+
+Optional, and much faster under a cap (6.3 vs 3.7 tok/s at 6 GiB; see
+the README's Qwen3-Next section). Qwen3-Next's experts have the
+35B-A3B's shape (hidden 2048, moe_intermediate 512), which is what
+`tools/requant_experts.py` and `tools/pack_experts.py` are written for;
+both take the expert count from the file size. Only the layer count
+has to be passed:
+
+```bash
+M="/Volumes/External NVMe M2 PCIe 4.0/models/qwen3-next-80b-a3b"
+python3 -I tools/requant_experts.py "$M/root" --layers 48 --out 3="$M/root-3bit-nibble"
+python3 -I tools/pack_experts.py "$M/root-3bit-nibble" "$M/root-3bit" && rm -r "$M/root-3bit-nibble"
+```
+
+The first step writes 3-bit codes in the 4-bit layout (40.5 GiB,
+~14 s a layer); the second packs them 8 per 3 bytes into
+`root-3bit/packed_experts/` (48 × 512 experts of 1,376,256 B, 705 MB
+a layer, 31.5 GiB; ~9–23 s a layer on the QLC drive). Peak disk is
+both copies, ~72 GiB, until the first is removed. 21 min in all on the
+external SSD, a few hundred MB of RAM.
+
+The engine tells the layout from the files' size. Point `Ctx::open_with`'s
+experts directory at `root-3bit`, or run the chat tool with
+`--precision 3` (it lists 3-bit when `root-3bit/` exists). To check
+quality against 4-bit (`cases.json` format: the doc comment in
+`tools/chat/src/bin/quality.rs`):
+
+```bash
+cd tools/chat
+cargo build --release --no-default-features --features qnext --bin quality
+target/release/quality --model "$M" --cases cases.json --out q_4bit.json --cap-gib 8 --save-ref ref_4bit.bin
+target/release/quality --model "$M" --cases cases.json --out q_3bit.json --cap-gib 8 --root "$M/root-3bit" --ref ref_4bit.bin
+```
+
 ## Tiny model and tests
 
 ```bash
