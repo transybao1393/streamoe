@@ -110,7 +110,9 @@ fn template(system: Option<&str>, prompt: &str) -> String {
     if let Some(sys) = system {
         s += &format!("<|im_start|>system\n{sys}<|im_end|>\n");
     }
-    s + &format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    // Qwen3-Next-Instruct's template has no think block.
+    let think = if cfg!(feature = "qnext") { "" } else { "<think>\n\n</think>\n\n" };
+    s + &format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{think}")
 }
 
 /// Score a greedy answer against `expect`.
@@ -151,7 +153,10 @@ fn main() {
         ..OpenConfig::default()
     };
     let art = base.join("artifacts");
-    let tok = Tokenizer::from_file(base.join("mlx-4bit/tokenizer.json")).expect("tokenizer.json");
+    // The MLX download's tokenizer, or the copy next to a converted model.
+    let tok_path = [base.join("mlx-4bit/tokenizer.json"), base.join("tokenizer.json")]
+        .into_iter().find(|p| p.exists()).expect("tokenizer.json");
+    let tok = Tokenizer::from_file(tok_path).expect("tokenizer.json");
     let mut ctx = Ctx::open_with(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
