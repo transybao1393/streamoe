@@ -3227,7 +3227,15 @@ impl RsCtx<MetalBackend> {
     ) -> Result<(), RsError> {
         let t0 = std::time::Instant::now();
         let n = input.n_tokens().unwrap_or(0) as u64;
+        // The window records its picks layer by layer; decay waits for
+        // the whole window (`HotTier::hold_decay`).
+        if let Some(h) = self.experts.hot_tier() {
+            h.hold_decay();
+        }
         let r = self.step_internal_layer_major_inner(input, start_pos, output, chunk_size);
+        if let Some(h) = self.experts.hot_tier() {
+            h.release_decay();
+        }
         if r.is_ok() {
             self.experts.counters().record_prefill(n, t0.elapsed().as_nanos() as u64);
         }
