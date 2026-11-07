@@ -9,3 +9,4 @@ implementation for tests, and tiny random-weight test models.
 | --- | --- |
 | Qwen3.5 / Qwen3.6 MoE (397B-A17B, 35B-A3B) | `qwen3_5_moe/` (wraps the shared scripts) |
 | Qwen3.8-Flash-Next | `qwen3_8_flash_next/` |
+| Qwen3-Next (80B-A3B) | `qwen3_next/` (converter only; the engine runs it on the qwen3_5_moe path) |

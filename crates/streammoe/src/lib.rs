@@ -16,6 +16,7 @@
 //!
 //! - `model-qwen3-5-a17b`
 //! - `model-qwen3-6-35b-a3b`
+//! - `model-qwen3-next-80b-a3b` (Qwen3-Next, same code path)
 //!
 //! See `docs/model_variants.md` for the full shape table.
 //!

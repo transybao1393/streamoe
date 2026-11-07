@@ -20,6 +20,7 @@ default = ["a3b"]
 a3b = ["streammoe/model-qwen3-6-35b-a3b"]
 a17b = ["streammoe/model-qwen3-5-a17b"]
 q38 = ["streammoe/model-qwen3-8-flash-next"]
+qnext = ["streammoe/model-qwen3-next-80b-a3b"]
 
 # Standalone: not a workspace member, so the engine crate gains no
 # dependencies from this tool.

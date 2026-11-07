@@ -537,6 +537,7 @@ pub const BITS: usize = 4;
     feature = "model-qwen3-5-a17b",
     feature = "model-qwen3-6-35b-a3b",
     feature = "model-qwen3-8-flash-next",
+    feature = "model-qwen3-next-80b-a3b",
 ))]
 pub const ROPE_THETA: f32 = 10_000_000.0;
 #[cfg(any(feature = "model-cogito-v2-671b", feature = "model-olmoe-1b-7b"))]
@@ -945,18 +946,136 @@ pub const VARIANT: Variant = Variant {
     yarn_mscale_all_dim: 1.0,
 };
 
+/// Qwen3-Next-80B-A3B (`model_type: qwen3_next`), MLX 4-bit
+/// (`mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit`, group size 64;
+/// `mlp.gate` and `mlp.shared_expert_gate` 8-bit). Source: its
+/// `config.json`.
+///
+/// The qwen3_5_moe family grew out of this model and the math is the
+/// same: 12 × (3 Gated DeltaNet + 1 gated full-attention) layers, the
+/// A3B's per-layer shapes (hidden 2048, 16 / 2 heads of 256, quarter
+/// rotary, linear attention 16 key / 32 value heads of 128), 512
+/// experts top-10 renormalised plus a sigmoid-gated shared expert,
+/// `1 + w` norms stored with the 1 added. Only the checkpoint layout
+/// differs — fused `in_proj_qkvz` / `in_proj_ba`, grouped per key
+/// head — and `tools/model_layer/qwen3_next/convert.py` re-lays them
+/// into the four projections this path reads. No vision tower, so no
+/// M-RoPE.
+#[cfg(all(feature = "model-qwen3-next-80b-a3b", not(feature = "model-qwen3-next-tiny")))]
+pub const VARIANT: Variant = Variant {
+    name: "Qwen3-Next-80B-A3B-Instruct-4bit",
+    hidden_dim: 2048,
+    num_layers: 48,
+    num_attn_heads: 16,
+    num_kv_heads: 2,
+    head_dim: 256,
+    vocab_size: 151936,
+    num_experts: 512,
+    num_experts_per_tok: 10,
+    moe_intermediate: 512,
+    shared_intermediate: 512,
+    full_attn_interval: 4,
+    linear_num_v_heads: 32,
+    linear_num_k_heads: 16,
+    // `<|im_end|>`, `<|endoftext|>`, `<think>`, `</think>` of the Qwen3
+    // tokenizer (tokenizer_config.json). The Instruct build does not
+    // think.
+    eos_token_1: 151645,
+    eos_token_2: 151643,
+    think_start_token: 151667,
+    think_end_token: 151668,
+    attn_kind: AttnKind::Gqa,
+    rope_kind: RopeKind::Vanilla,
+    router_kind: RouterKind::Softmax,
+    shared_expert_gate: SharedExpertGate::SigmoidGate,
+    attn_output_gate: true,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 64, // head_dim / 4 (partial_rotary_factor 0.25)
+    norm_topk_prob: true,
+    q_lora_rank: 0,
+    kv_lora_rank: 0,
+    qk_nope_head_dim: 0,
+    qk_rope_head_dim: 0,
+    v_head_dim: 0,
+    n_group: 0,
+    topk_group: 0,
+    routed_scaling_factor: 1.0,
+    first_k_dense_replace: 0,
+    dense_intermediate: 0,
+    yarn_factor: 1.0,
+    yarn_original_max_pos: 0,
+    yarn_beta_fast: 0.0,
+    yarn_beta_slow: 0.0,
+    yarn_mscale: 1.0,
+    yarn_mscale_all_dim: 1.0,
+};
+
+/// Test only (`model-qwen3-next-tiny`, which turns on
+/// `model-qwen3-next-80b-a3b` too): Qwen3-Next at the tiny
+/// random-weight shapes of `tools/model_layer/qwen3_next/make_tiny.py`
+/// — hidden 512, 8 layers (2 × (3 Gated DeltaNet + 1 full attention)),
+/// the real per-head dims (linear attention 128, attention 256), 32
+/// experts top-10. For the `qnext_engine` integration test; not a
+/// model anyone runs.
+#[cfg(feature = "model-qwen3-next-tiny")]
+pub const VARIANT: Variant = Variant {
+    name: "Qwen3-Next-tiny",
+    hidden_dim: 512,
+    num_layers: 8,
+    num_attn_heads: 4,
+    num_kv_heads: 2,
+    head_dim: 256,
+    vocab_size: 1024,
+    num_experts: 32,
+    num_experts_per_tok: 10,
+    moe_intermediate: 128,
+    shared_intermediate: 128,
+    full_attn_interval: 4,
+    linear_num_v_heads: 4,
+    linear_num_k_heads: 2,
+    eos_token_1: 1023,
+    eos_token_2: 1022,
+    think_start_token: -1,
+    think_end_token: -1,
+    attn_kind: AttnKind::Gqa,
+    rope_kind: RopeKind::Vanilla,
+    router_kind: RouterKind::Softmax,
+    shared_expert_gate: SharedExpertGate::SigmoidGate,
+    attn_output_gate: true,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 64, // head_dim / 4 (partial_rotary_factor 0.25)
+    norm_topk_prob: true,
+    q_lora_rank: 0,
+    kv_lora_rank: 0,
+    qk_nope_head_dim: 0,
+    qk_rope_head_dim: 0,
+    v_head_dim: 0,
+    n_group: 0,
+    topk_group: 0,
+    routed_scaling_factor: 1.0,
+    first_k_dense_replace: 0,
+    dense_intermediate: 0,
+    yarn_factor: 1.0,
+    yarn_original_max_pos: 0,
+    yarn_beta_fast: 0.0,
+    yarn_beta_slow: 0.0,
+    yarn_mscale: 1.0,
+    yarn_mscale_all_dim: 1.0,
+};
+
 #[cfg(not(any(
     feature = "model-qwen3-5-a17b",
     feature = "model-qwen3-6-35b-a3b",
     feature = "model-cogito-v2-671b",
     feature = "model-olmoe-1b-7b",
     feature = "model-qwen3-8-flash-next",
+    feature = "model-qwen3-next-80b-a3b",
 )))]
 compile_error!(
     "streammoe: enable exactly one model variant feature \
      (`model-qwen3-5-a17b`, `model-qwen3-6-35b-a3b`, \
-     `model-cogito-v2-671b`, `model-olmoe-1b-7b`, or \
-     `model-qwen3-8-flash-next`)."
+     `model-cogito-v2-671b`, `model-olmoe-1b-7b`, \
+     `model-qwen3-8-flash-next`, or `model-qwen3-next-80b-a3b`)."
 );
 
 // --- Static sanity checks ----------------------------------------
@@ -1155,6 +1274,7 @@ mod tests {
         feature = "model-qwen3-5-a17b",
         feature = "model-qwen3-6-35b-a3b",
         feature = "model-qwen3-8-flash-next",
+        feature = "model-qwen3-next-80b-a3b",
     ))]
     #[test]
     fn qwen_attention_and_routing_flags() {
@@ -1207,6 +1327,27 @@ mod tests {
         assert_eq!(v.down_w_off_4bit(), 2 * 1_179_648);
         assert_eq!(v.down_s_off_4bit(), 2 * 1_179_648 + 1_048_576);
         assert_eq!(v.down_b_off_4bit(), 2 * 1_179_648 + 1_048_576 + 65_536);
+    }
+
+    /// Qwen3-Next-80B-A3B constants against its `config.json`; the
+    /// 4-bit expert is the A3B's (hidden 2048, intermediate 512).
+    #[cfg(all(feature = "model-qwen3-next-80b-a3b", not(feature = "model-qwen3-next-tiny")))]
+    #[test]
+    fn qwen3_next_constants() {
+        let v = VARIANT;
+        assert_eq!(
+            (v.hidden_dim, v.num_layers, v.num_attn_heads, v.num_kv_heads, v.head_dim),
+            (2048, 48, 16, 2, 256)
+        );
+        assert_eq!((v.vocab_size, v.num_experts, v.num_experts_per_tok), (151936, 512, 10));
+        assert_eq!((v.moe_intermediate, v.shared_intermediate), (512, 512));
+        assert_eq!((v.linear_num_k_heads, v.linear_num_v_heads, v.linear_conv_dim()), (16, 32, 8192));
+        assert_eq!((v.eos_token_1, v.eos_token_2), (151645, 151643));
+        assert_eq!(v.expert_size_4bit(), 1_769_472);
+        assert_eq!(GROUP_SIZE, 64);
+        assert_eq!(ROPE_THETA, 10_000_000.0);
+        assert!(MROPE_SECTION.is_none());
+        assert_eq!((0..v.num_layers).filter(|&i| v.layer_kind(i) == LayerKind::FullAttn).count(), 12);
     }
 
     /// `layer_kind(i)` must agree with the legacy modulo predicate for
