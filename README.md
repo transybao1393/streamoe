@@ -107,7 +107,7 @@ still change before 0.2.0; changes are listed in
 | Vision for Qwen3.5 / 3.6 | Implemented; matches transformers (cosine 1.000000) |
 | Packed 3-bit experts | Implemented; KL 0.048 vs 4-bit, 10/10 scored tasks |
 | Several tokens per pass (parallel requests, speculative checks) | Implemented; 1.3× throughput with 4 requests |
-| Models | Qwen3.6-35B-A3B tested; Qwen3.5-397B-A17B runs in 9 GiB (0.53 tok/s, [below](#running-qwen35-397b-a17b-in-9-gib)); Cogito-V2, OLMoE-1B-7B variants build |
+| Models | Qwen3.6-35B-A3B tested; Qwen3.5-397B-A17B runs in 9 GiB (0.53 tok/s, [below](#running-qwen35-397b-a17b-in-9-gib)); Qwen3.8-Flash-Next runs in 6 GiB (1.41 tok/s, [below](#running-qwen38-flash-next-in-6-gib)); Qwen3-Next-80B-A3B runs in 6 GiB (4.6 tok/s, [below](#running-qwen3-next-80b-a3b-in-6-gib)); Cogito-V2, OLMoE-1B-7B variants build |
 | Router policy, per-expert precision | Planned |
 
 The full table, how each part was tested, and the last test run are in
@@ -409,6 +409,201 @@ at 9 GiB; at bigger caps the gap closes (84.1% vs 83.8% at 120 GiB).
 Details, plus notes on prefill, prefetch, a DGX Spark and
 Qwen3.8-Flash-Next: [`docs/design-notes.md`](docs/design-notes.md).
 
+## Running Qwen3.8-Flash-Next in 6 GiB
+
+<details>
+<summary><b>Qwen3.8-Flash-Next</b>: 6B active of 125B, 103 GiB on disk, runs in 6 GiB from an external SSD: <b>1.41 tok/s</b>, prompts at <b>22 tok/s</b> (first real run, 2026-11-07)</summary>
+
+<br>
+
+Qwen3.8-Flash-Next (`qwen4_exp`, feature `model-qwen3-8-flash-next`)
+is a different design from the Qwen3.5 / 3.6 models above: 48 layers
+of Gated DeltaNet and Qwen Sparse Attention (3 + 1, repeated), a
+4-copy Gated Residual stream in place of layer norms, 512 experts per
+layer with 10 used per token plus a shared expert, and an n-gram
+embedding table read at layer 1. Its code lives in
+`crates/streammoe/src/riir/model_layer/qwen3_8_flash_next/`, its
+converter and Python reference in
+`tools/model_layer/qwen3_8_flash_next/`.
+
+At 4-bit it is **103.2 GiB** on disk:
+
+| Part | Size | Where it lives |
+| --- | --- | --- |
+| Experts: 48 layers × 512, 2.93 MiB each (3,080,192 B stride) | 70.5 GiB | Streamed from the SSD; the hottest in the hot tier |
+| n-gram embedding table (320 M rows × 160, 4-bit) | 29.8 GiB | On the SSD; ~8–16 small reads per token |
+| Everything else | 2.9 GiB | In RAM (2.54 GiB with the embedding streamed) |
+
+*Setup: standard, except: model on the same external SSD as the 397B
+(Kingston NV3 500 GB, QLC, USB4 enclosure), 4-bit experts, 6 GiB cap,
+greedy decoding, one run each, 2026-11-06/07, build `d8b8a0e`.*
+
+**Answers.** "What is the capital of France? Answer in one sentence."
+→ *"The capital of France is Paris."*, then it stops by itself. A
+983-token text about a warehouse, "summarize in two sentences" →
+*"The warehouse faces critical inefficiencies due to disorganized pick
+lists that cause excessive walking, a lack of standardized packing
+materials that increases courier fees, and a slow, undifferentiated
+returns process that leaves items in limbo. To address these
+issues…"* (cut at the 48-token limit).
+
+| Setup (6 GiB cap) | Hot tier | Prompt speed (983 tokens) | tok/s | Peak memory |
+| --- | --- | --- | --- | --- |
+| Defaults (1 checkpoint reserved) | 226 experts, 0.65 GiB | 22.6 tok/s (43.5 s) | 1.25 | 5.56 GiB |
+| **No checkpoints** | 675 experts, 1.93 GiB | 22.2 tok/s | **1.41** | 5.58 GiB |
+| No checkpoints, no prefetch | 683 experts, 1.95 GiB | 22.5 tok/s | 1.35 | 5.56 GiB |
+
+A 24-token prompt runs at 4.0 tok/s (6.0 s): a short prompt still
+reads most of each layer's experts once.
+
+- **Prompts are limited by the drive.** Each 512-token chunk needs
+  ~300 of the 512 experts per layer (14,353 of 24,576 in the first
+  chunk), read in 5,846 preads averaging 7.4 MiB, 41 GiB per chunk.
+  Of the chunk's 21.2 s, 18.7 s is waiting on the drive (~2.3 GB/s)
+  and 2.0 s on the GPU.
+- **Decode is mostly reads too.** Each token picks 480 experts
+  (1.4 GiB if none were cached), and the hot tier holds 675 of the
+  24,576.
+- **Checkpoints cost cache.** A reserved checkpoint takes 1.28 GiB,
+  which the hot tier gets back with `max_checkpoints: 0`
+  (+13% tok/s).
+- **Prefetch guesses badly here.** The previous token's experts are
+  right for 12% of the next token's picks (2,416 of 19,714). It still
+  wins slightly (1.41 vs 1.35 tok/s).
+- Against the 397B on the same drive: 2.6× the tok/s in two-thirds of
+  the cap, because an expert is 2.93 MiB instead of 6.75 MiB.
+
+**Correctness.** No reference fits in this Mac's memory at full size,
+so correctness is checked on tiny random-weight models with the same
+structure against a pure-PyTorch port of the transformers code: every
+logits row within 6.2e-5, CPU vs Metal 2.7e-6, chunked prefill vs one
+token at a time 1.8e-6.
+
+**Setup.**
+
+```bash
+M="/Volumes/External NVMe M2 PCIe 4.0/models/qwen3-8-flash-next"
+# 22 shards, ~5 GiB each: download one, convert it, delete it; peak disk = output + one shard
+hf download mlx-community/Qwen3.8-Flash-Next-4bit --exclude "*.safetensors" --local-dir mlx-4bit
+hf download mlx-community/Qwen3.8-Flash-Next-4bit model-00001-of-00022.safetensors --local-dir mlx-4bit
+python3 -I tools/model_layer/qwen3_8_flash_next/convert.py --source mlx-4bit --out "$M" --delete-source
+# … repeat for each shard; the last run writes the manifests
+
+cd tools/chat && cargo run --release --no-default-features --features q38 -- \
+    --model "$M" --cap-gib 7 --n-ctx 4096 --no-vision --no-prefill-while-typing
+```
+
+The download and conversion took ~1 h (the conversion reads every
+tensor back and compares it). The chat page works with one
+conversation; on the chat page at a 7 GiB cap the hot tier holds
+1,020 experts.
+
+**Not supported yet:** images (the vision tower was not converted;
+the text model also needs M-RoPE for image positions), several chats
+at once, prefill while typing (needs a checkpoint), layer ranges,
+non-F32 KV caches, and `memory_seq_rm` to a middle position.
+
+**Next:** start a layer's reads before its router finishes (a
+whole-layer read doesn't depend on the routing), a better expert
+guess than the previous token's, and layer-major prefill so a long
+prompt reads each layer once.
+
+</details>
+
+## Running Qwen3-Next-80B-A3B in 6 GiB
+
+<details>
+<summary><b>Qwen3-Next-80B-A3B</b>: 3B active of 80B, 42 GiB on disk, runs in 6 GiB from an external SSD: <b>4.6 tok/s</b>, prompts at <b>46 tok/s</b>, the fastest large model on this Mac (first real run, 2026-11-07)</summary>
+
+<br>
+
+Qwen3-Next-80B-A3B (`qwen3_next`, feature `model-qwen3-next-80b-a3b`)
+is the model the Qwen3.5 / 3.6 family grew out of: 48 layers of Gated
+DeltaNet and gated full attention (3 + 1, repeated), 512 experts per
+layer with 10 used per token plus a sigmoid-gated shared expert. Its
+math is the same as the 35B-A3B's, so it runs on the engine's original
+code path with its own shape constants and no engine changes. Only the
+checkpoint layout differs: the converter
+(`tools/model_layer/qwen3_next/`) splits the fused `in_proj_qkvz` /
+`in_proj_ba` projections, which are grouped per key head, into the
+layout the engine reads.
+
+At 4-bit it is **41.8 GiB** on disk:
+
+| Part | Size | Where it lives |
+| --- | --- | --- |
+| Experts: 48 layers × 512, 1.69 MiB each (same as the 35B-A3B) | 40.5 GiB | Streamed from the SSD; the hottest in the hot tier |
+| Everything else | 1.26 GiB | In RAM (1.10 GiB with the embedding streamed) |
+
+*Setup: standard, except: model on the same external SSD as the 397B
+(Kingston NV3 500 GB, QLC, USB4 enclosure), 4-bit experts, 6 GiB cap,
+no checkpoints, greedy decoding, one run each, 2026-11-07, build
+`4ff0303` (merged in `d5ffbfa`).* Open-time plan: 6.00 GiB, of
+which the resident weights are 1.10 GiB, prefill staging 0.84 GiB and
+the hot tier 2.87 GiB (1,743 experts, 7.1% of 24,576).
+
+**Answers.** "What is the capital of France? Answer in one sentence."
+→ *"The capital of France is Paris."*, then it stops by itself. The
+same 979-token warehouse text as the Flash-Next run, "summarize in two
+sentences" → *"Our warehouse faces chronic inefficiencies in order
+fulfillment, including inefficient pick routing, mismatched packaging,
+delayed returns processing, and inventory inaccuracies—exacerbated by
+seasonal spikes and fragmented systems across sales channels. Despite
+a successful past pilot of zone…"* (cut at the 48-token limit).
+
+| Prompt | Prompt speed | tok/s | Peak memory |
+| --- | --- | --- | --- |
+| 20 tokens ("capital of France") | 5.8 tok/s (3.4 s) | 4.1 (7 tokens, 0.23–0.38 s each) | 5.60 GiB |
+| **979 tokens (summary)** | **46.2 tok/s (21.2 s)** | **4.64** (46 tokens) | 5.61 GiB |
+
+Against the other large models on the same drive:
+
+| | Qwen3-Next-80B-A3B | Qwen3.8-Flash-Next | Qwen3.5-397B-A17B |
+| --- | --- | --- | --- |
+| Active / total | 3B / 80B | 6B / 125B | 17B / 397B |
+| Expert size | 1.69 MiB | 2.93 MiB | 6.75 MiB |
+| Cap | 6 GiB | 6 GiB | 9 GiB |
+| Hot tier | 1,743 experts | 675 | 305 |
+| tok/s | **4.64** | 1.41 | 0.54 |
+| Long-prompt speed | **46 tok/s** | 22 tok/s | 5.6 tok/s (15.3 layer-major) |
+
+- **Small experts are why it's fast.** Each token reads at most 480
+  experts of 1.69 MiB, 58% of Flash-Next's bytes, and the same
+  cap holds 2.6× as many of them.
+- **Prefetch doesn't help here.** The guess was right for 122 of the
+  7,451 experts it read ahead (1.6%); turning it off is still to be
+  measured.
+- The conversion took 15 min (912 s) for 9 shards, every tensor read
+  back and hash-checked.
+
+**Correctness.** On a tiny random-weight model with the same layout
+(fused projections, 8-bit router), against a pure-PyTorch port of the
+transformers code: every row within 1.7e-5 one token at a time, and
+within 2.5e-3 after a batched prefill (the shared batched MoE kernel;
+5e-6 with it off). Converting without regrouping the fused projections
+gives 1.28, so the test catches a wrong split.
+
+**Setup.**
+
+```bash
+M="/Volumes/External NVMe M2 PCIe 4.0/models/qwen3-next-80b-a3b"
+hf download mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit --local-dir "$M/mlx-4bit"   # 44.8 GB
+python3 -I tools/model_layer/qwen3_next/convert.py --source "$M/mlx-4bit" --out "$M"   # add --delete-source to drop shards as they're verified
+
+cd tools/chat && cargo run --release --no-default-features --features qnext -- \
+    --model "$M" --cap-gib 6 --n-ctx 4096 --no-vision --no-prefill-while-typing
+```
+
+Two downloads with `hf` stalled after the last byte and one left a
+corrupt partial file; downloading each shard with `curl -C -` and
+checking its SHA-256 against the `x-linked-etag` header avoided both.
+
+**Not supported yet:** images (Qwen3-Next has no vision tower), and
+thinking mode (this is the Instruct build; the chat page leaves out the
+empty think block for it).
+
+</details>
+
 ## Roadmap
 
 - **Faster time to first word**: layer-major prefill, which reads each
@@ -416,9 +611,9 @@ Qwen3.8-Flash-Next: [`docs/design-notes.md`](docs/design-notes.md).
   (built and opt-in; on a 2,062-token prompt −45% prefill on the 35B,
   first word 368 → 135 s on the 397B); stage layer L+1's experts while the
   GPU computes layer L.
-- **Qwen3.8-Flash-Next**: 6B active of 125B, ~63 GiB of 4-bit
-  experts; needs Qwen Sparse Attention, Gated Residual and an n-gram
-  embedding lookup ([notes](docs/design-notes.md#qwen38-flash-next)).
+- **Qwen3.8-Flash-Next**: runs ([above](#running-qwen38-flash-next-in-6-gib));
+  next are images, earlier expert reads, a better expert guess and
+  layer-major prefill ([notes](docs/design-notes.md#qwen38-flash-next)).
 - **Router policy and per-expert precision**: per expert, 4-bit, 3-bit
   or skip, chosen at run time.
 - **Fewer, longer GPU bursts**: more than half of each token is GPU
