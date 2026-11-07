@@ -49,7 +49,12 @@
 //! hot-tier experts masked out): layer L's reads are issued at the top
 //! of layer L, before its first command buffer, so they run under the
 //! GPU work up to its router; with `prefetch_lookahead` layer L+1's go
-//! out right after layer L's router readback. A routed expert found in
+//! out right after layer L's router readback. With
+//! `PrefetchGuess::CrossLayer` (and no lookahead) layer L's router
+//! command buffer also runs layer L+1's router on layer L's MoE input;
+//! its top guesses not in the hot tier are read right after layer L's
+//! own reads land (set (L+1) % 2 was last bound by layer L-1's
+//! experts, which layer L's router readback waited for). A routed expert found in
 //! the layer's set binds that slot (no copy). Wrong guesses finish in
 //! the background; everything in flight is drained at the end of the
 //! token. Off with `prefetch_experts = 0` (then only `K` slots are
@@ -130,7 +135,8 @@ use crate::riir::backend::{BufId, BufferPool, Graph, GraphError, Op, WeightRef};
 use crate::riir::io::embedding::{bf16_to_f32, embed_lookup};
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
 use crate::riir::io::io_stats::{guess_overlap, Guesser};
-use crate::riir::io::prefetch::{mask_hot, PrefetchState};
+use crate::riir::io::guess::{min_prob_from_env, prob_floor, top_k_into};
+use crate::riir::io::prefetch::{mask_hot_compact, PrefetchGuess, PrefetchState};
 use crate::riir::moe::expert_forward::MAX_K;
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_router::{build_expert_buckets, moe_router_cpu_with, ExpertBuckets};
@@ -757,6 +763,14 @@ pub struct Q38Engine<B: Q38Exec> {
     pf: Option<PrefetchState>,
     /// Staging slots per prefetch set ([`prefetch_slots`]; 0 = off).
     pf_slots: usize,
+    /// Cross-layer guess for the next layer (`PrefetchGuess::CrossLayer`):
+    /// layer l+1's router run on layer l's MoE input, ranked, `(l + 1,
+    /// experts)`, after `STREAMMOE_PREFETCH_MIN_P`. Taken by the
+    /// dispatch. `cross_raw` is the same ranking unfloored, moved to
+    /// `cross_scored` to be scored against l+1's routing.
+    cross_next: Option<(usize, [i32; MAX_K])>,
+    cross_raw: Option<(usize, [i32; MAX_K])>,
+    cross_scored: Option<(usize, [i32; MAX_K])>,
     /// Host address of `bufs.expert_base` (shared storage / the CPU
     /// backend's vector: allocated once, never moved). Slots are
     /// handed out as disjoint slices of it ([`Self::slot`]), so
@@ -788,8 +802,11 @@ impl<B: Q38Exec> Q38Engine<B> {
     }
 
     /// [`Self::new`] with speculative expert prefetch driven by `pf`
-    /// (its `max_experts` and `lookahead` settings; the cross-layer
-    /// guesser is not used here). `None` or `max_experts() == 0`: off.
+    /// (its `max_experts`, `lookahead` and `guess` settings; the
+    /// cross-layer guess runs layer l+1's router on layer l's MoE input
+    /// on the backend, in the router's command buffer, and reads the
+    /// guesses as soon as layer l's own reads are done). `None` or
+    /// `max_experts() == 0`: off.
     /// Prefill settings from the environment ([`Q38PrefillIo::from_env`]).
     pub fn with_prefetch(
         b: &mut B,
@@ -969,6 +986,9 @@ impl<B: Q38Exec> Q38Engine<B> {
             submits: std::sync::atomic::AtomicU64::new(0),
             pf,
             pf_slots,
+            cross_next: None,
+            cross_raw: None,
+            cross_scored: None,
             staging_addr,
             io,
             pf_io_slots: io.slots,
@@ -1105,8 +1125,23 @@ impl<B: Q38Exec> Q38Engine<B> {
         if layer >= self.cfg.num_layers || pf.in_flight_for(layer) {
             return;
         }
-        let Some(mut predicted) = pf.predict_for(layer) else { return };
-        mask_hot(experts.hot_tier(), layer, &mut predicted[..p]);
+        let cross = match self.cross_next.take() {
+            Some((l, g)) if l == layer => Some(g),
+            _ => None,
+        };
+        let (mut predicted, n) = match cross {
+            Some(g) => (g, MAX_K),
+            None => match pf.predict_for(layer) {
+                Some(g) => (g, p),
+                None => return,
+            },
+        };
+        // Cross guess: the strongest p non-resident of MAX_K ranked
+        // candidates. Previous-token guess: its first p minus the
+        // resident ones (topping it up from the weaker picks read
+        // 26%-useful guesses that queued ahead of the demand reads and
+        // cut real-model decode 1.01 -> 0.42 tok/s).
+        mask_hot_compact(experts.hot_tier(), layer, &mut predicted, n);
         let mut spare = [0u8; MAX_K];
         let mut spare = spare.chunks_mut(1);
         // SAFETY: the set's slots are disjoint from each other and from
@@ -1123,6 +1158,9 @@ impl<B: Q38Exec> Q38Engine<B> {
         if let Some(p) = self.pf.as_mut() {
             p.invalidate_all();
         }
+        self.cross_next = None;
+        self.cross_raw = None;
+        self.cross_scored = None;
         for lb in &self.layers {
             if let LayerBufs::Gdn { conv, delta, conv_len, delta_len } = *lb {
                 upload(b, conv, &vec![0.0f32; conv_len])?;
@@ -1767,6 +1805,27 @@ impl<B: Q38Exec> Q38Engine<B> {
         let bu = &self.bufs;
         let (h, si, k) = (c.hidden as u32, c.shared_intermediate as u32, c.top_k);
         steps.push(matvec("q38.moe.router", m.router, bu.mixed, bu.router_logits, h, c.num_experts as u32));
+        // Cross-layer guess: layer l+1's router on this layer's MoE
+        // input, into the second row of `router_logits` (decode uses
+        // only the first). Only picks which experts to read early.
+        let ne = c.num_experts;
+        let cross = l + 1 < c.num_layers
+            && self.max_chunk >= 2
+            && !self.pf.as_ref().is_some_and(|p| p.lookahead())
+            && self.pf.as_ref().is_some_and(|p| p.max_experts() > 0 && p.guess() == PrefetchGuess::CrossLayer);
+        if cross {
+            steps.push(Step::G(Op::MatvecNTokens {
+                label: "q38.moe.router_next",
+                weight: self.w.layers[l + 1].moe.router,
+                input: t(bu.mixed),
+                input_off: 0,
+                output: t(bu.router_logits),
+                output_off: (ne * 4) as u64,
+                in_dim: h,
+                out_dim: ne as u32,
+                n_tokens: 1,
+            }));
+        }
         steps.push(matvec("q38.moe.shared_expert_gate", m.shared_gate, bu.mixed, bu.shared_gate, h, 1));
         steps.push(matvec("q38.moe.shared_gate_proj", m.gate, bu.mixed, bu.s_gate, h, si));
         steps.push(matvec("q38.moe.shared_up_proj", m.up, bu.mixed, bu.s_up, h, si));
@@ -1787,7 +1846,15 @@ impl<B: Q38Exec> Q38Engine<B> {
         let bu = &self.bufs;
 
         // Router (host): softmax, top-k, renormalized.
-        let mut scores = download(b, bu.router_logits, c.num_experts)?;
+        let mut scores = download(b, bu.router_logits, if cross { 2 * ne } else { ne })?;
+        if cross {
+            let mut g = [-1i32; MAX_K];
+            top_k_into(&scores[ne..], MAX_K, &mut g);
+            self.cross_raw = Some((l + 1, g));
+            prob_floor(&scores[ne..], &mut g, min_prob_from_env());
+            self.cross_next = Some((l + 1, g));
+            scores.truncate(ne);
+        }
         let mut idx = vec![0i32; k];
         let mut wts = vec![0.0f32; k];
         moe_router_cpu_with(&mut scores, k, c.norm_topk_prob, &mut idx, &mut wts)?;
@@ -1797,6 +1864,13 @@ impl<B: Q38Exec> Q38Engine<B> {
         // into staging slot i, or bound in place from the layer's
         // prefetch set.
         let ids = buckets.expert_ids.clone();
+        if crate::riir::io::guess_trace::enabled() {
+            let x = download(b, bu.mixed, c.hidden)?;
+            let hot = experts.hot_tier();
+            crate::riir::io::guess_trace::record(l, &x, &idx, &wts, c.num_experts, |e| {
+                hot.is_some_and(|h| h.contains(l, e))
+            });
+        }
         for &e in &ids {
             experts.record_pick(l, e as usize, 1);
         }
@@ -1842,6 +1916,18 @@ impl<B: Q38Exec> Q38Engine<B> {
             }
         }
         experts.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
+        if let Some((cl, g)) = self.cross_scored.take() {
+            if cl == l {
+                experts.counters().record_guess(Guesser::CrossLayer, k as u64, guess_overlap(&g[..k], &idx));
+            }
+        }
+        self.cross_scored = self.cross_raw.take();
+        if let Some((cl, _)) = self.cross_next {
+            // Read l+1's guesses now, under this layer's expert compute
+            // and l+1's attention. Set (l+1) % 2 was last bound by layer
+            // l-1's experts, which this layer's first flush completed.
+            self.prefetch_dispatch(cl, experts, io_pool);
+        }
         if let Some(pf) = self.pf.as_mut() {
             let n = ids.len() as u64;
             pf.record_outcome(hit_n, n - hit_n - hot_n);
