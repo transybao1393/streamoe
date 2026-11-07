@@ -95,37 +95,59 @@ pub fn rms_norm_bf16(x: &[f32], w: &[u8], eps: f32, out: &mut [f32]) {
 /// Serial `out[r] = Σ_c dequant(W[r, c]) · x[c]` for a `bits`-bit
 /// (4 or 8) MLX-packed matrix: `packed` holds `32 / bits` values per
 /// u32, low bits first; `scales` / `biases` are bf16 per
-/// [`group_size_for_bits`]`(bits)` inputs. Matches `dequant_matvec_4bit_cpu` /
-/// `dequant_matvec_8bit_v3_cpu` without the thread pool.
+/// [`group_size_for_bits`]`(bits)` inputs. Matches
+/// `dequant_matvec_4bit_cpu` / `dequant_matvec_8bit_v3_cpu` without the
+/// thread pool up to rounding: each group sums as
+/// `scale · Σ q·x + bias · Σ x` (`gsum`, scratch of at least
+/// `x.len() / group` floats, holds the `Σ x`), with independent
+/// accumulators so the loop vectorizes. A guess only picks which
+/// experts to read early, so the last bits don't matter; the old
+/// one-chain form took ~3 ms per 512 × 2048 gate (8-bit) on the M3 Pro,
+/// ~150 ms per token on a 48-layer model.
 pub fn gate_logits(
     packed: &[u32],
     scales: &[u16],
     biases: &[u16],
     bits: u32,
     x: &[f32],
+    gsum: &mut [f32],
     out: &mut [f32],
 ) {
     let in_dim = x.len();
-    let per_word = (32 / bits) as usize;
-    let mask = (1u32 << bits) - 1;
-    let in_packed = in_dim / per_word;
     let group = group_size_for_bits(bits);
     let in_groups = in_dim / group;
-    let words_per_group = group / per_word;
+    let row_bytes = in_dim * bits as usize / 8;
+    let bytes: &[u8] = bytemuck::cast_slice(packed);
+    for (g, s) in gsum[..in_groups].iter_mut().enumerate() {
+        *s = x[g * group..(g + 1) * group].iter().sum();
+    }
     for (r, o) in out.iter_mut().enumerate() {
-        let row = &packed[r * in_packed..(r + 1) * in_packed];
+        let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
         let mut acc = 0.0f32;
         for g in 0..in_groups {
-            let scale = bf16_to_f32(scales[r * in_groups + g]);
-            let bias = bf16_to_f32(biases[r * in_groups + g]);
-            for p in 0..words_per_group {
-                let word = row[g * words_per_group + p];
-                let xs = &x[g * group + p * per_word..][..per_word];
-                for (n, &xv) in xs.iter().enumerate() {
-                    let q = ((word >> (n as u32 * bits)) & mask) as f32;
-                    acc = q.mul_add(scale, bias).mul_add(xv, acc);
+            let xs = &x[g * group..(g + 1) * group];
+            let mut a = [0.0f32; 8];
+            if bits == 8 {
+                let qs = &row[g * group..(g + 1) * group];
+                for (qc, xc) in qs.chunks_exact(8).zip(xs.chunks_exact(8)) {
+                    for j in 0..8 {
+                        a[j] += qc[j] as f32 * xc[j];
+                    }
+                }
+            } else {
+                // 4-bit: byte i holds element 2i (low nibble) and 2i+1.
+                let qs = &row[g * group / 2..(g + 1) * group / 2];
+                for (qc, xc) in qs.chunks_exact(4).zip(xs.chunks_exact(8)) {
+                    for j in 0..4 {
+                        a[2 * j] += (qc[j] & 0xf) as f32 * xc[2 * j];
+                        a[2 * j + 1] += (qc[j] >> 4) as f32 * xc[2 * j + 1];
+                    }
                 }
             }
+            let dot: f32 = a.iter().sum();
+            let scale = bf16_to_f32(scales[r * in_groups + g]);
+            let bias = bf16_to_f32(biases[r * in_groups + g]);
+            acc += scale * dot + bias * gsum[g];
         }
         *o = acc;
     }
@@ -163,6 +185,32 @@ pub fn top_k_into(scores: &[f32], k: usize, out: &mut [i32; MAX_K]) {
     }
 }
 
+/// `STREAMMOE_PREFETCH_MIN_P`: drop cross-layer guesses whose softmax
+/// probability under the guessing router is below this (default 0:
+/// keep every guess). Read once.
+pub fn min_prob_from_env() -> f32 {
+    static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("STREAMMOE_PREFETCH_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    })
+}
+
+/// Set to `-1` the entries of `guess` (indices into `logits`, `-1`
+/// for none) whose softmax probability over all of `logits` is below
+/// `min_p`. No-op for `min_p <= 0`.
+pub fn prob_floor(logits: &[f32], guess: &mut [i32; MAX_K], min_p: f32) {
+    if min_p <= 0.0 || logits.is_empty() {
+        return;
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&z| (z - max).exp()).sum();
+    for e in guess.iter_mut() {
+        if *e >= 0 && (logits[*e as usize] - max).exp() / sum < min_p {
+            *e = -1;
+        }
+    }
+}
+
 /// Fixed-buffer cross-layer guesser. See the module docs.
 #[derive(Debug)]
 pub struct CrossLayerGuesser {
@@ -171,6 +219,8 @@ pub struct CrossLayerGuesser {
     h: Vec<f32>,
     normed: Vec<f32>,
     scores: Vec<f32>,
+    /// Per-group input sums for [`gate_logits`].
+    gsum: Vec<f32>,
     /// Layer whose residual is in `h`.
     from_layer: Option<usize>,
     /// Last computed guess and the layer it is for.
@@ -190,6 +240,7 @@ impl CrossLayerGuesser {
             h: vec![0.0; v.hidden_dim],
             normed: vec![0.0; v.hidden_dim],
             scores: vec![0.0; v.num_experts],
+            gsum: vec![0.0; v.hidden_dim.div_ceil(32)],
             from_layer: None,
             guess: None,
         }
@@ -220,10 +271,12 @@ impl CrossLayerGuesser {
         let scales: &[u16] = bytemuck::try_cast_slice(bytes(g.scales)?).ok()?;
         let biases: &[u16] = bytemuck::try_cast_slice(bytes(g.biases)?).ok()?;
         rms_norm_bf16(&self.h, bytes(g.norm)?, RMS_NORM_EPS, &mut self.normed);
-        gate_logits(packed, scales, biases, g.bits, &self.normed, &mut self.scores);
+        gate_logits(packed, scales, biases, g.bits, &self.normed, &mut self.gsum, &mut self.scores);
         let mut out = [-1i32; MAX_K];
         top_k_into(&self.scores, k, &mut out);
+        // Scored unfloored: the telemetry rates the ranking.
         self.guess = Some((layer, out));
+        prob_floor(&self.scores, &mut out, min_prob_from_env());
         Some(out)
     }
 
@@ -259,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_logits_matches_threaded_kernels() {
+    fn gate_logits_matches_threaded_kernels_to_rounding() {
         let (in_dim, out_dim) = (256, 5);
         let mut seed = 7u64;
         let x: Vec<f32> = (0..in_dim).map(|_| (lcg(&mut seed) % 200) as f32 / 100.0 - 1.0).collect();
@@ -280,8 +333,11 @@ mod tests {
                     .unwrap();
             }
             let mut got = vec![0f32; out_dim];
-            gate_logits(&packed, &scales, &biases, bits, &x, &mut got);
-            assert_eq!(got, want, "bits={bits}");
+            let mut gsum = vec![0f32; in_dim / 32];
+            gate_logits(&packed, &scales, &biases, bits, &x, &mut gsum, &mut got);
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "bits={bits}: {g} vs {w}");
+            }
         }
     }
 
@@ -296,6 +352,20 @@ mod tests {
         assert_eq!(&out[..2], &[1, 0]);
         top_k_into(&scores, 0, &mut out);
         assert!(out.iter().all(|&e| e == -1));
+    }
+
+    #[test]
+    fn prob_floor_drops_unlikely_guesses() {
+        // softmax of [ln 6, ln 3, ln 1] = [0.6, 0.3, 0.1].
+        let logits = [6f32.ln(), 3f32.ln(), 0.0];
+        let mut g = [-1i32; MAX_K];
+        g[..3].copy_from_slice(&[0, 1, 2]);
+        prob_floor(&logits, &mut g, 0.0);
+        assert_eq!(&g[..3], &[0, 1, 2]);
+        prob_floor(&logits, &mut g, 0.2);
+        assert_eq!(&g[..3], &[0, 1, -1]);
+        prob_floor(&logits, &mut g, 0.5);
+        assert_eq!(&g[..3], &[0, -1, -1]);
     }
 
     #[test]
