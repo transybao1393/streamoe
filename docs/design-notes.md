@@ -170,7 +170,7 @@ Ideas, biggest first:
 
 | # | Idea | Helps | Status |
 | --- | --- | --- | --- |
-| 1 | **Layer-major prefill**: run each layer over every chunk before the next layer, so its experts are read once per prompt instead of once per chunk | Long prompts. Measured, 2,062 tokens: −45% prefill on the 35B, **2.7× faster on the 397B** (below) | Built, opt-in, bit-identical, branch `worktree-agent-a75d0afb8b2779274` at `98a6263` |
+| 1 | **Layer-major prefill**: run each layer over every chunk before the next layer, so its experts are read once per prompt instead of once per chunk | Long prompts. Measured, 2,062 tokens: −45% prefill on the 35B, **2.7× faster on the 397B** (below) | Default since 2026-11-07 (`STREAMMOE_LAYER_MAJOR=0` turns it off), bit-identical; Qwen3-Next 1,998 tokens 36.1 → 17.0 s |
 | 2 | Prefill while typing | Chat | Done; chat default since 2026-11-05 |
 | 3 | Probation for prompt experts | Decode after a long prompt | Measured: loses (above) |
 | 4 | Chunkwise batched linear attention | Long prompts on the 35B (compute-bound at 108–128 tok/s) | Not started |
@@ -183,7 +183,8 @@ the prompt's hidden rows (2,000 × 4,096 × 4 B ≈ 32 MB) plus a running
 sum. Prompts under 512 tokens are one chunk and gain nothing.
 
 **Layer-major, measured.** Switches: `OpenConfig::layer_major` /
-`STREAMMOE_LAYER_MAJOR=1`, and `layer_major_chunks` /
+`STREAMMOE_LAYER_MAJOR` (on by default since 2026-11-07; `0` turns it
+off), and `layer_major_chunks` /
 `STREAMMOE_LAYER_MAJOR_CHUNKS` (window, default 4 chunks). Within a
 window each layer runs all its chunks before the next layer. With full
 staging (35B) later chunks stage only experts not already staged. With
@@ -231,6 +232,26 @@ lent slots are emptied at every prefill). On short chat the price is a
 slightly smaller tier for no prefill gain; layer-major pays only for
 prompts over 512 tokens. Evidence:
 `docs/dev/a17b-evidence/layermajor-20261106-1449/`.
+
+*Setup: Qwen3-Next-80B-A3B, packed 3-bit experts, M3 Pro 18 GB, model
+on the external SSD (Kingston NV3, USB4), 6 GiB cap, n_ctx 4096,
+prefetch off, no checkpoints, greedy, 32 tokens; a 979-token prompt
+(the warehouse summary) and a 1,998-token one (the start of
+`docs/known-issues.md`, "summarize in two sentences"); 2026-11-07,
+builds `9c67937` and `4966de6` (decay hold); 3–6 runs per arm,
+alternating, other agents on the host.* Output tokens identical in all
+18 runs.
+
+| | 979 tokens, chunk-major | 979, layer-major | 1,998, chunk-major | 1,998, layer-major |
+| --- | --- | --- | --- | --- |
+| Prefill | 18.2 s (53.7 tok/s) | **12.2 s (80.4 tok/s)** | 36.1 s (55.3 tok/s) | **17.0 s (118 tok/s)** |
+| Prefill disk reads | 34,047 MiB | 20,163 MiB | 65,811 MiB | 21,530 MiB |
+| Decode hot hits / demand reads (32 tokens, last pair) | 10,973 / 4,387 | 11,739 / 3,621 | 10,669 / 4,691 | 10,912 / 4,448 |
+| Decode (last pair, quiet host) | 5.37 tok/s | 6.18 tok/s | 4.98 tok/s | 5.13 tok/s |
+
+A 2-chunk window on the 1,998-token prompt (2 + 2) gave 23.2 s and
+37,675 MiB, between the two. The window costs 0.02 GiB of the plan
+here (full staging), lent back to the hot tier during decode.
 
 ## Right and wrong guesses
 

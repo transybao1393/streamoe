@@ -276,8 +276,8 @@ history of `.claude/memory/`, which is no longer tracked.
   Under a cap prompts prefill in chunks of 512, each through every
   layer before the next, so a 4-chunk prompt staged most experts of
   every layer four times. Layer-major prefill
-  (`OpenConfig::layer_major`, env `STREAMMOE_LAYER_MAJOR=1`; off by
-  default until measured more widely) runs a window of up to
+  (`OpenConfig::layer_major`; on by default since 2026-11-07, env
+  `STREAMMOE_LAYER_MAJOR=0` turns it off) runs a window of up to
   `layer_major_chunks` chunks (default 4, env
   `STREAMMOE_LAYER_MAJOR_CHUNKS`) layer by layer: each layer runs all
   of the window's chunks in order (KV rows and linear-attn recurrence
@@ -301,10 +301,30 @@ history of `.claude/memory/`, which is no longer tracked.
   server per run, 2 runs each, 2026-11-05: prefill 14.0 / 14.0 →
   7.7 / 7.7 s (147 → 269 tok/s, −45%), staging I/O 10.6 → 3.5 s, prefill
   disk reads 55,890 → 18,887 MiB; output text and peak (3.63 GiB)
-  identical. Hot-tier popularity is recorded per chunk as before, but
-  in layer-major order, so its decay can land between other picks than
-  chunk-major (decode speed only). The 397B (bounded) has not been
-  measured with it.
+  identical. The 397B (bounded, 9 GiB cap, external SSD, 2,062
+  tokens, 2026-11-06): first word 368 → 135 s, same answer; its
+  0.31 GiB window comes out of the hot tier's plan (305 → 257 slots,
+  lent back during decode; decode 0.43 → 0.42 tok/s). Qwen3-Next-80B
+  packed 3-bit (6 GiB cap, external SSD, 2026-11-07): 979 tokens
+  18.2 → 12.2 s, 1,998 tokens 36.1 → 17.0 s (prefill disk reads
+  65,811 → 21,530 MiB), output identical in 18 runs, decode unchanged
+  (see the next entry). Made the default after those runs.
+- **Layer-major prefill skewed the hot tier toward late layers (fixed
+  2026-11-07).** The tier halves every popularity counter each 4096
+  recorded picks. Chunk by chunk, each layer adds 512 × top-k picks
+  per chunk, about one halving per layer; layer-major adds a whole
+  window's picks per layer at once (4 × 512 × 10 = 20,480 on
+  Qwen3-Next, five halvings), so by the end of the window the early
+  layers' counts were near zero and admission favored the late
+  layers' experts. `HotTier::hold_decay` / `release_decay` now hold
+  the halvings for the window and apply them at its end. Qwen3-Next
+  3-bit, 6 GiB, 1,998 tokens, 32 decode tokens: hot hits 10,613 →
+  10,932, demand reads 4,747 → 4,428 (chunk by chunk: 10,669 /
+  4,691); 979 tokens: 11,739 / 3,621 vs chunk by chunk 10,973 /
+  4,387. Logits never depended on it. Decode tok/s on this shared host
+  swings 2–6 tok/s run to run with other agents' load (the same
+  chunk-major run measured 5.0 and 2.0); compare hot hits and demand
+  reads, not tok/s, unless the host is quiet.
 
 ## Precautions
 
