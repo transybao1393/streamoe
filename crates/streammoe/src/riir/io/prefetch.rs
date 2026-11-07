@@ -80,6 +80,10 @@ pub enum SlotSource {
     Prefetched(usize),
 }
 
+/// Default size of the speculative reads' own thread pool
+/// ([`PrefetchState::set_threads_from_env`]); 0 = share the I/O pool.
+pub const PREFETCH_THREADS: usize = 0;
+
 /// How speculative prefetch guesses the experts of the layer about to
 /// run ([`crate::riir::OpenConfig::prefetch_guess`], plan phase 6).
 /// Either way the forward pass routes on its own logits; the guess
@@ -92,7 +96,10 @@ pub enum PrefetchGuess {
     /// Layer L's post-attention residual through layer L+1's norm and
     /// router gate, on the CPU ([`super::guess::CrossLayerGuesser`]);
     /// falls back to `PrevToken` for a range's first layer and where
-    /// the gate can't be read. GQA variants in pread mode only.
+    /// the gate can't be read. GQA variants in pread mode, and the
+    /// Flash-Next engine (layer L+1's router on layer L's MoE input, on
+    /// the GPU). Its strongest `prefetch_experts` guesses not in the
+    /// hot tier are read.
     CrossLayer,
 }
 
@@ -135,6 +142,14 @@ pub struct PrefetchState {
     mode: ExpertIoMode,
     /// Cross-layer guesser when [`PrefetchGuess::CrossLayer`] is on.
     cross: Option<CrossLayerGuesser>,
+    /// The configured guess. Engines that compute the cross-layer
+    /// guess themselves (the Flash-Next engine, on the GPU) read it
+    /// here; the qwen3_5_moe path goes by `cross`.
+    guess: PrefetchGuess,
+    /// Threads of its own for the speculative reads
+    /// ([`Self::set_threads_from_env`]); `None`: they share the
+    /// caller's I/O pool with the demand reads.
+    own_pool: Option<rayon::ThreadPool>,
     /// Experts per layer a prefetch reads, strongest guess first
     /// ([`crate::riir::OpenConfig::prefetch_experts`]); `0` = off.
     max_experts: usize,
@@ -288,6 +303,8 @@ impl PrefetchState {
             misses: AtomicU64::new(0),
             mode,
             cross: None,
+            guess: PrefetchGuess::PrevToken,
+            own_pool: None,
             max_experts: MAX_K,
         }
     }
@@ -301,6 +318,39 @@ impl PrefetchState {
     /// Experts per layer a prefetch reads.
     pub fn max_experts(&self) -> usize {
         self.max_experts
+    }
+
+    /// `STREAMMOE_PREFETCH_THREADS=<n>` (n > 0): run the speculative
+    /// reads on a pool of `n` threads of their own instead of the I/O
+    /// pool the demand reads use, so that demand reads never queue
+    /// behind guesses. Default [`PREFETCH_THREADS`] = 0 (shared): on
+    /// Qwen3-Next and Flash-Next it measured within noise of shared
+    /// (docs/design-notes.md, "Cross-layer guess"). No pool while
+    /// prefetch is off: call after [`Self::set_max_experts`].
+    pub fn set_threads_from_env(&mut self) {
+        let n = std::env::var("STREAMMOE_PREFETCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(PREFETCH_THREADS);
+        self.own_pool = (n > 0 && self.max_experts > 0)
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .thread_name(|i| format!("streammoe-prefetch-{i}"))
+                    .build()
+                    .ok()
+            })
+            .flatten();
+    }
+
+    /// Record the configured guess ([`Self::guess`]).
+    pub fn set_guess(&mut self, guess: PrefetchGuess) {
+        self.guess = guess;
+    }
+
+    /// The configured guess.
+    pub fn guess(&self) -> PrefetchGuess {
+        self.guess
     }
 
     /// Turn on cross-layer guesses ([`PrefetchGuess::CrossLayer`]).
@@ -536,6 +586,7 @@ impl PrefetchState {
         }
         let set = target_layer % 2;
         self.drain_set(set);
+        let pool = self.own_pool.as_ref().unwrap_or(pool);
         let (tx, rx) = sync_channel::<(usize, Result<(), ExpertIoError>)>(MAX_K);
         let efp = ExpertFilesPtr::from_ref(expert_files);
         // Capture the K disjoint slot pointers BEFORE spawning;
@@ -576,21 +627,28 @@ impl PrefetchState {
     }
 }
 
-/// Mask out (set to `-1`) the entries of `predicted` that are already
-/// resident in `hot` — they bind from RAM, so reading them would only
-/// spend SSD bandwidth.
-pub fn mask_hot(
+/// Of the first `n` guesses in `predicted` (strongest first), keep the
+/// ones not resident in `hot`, in order, at the front; set the rest
+/// to `-1`. [`PrefetchState::dispatch`] then reads the first
+/// `max_experts` of them — the strongest guesses that would otherwise
+/// be demand reads, rather than the strongest guesses minus the ones
+/// already resident (often all of them: the previous token's picks
+/// are mostly admitted to the tier by now).
+pub fn mask_hot_compact(
     hot: Option<&crate::riir::io::hot_tier::HotTier>,
     layer_idx: usize,
-    predicted: &mut [i32],
+    predicted: &mut [i32; MAX_K],
+    n: usize,
 ) {
-    if let Some(hot) = hot {
-        for e in predicted.iter_mut() {
-            if *e >= 0 && hot.contains(layer_idx, *e as usize) {
-                *e = -1;
-            }
+    let mut out = [-1i32; MAX_K];
+    let mut m = 0;
+    for &e in &predicted[..n.min(MAX_K)] {
+        if e >= 0 && !hot.is_some_and(|h| h.contains(layer_idx, e as usize)) && !out[..m].contains(&e) {
+            out[m] = e;
+            m += 1;
         }
     }
+    *predicted = out;
 }
 
 impl Drop for PrefetchState {
@@ -675,5 +733,31 @@ mod tests {
         tx.send((0, Ok(()))).unwrap();
         assert!(st.begin_layer(0).is_none());
         assert!(!st.in_flight_for(2));
+    }
+
+    #[test]
+    fn mask_hot_compact_keeps_the_strongest_non_resident_guesses() {
+        let mut g = [-1i32; MAX_K];
+        g[..6].copy_from_slice(&[5, -1, 7, 5, 2, 9]);
+        // No tier: negatives and repeats drop, order holds.
+        let mut a = g;
+        mask_hot_compact(None, 0, &mut a, 6);
+        assert_eq!(&a[..5], &[5, 7, 2, 9, -1]);
+        // Only the first n are candidates.
+        let mut a = g;
+        mask_hot_compact(None, 0, &mut a, 3);
+        assert_eq!(&a[..3], &[5, 7, -1]);
+        assert!(a[3..].iter().all(|&e| e == -1));
+        // Resident experts (5 and 2 of layer 1) drop; 9 moves up.
+        let dev = metal::Device::system_default().expect("Metal device");
+        let hot = crate::riir::io::hot_tier::HotTier::new(&dev, 4, 64, 2, 16).unwrap();
+        assert!(hot.offer(1, 5, &[0u8; 64]) && hot.offer(1, 2, &[0u8; 64]));
+        let mut a = g;
+        mask_hot_compact(Some(&hot), 1, &mut a, 6);
+        assert_eq!(&a[..3], &[7, 9, -1]);
+        // Another layer's residency doesn't count.
+        let mut a = g;
+        mask_hot_compact(Some(&hot), 0, &mut a, 6);
+        assert_eq!(&a[..5], &[5, 7, 2, 9, -1]);
     }
 }
