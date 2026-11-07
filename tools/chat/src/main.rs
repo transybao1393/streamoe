@@ -429,7 +429,8 @@ impl Chat {
         }
         head += "<|im_start|>user\n";
         let mut tail = format!("{msg}<|im_end|>\n<|im_start|>assistant\n");
-        tail += if think { "<think>\n" } else { "<think>\n\n</think>\n\n" };
+        // Qwen3-Next-Instruct's template has no think block.
+        tail += if cfg!(feature = "qnext") { "" } else if think { "<think>\n" } else { "<think>\n\n</think>\n\n" };
         // Qwen's chat template puts an image before the message text.
         let mut first = std::mem::take(&mut c.pending);
         first.extend(self.encode(&head));
@@ -847,7 +848,10 @@ fn main() {
     } else {
         None
     };
-    let tok = Tokenizer::from_file(base.join("mlx-4bit/tokenizer.json")).expect("tokenizer.json");
+    // The MLX download's tokenizer, or the copy next to a converted model.
+    let tok_path = [base.join("mlx-4bit/tokenizer.json"), base.join("tokenizer.json")]
+        .into_iter().find(|p| p.exists()).expect("tokenizer.json");
+    let tok = Tokenizer::from_file(tok_path).expect("tokenizer.json");
     eprintln!("[chat] opening {} (cap {:?} GiB, n_ctx {n_ctx}, kv {kv:?})", base.display(), cap);
     let t = Instant::now();
     let open = |cfg: &OpenConfig| Ctx::open_with(
