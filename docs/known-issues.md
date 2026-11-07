@@ -202,6 +202,21 @@ history of `.claude/memory/`, which is no longer tracked.
   chat at a 4 GiB cap, 4-bit → packed 3-bit: forward 118 → 89,
   146 → 115, 121 → 97 ms/token; first word 1.57 → 1.11, 1.38 → 0.92,
   1.36 → 0.90 s; hot tier 719 → 997 slots in the same memory.
+- **Qwen3.8-Flash-Next had 4-bit experts only**: its MoE (prefill and
+  decode) runs `Op::MoeBatchedPermuteFuse`, whose kernels and CPU path
+  assumed 4-bit, and the requant / pack tools hardcoded the 35B-A3B
+  shapes. The op now carries `bits` (a padded stride cannot tell the
+  layouts apart: the tiny model's 4-bit and packed experts both sit at
+  32,768 B); 3-bit always takes the gather GEMM
+  (`affine_gather_qmm_rhs` instantiated at b 3, gs 32, BM=32
+  tile), the CPU backend rewrites packed experts as nibbles; the tools
+  read shapes and the padded stride from `layout.json`. Packed 2.34 MiB
+  vs 2.93 MiB per expert (−20%: the group-32 scales do not shrink).
+  Tiny model: packed == nibble 3-bit bit for bit, CPU and Metal,
+  chunked prefill, a step per token, hot tier (`packed3_tests`,
+  `q38_engine::ctx_packed_3bit_matches_nibbles_under_cap`). Not yet
+  converted or run at full size; steps in
+  `tools/model_layer/qwen3_8_flash_next/README.md`.
 - **Old popularity held the hot tier for ~200 tokens**: counters
   halved every 65536 picks, ~205 tokens on a3b (40 layers × 8 picks),
   so after a topic change the previous topic's experts still beat the
@@ -298,6 +313,14 @@ history of `.claude/memory/`, which is no longer tracked.
   `STREAMMOE_MOE_GATHER_ID=0` fallbacks and the per-expert decode
   fallback (hidden > 4096, Cogito) have 4-bit kernels only. Every
   layer file must hold the same layout (`ExpertIoError::MixedLayouts`).
+  Qwen3.8-Flash-Next's permute-fuse MoE runs packed 3-bit through the
+  gather GEMM whatever `STREAMMOE_MOE_GATHER` says (its per-bucket
+  matvec fallback is 4-bit only).
+- **Qwen3.8-Flash-Next reads `ngram.mfng` from the experts
+  directory**, so a `root-3bit/` made by the tools needs the n-gram
+  table next to its `packed_experts/` (`ln root/ngram.mfng
+  root-3bit/`); without it the open fails. Padded experts need their
+  `layout.json` too: the tools copy it with the new size and stride.
 - **Quantization group size is compile-time, per variant and per
   bits** (`variants::group_size_for_bits`): 4-bit / packed 3-bit use
   `GROUP_SIZE` (64; 32 under `model-qwen3-8-flash-next`), 8-bit use
