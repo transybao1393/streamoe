@@ -281,6 +281,7 @@ fn run_gather_case_gs(
             n_tokens,
             stride_w: block_bytes as u64,
             stride_s: (block_bytes / 2) as u64,
+            bits: 4,
         },
     );
     cmd.commit();

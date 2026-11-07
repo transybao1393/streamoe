@@ -612,6 +612,11 @@ pub enum Op {
         /// Byte stride between consecutive expert blocks in
         /// `expert_base`.
         expert_stride: u64,
+        /// Expert weight width ([`crate::riir::variants::ExpertLayout`]):
+        /// 4, or 3 for packed 3-bit experts (the gather GEMM only — the
+        /// per-bucket matvec fallback is 4-bit). A padded stride does
+        /// not tell the two apart, so the producer says.
+        bits: u32,
         /// Per-assignment-row expert slot (`u32`). Length =
         /// `total_assignments`; the gather kernel's `indices`.
         expert_indices: BufId<ExpertIndicesBuf>,
@@ -1293,6 +1298,7 @@ mod tests {
             label: "moe_pf",
             expert_base: buf::<ExpertBaseBuf>(21),
             expert_stride: 0,
+            bits: 4,
             expert_indices: buf::<ExpertIndicesBuf>(35),
             expert_slots: vec![0],
             bucket_input: buf::<BucketInputBuf>(22),

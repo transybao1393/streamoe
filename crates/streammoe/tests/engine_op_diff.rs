@@ -626,6 +626,7 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
                 label: "engine_diff.permute_fuse",
                 expert_base: expert_base_id,
                 expert_stride: v.expert_size_4bit() as u64,
+                bits: 4,
                 expert_indices: scratch.expert_indices,
                 expert_slots: expert_slots.clone(),
                 bucket_input: scratch.bucket_input,

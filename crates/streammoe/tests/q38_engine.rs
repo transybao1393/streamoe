@@ -234,6 +234,71 @@ fn ctx_long_prompt_default_prefill_under_cap() {
     assert!(ctx.footprint().expect("footprint").current <= cap);
 }
 
+/// Packed 3-bit experts through the context: `tools/requant_experts.py`
+/// and `tools/pack_experts.py` (needs `python3` with NumPy) write
+/// 3-bit copies of the tiny experts under `CARGO_TARGET_TMPDIR`; the
+/// context detects each layout at open and, under a cap, gives the
+/// packed copy the nibble copy's logits bit for bit — a 560-token
+/// `eval_prompt` (prefill staging at the padded stride), then decode
+/// steps.
+#[test]
+fn ctx_packed_3bit_matches_nibbles_under_cap() {
+    let Some(dir) = tiny_dir() else {
+        eprintln!("[q38_engine] STREAMMOE_Q38_TINY unset: skipped");
+        return;
+    };
+    let m = dir.join("streammoe");
+    let a = m.join("artifacts");
+    let tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join("q38_packed_3bit");
+    let (nib, packed) = (tmp.join("root-3nib"), tmp.join("root-3bit"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let py = |args: &[&std::ffi::OsStr]| {
+        let st = std::process::Command::new("python3").arg("-I").args(args).status().expect("python3");
+        assert!(st.success(), "{args:?}");
+    };
+    let out = format!("3={}", nib.display());
+    py(&[tools.join("requant_experts.py").as_os_str(), m.join("root").as_os_str(), "--out".as_ref(), out.as_ref()]);
+    py(&[tools.join("pack_experts.py").as_os_str(), nib.as_os_str(), packed.as_os_str()]);
+    for d in [&nib, &packed] {
+        std::fs::copy(m.join("root/ngram.mfng"), d.join("ngram.mfng")).unwrap();
+    }
+    let cap = 2 * GIB;
+    let run = |root: &Path| {
+        let cfg = OpenConfig { n_ctx: 576, mem_cap: Some(cap), ..OpenConfig::default() };
+        let mut ctx = Ctx::open_with(
+            &a.join("model_weights.bin"),
+            &a.join("model_weights.json"),
+            &a.join("vocab.bin"),
+            root,
+            false,
+            &cfg,
+        )
+        .expect("open the tiny model");
+        let v = ctx.n_vocab();
+        let prompt: Vec<i32> = (0..560).map(|i| ((i * 37 + 5) % v) as i32).collect();
+        let mut rows = vec![vec![0.0f32; v]];
+        ctx.eval_prompt(&prompt, 0, 0, &mut rows[0]).unwrap();
+        for (i, t) in [5, 17, 300].into_iter().enumerate() {
+            let mut l = vec![0.0f32; v];
+            ctx.eval_token(t, prompt.len() + i, 0, &mut l).unwrap();
+            rows.push(l);
+        }
+        assert!(ctx.footprint().expect("footprint").current <= cap);
+        rows
+    };
+    let (a3, p3) = (run(&nib), run(&packed));
+    let same = a3.iter().zip(&p3).all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()));
+    assert!(same, "packed 3-bit logits differ from nibble 3-bit");
+    let q4 = run(&m.join("root"));
+    eprintln!(
+        "[q38_engine] packed 3-bit == nibble 3-bit over {} rows; vs 4-bit rel err {:.3e}",
+        a3.len(),
+        p3.iter().zip(&q4).map(|(x, y)| rel_err(x, y)).fold(0.0f32, f32::max)
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// What the family does not support is refused at open.
 #[test]
 fn ctx_rejects_unsupported_config() {

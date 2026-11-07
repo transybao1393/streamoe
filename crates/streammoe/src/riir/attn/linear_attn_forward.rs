@@ -3723,6 +3723,8 @@ impl MoeExperts {
                     label: "moe.permute_fuse",
                     expert_base,
                     expert_stride: moe.expert_stride,
+                    // Packed 3-bit takes the gather-id path above.
+                    bits: 4,
                     expert_indices: moe.expert_indices,
                     expert_slots,
                     bucket_input: moe.bucket_input,

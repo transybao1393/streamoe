@@ -25,7 +25,7 @@ use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::mlp_cpu::{MlpForwardError, shared_expert_swiglu_cpu};
 use crate::riir::moe::moe_router::{ExpertBuckets, MoeRouterError, noaux_tc_router_cpu};
-use crate::riir::variants::{GROUP_SIZE, VARIANT, Variant};
+use crate::riir::variants::{ExpertLayout, GROUP_SIZE, VARIANT, Variant};
 
 /// Errors specific to the CPU MoE forward.
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +217,31 @@ fn run_packed_expert_swiglu(
     }
     dequant_matvec_4bit_bytes_cpu(down_w, down_s, down_b, intermediate, hidden_dim, &gate, out)?;
     Ok(())
+}
+
+/// A packed 3-bit expert ([`ExpertLayout::Q3`], 8 codes per 3 bytes,
+/// code `i` at bits `3i..3i+3`) rewritten in the 4-bit layout (8
+/// nibbles per `u32`, low first), scales and biases copied. The 4-bit
+/// CPU path then computes exactly what the 3-bit kernels do: the codes
+/// and the affine `q * s + b` are the same.
+pub fn q3_expert_to_q4(blob: &[u8]) -> Vec<u8> {
+    let (q3, q4) = (ExpertLayout::Q3, ExpertLayout::Q4);
+    assert!(blob.len() >= q3.expert_size(), "packed 3-bit expert: {} bytes", blob.len());
+    let mut out = Vec::with_capacity(q4.expert_size());
+    for block in 0..3 {
+        let (w3, s3, _) = q3.offsets(block);
+        for p in blob[w3..s3].chunks_exact(3) {
+            let v = p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16;
+            let mut w = 0u32;
+            for i in 0..8 {
+                w |= ((v >> (3 * i)) & 7) << (4 * i);
+            }
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&blob[s3..s3 + 2 * VARIANT.expert_scale_bytes()]);
+    }
+    debug_assert_eq!(out.len(), q4.expert_size());
+    out
 }
 
 /// CPU oracle for the bucket-driven MoE permute-fuse Op

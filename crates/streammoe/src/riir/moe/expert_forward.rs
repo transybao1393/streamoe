@@ -1563,6 +1563,7 @@ pub fn encode_moe_batched_permute_fuse(
     bucket_accumulate: &ComputePipelineState,
     expert_base: &Buffer,
     expert_stride: u64,
+    layout: ExpertLayout,
     expert_indices: &Buffer,
     expert_slots: &[u32],
     bucket_input: &Buffer,
@@ -1578,15 +1579,18 @@ pub fn encode_moe_batched_permute_fuse(
     gather: bool,
 ) {
     debug_assert_eq!(expert_slots.len(), buckets.expert_ids.len());
-    // 4-bit blocks, packed or padded to a larger even stride (the
+    // `layout`'s blocks, packed or padded to a larger even stride (the
     // Qwen3.8-Flash-Next prefill staging holds them at the file's
     // padded stride); the kernels address expert `s` at `s · stride`.
+    let size = layout.expert_size() as u64;
     assert!(
-        expert_stride == ExpertLayout::Q4.expert_size() as u64
-            || (expert_stride > ExpertLayout::Q4.expert_size() as u64 && expert_stride % 16 == 0),
-        "[moe] permute-fuse prefill has 4-bit kernels only (packed 3-bit takes MoeGatherIdFuse); stride {expert_stride}"
+        expert_stride == size || (expert_stride > size && expert_stride % 16 == 0),
+        "[moe] permute-fuse: stride {expert_stride} for {}-bit experts of {size} B",
+        layout.bits
     );
-    if gather {
+    // The per-bucket matvec fallback has 4-bit kernels only; packed
+    // 3-bit always runs the gather GEMM.
+    if gather || layout.bits != 4 {
         encode_moe_gather(
             cmdbuf,
             kernels,
@@ -1594,6 +1598,7 @@ pub fn encode_moe_batched_permute_fuse(
             bucket_accumulate,
             expert_base,
             expert_stride,
+            layout,
             expert_indices,
             bucket_input,
             bucket_gate,
@@ -1705,6 +1710,7 @@ fn encode_moe_gather(
     bucket_accumulate: &ComputePipelineState,
     expert_base: &Buffer,
     expert_stride: u64,
+    layout: ExpertLayout,
     expert_indices: &Buffer,
     bucket_input: &Buffer,
     bucket_gate: &Buffer,
@@ -1758,24 +1764,30 @@ fn encode_moe_gather(
                 n_tokens: total,
                 stride_w: expert_stride,
                 stride_s,
+                bits: layout.bits,
             },
         );
     };
 
     // 1. gate, 2. up — bucket_input → bucket_gate / bucket_up.
+    let off = |block: usize| {
+        let (w, s, b) = layout.offsets(block);
+        (w as u64, s as u64, b as u64)
+    };
+    let ((gw, gs, gb), (uw, us, ub), (dw, ds, db)) = (off(0), off(1), off(2));
     gather(
-        v.gate_w_off_4bit() as u64,
-        v.gate_s_off_4bit() as u64,
-        v.gate_b_off_4bit() as u64,
+        gw,
+        gs,
+        gb,
         bucket_input,
         bucket_gate,
         hidden_dim,
         moe_inter,
     );
     gather(
-        v.up_w_off_4bit() as u64,
-        v.up_s_off_4bit() as u64,
-        v.up_b_off_4bit() as u64,
+        uw,
+        us,
+        ub,
         bucket_input,
         bucket_up,
         hidden_dim,
@@ -1795,9 +1807,9 @@ fn encode_moe_gather(
 
     // 4. down — bucket_act → bucket_out.
     gather(
-        v.down_w_off_4bit() as u64,
-        v.down_s_off_4bit() as u64,
-        v.down_b_off_4bit() as u64,
+        dw,
+        ds,
+        db,
         bucket_act,
         bucket_out,
         moe_inter,

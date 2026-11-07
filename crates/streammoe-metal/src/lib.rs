@@ -101,6 +101,9 @@ const QMM_T_UNALIGNED_GS32: &str = "affine_qmm_t_float_gs_32_b_4_alN_false_batch
 const GATHER_QMM_RHS: &str = "affine_gather_qmm_rhs_float_gs_64_b_4_t_true";
 /// The gathered GEMM at group size 32 (BM=32 tile only).
 const GATHER_QMM_RHS_GS32: &str = "affine_gather_qmm_rhs_float_gs_32_b_4_t_true";
+/// The gathered GEMM over packed 3-bit weights at group size 32 (BM=32
+/// tile only; Qwen3.8-Flash-Next's 3-bit experts).
+const GATHER_QMM_RHS_GS32_B3: &str = "affine_gather_qmm_rhs_float_gs_32_b_3_t_true";
 /// Experimental BM=64 / WM=4 variant of the gather kernel. Same
 /// alignment-flag PSO matrix as the BM=32 default; selected at
 /// runtime by [`gather_tile_variant`] (env `STREAMMOE_GATHER_QMM_TILE`).
@@ -412,6 +415,10 @@ pub struct GatherQmmCall<'a> {
     pub stride_w: u64,
     /// `ScaleT` (bf16) elements between consecutive experts' scale blocks.
     pub stride_s: u64,
+    /// Weight width: 4 (8 nibbles per `u32`), or 3 for packed 3-bit
+    /// experts (8 weights per 3 bytes, MLX's layout; group size 32 and
+    /// the BM=32 tile only).
+    pub bits: u32,
 }
 
 /// One FlashAttention-2 batched-prefill causal SDPA dispatch.
@@ -495,6 +502,9 @@ pub struct Kernels {
     gather: [ComputePipelineState; 8],
     /// `gather` at group size 32 (every tile variant uses it).
     gather_gs32: [ComputePipelineState; 8],
+    /// `gather_gs32` over packed 3-bit weights
+    /// ([`GatherQmmCall::bits`] = 3; every tile variant uses it).
+    gather_gs32_b3: [ComputePipelineState; 8],
     /// BM=64 / WM=4 variant of the gather kernel — same alignment-PSO
     /// matrix shape as `gather`. Selected at dispatch time by
     /// [`gather_tile_variant`]. All arrays always built; the extra
@@ -612,6 +622,8 @@ impl Kernels {
             build_gather_array(GATHER_QMM_RHS, QMM_T_THREADS_PER_GROUP)?;
         let gather_gs32 =
             build_gather_array(GATHER_QMM_RHS_GS32, QMM_T_THREADS_PER_GROUP)?;
+        let gather_gs32_b3 =
+            build_gather_array(GATHER_QMM_RHS_GS32_B3, QMM_T_THREADS_PER_GROUP)?;
         // BM=64/WM=4 variant runs 256 threads/threadgroup.
         let gather_bm64 = build_gather_array(GATHER_QMM_RHS_BM64, 256)?;
         // BM=16/WM=2 variant runs the same 128 threads/threadgroup as
@@ -637,6 +649,7 @@ impl Kernels {
             qmm_t_unaligned_gs32: build(QMM_T_UNALIGNED_GS32)?,
             gather,
             gather_gs32,
+            gather_gs32_b3,
             gather_bm64,
             gather_bm16,
             sdpa_va: build(SDPA_VA)?,
@@ -726,12 +739,14 @@ impl KernelCall for QmmCall<'_> {
 /// bounds-unsafe path. Encoding cannot fail.
 impl KernelCall for GatherQmmCall<'_> {
     fn encode(&self, kernels: &Kernels, cmdbuf: &CommandBufferRef) {
-        // Group size 32 is built for the default BM=32 tile only.
-        let variant = match self.weights.group_size {
-            64 => gather_tile_variant(),
-            32 => GatherTileVariant::Bm32Wm2,
-            gs => panic!(
-                "GatherQmmCall: no gather_qmm for group_size {gs}; built: {QMM_GROUP_SIZES:?}"
+        // Group size 32 and 3-bit (gs 32 only) are built for the default
+        // BM=32 tile only.
+        let variant = match (self.weights.group_size, self.bits) {
+            (64, 4) => gather_tile_variant(),
+            (32, 4) | (32, 3) => GatherTileVariant::Bm32Wm2,
+            (gs, bits) => panic!(
+                "GatherQmmCall: no gather_qmm for group_size {gs} at {bits} bits; built: \
+                 {QMM_GROUP_SIZES:?} at 4 bits, 32 at 3 bits"
             ),
         };
         let bm = variant.bm();
@@ -743,6 +758,7 @@ impl KernelCall for GatherQmmCall<'_> {
             | (usize::from(align_n) << 1)
             | (usize::from(align_k) << 2);
         let pipeline = match variant {
+            GatherTileVariant::Bm32Wm2 if self.bits == 3 => &kernels.gather_gs32_b3[idx],
             GatherTileVariant::Bm32Wm2 if self.weights.group_size == 32 => {
                 &kernels.gather_gs32[idx]
             }
