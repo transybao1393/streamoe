@@ -107,7 +107,7 @@ still change before 0.2.0; changes are listed in
 | Vision for Qwen3.5 / 3.6 | Implemented; matches transformers (cosine 1.000000) |
 | Packed 3-bit experts | Implemented; KL 0.048 vs 4-bit, 10/10 scored tasks |
 | Several tokens per pass (parallel requests, speculative checks) | Implemented; 1.3× throughput with 4 requests |
-| Models | Qwen3.6-35B-A3B tested; Qwen3.5-397B-A17B runs in 9 GiB (0.53 tok/s, [below](#running-qwen35-397b-a17b-in-9-gib)); Qwen3.8-Flash-Next runs in 6 GiB (1.41 tok/s, [below](#running-qwen38-flash-next-in-6-gib)); Qwen3-Next-80B-A3B runs in 6 GiB (4.6 tok/s, [below](#running-qwen3-next-80b-a3b-in-6-gib)); Cogito-V2, OLMoE-1B-7B variants build |
+| Models | Qwen3.6-35B-A3B tested; Qwen3.5-397B-A17B runs in 9 GiB (0.53 tok/s, [below](#running-qwen35-397b-a17b-in-9-gib)); Qwen3.8-Flash-Next runs in 6 GiB (1.41 tok/s, [below](#running-qwen38-flash-next-in-6-gib)); Qwen3-Next-80B-A3B runs in 6 GiB (4.6 tok/s; 6.3 with packed 3-bit experts, [below](#running-qwen3-next-80b-a3b-in-6-gib)); Cogito-V2, OLMoE-1B-7B variants build |
 | Router policy, per-expert precision | Planned |
 
 The full table, how each part was tested, and the last test run are in
@@ -513,7 +513,7 @@ prompt reads each layer once.
 ## Running Qwen3-Next-80B-A3B in 6 GiB
 
 <details>
-<summary><b>Qwen3-Next-80B-A3B</b>: 3B active of 80B, 42 GiB on disk, runs in 6 GiB from an external SSD: <b>4.6 tok/s</b>, prompts at <b>46 tok/s</b>, the fastest large model on this Mac (first real run, 2026-11-07)</summary>
+<summary><b>Qwen3-Next-80B-A3B</b>: 3B active of 80B, 42 GiB on disk, runs in 6 GiB from an external SSD: <b>4.6 tok/s</b>, prompts at <b>46 tok/s</b>; with packed 3-bit experts <b>6.3 tok/s</b> in 6 GiB and <b>8.5 tok/s</b> in 9 GiB, the fastest large model on this Mac (2026-11-07)</summary>
 
 <br>
 
@@ -534,6 +534,7 @@ At 4-bit it is **41.8 GiB** on disk:
 | --- | --- | --- |
 | Experts: 48 layers × 512, 1.69 MiB each (same as the 35B-A3B) | 40.5 GiB | Streamed from the SSD; the hottest in the hot tier |
 | Everything else | 1.26 GiB | In RAM (1.10 GiB with the embedding streamed) |
+| Optional packed 3-bit experts: 1.31 MiB each | 31.5 GiB more | `root-3bit/`, read instead of `root/` |
 
 *Setup: standard, except: model on the same external SSD as the 397B
 (Kingston NV3 500 GB, QLC, USB4 enclosure), 4-bit experts, 6 GiB cap,
@@ -571,10 +572,50 @@ Against the other large models on the same drive:
   experts of 1.69 MiB, 58% of Flash-Next's bytes, and the same
   cap holds 2.6× as many of them.
 - **Prefetch doesn't help here.** The guess was right for 122 of the
-  7,451 experts it read ahead (1.6%); turning it off is still to be
-  measured.
+  7,451 experts it read ahead (1.6%). Off vs on, same prompt and cap:
+  3.76 vs 3.83 tok/s, within run-to-run noise. The chat page's
+  default (prefetch 6, cross-layer guess) ran at 0.4–0.5 tok/s for
+  this model; `--prefetch 0 --guess prev` brings it to 3.6 tok/s.
 - The conversion took 15 min (912 s) for 9 shards, every tensor read
   back and hash-checked.
+
+**Packed 3-bit experts and bigger caps.** Requantized from the 4-bit
+experts with `tools/requant_experts.py` and packed with
+`tools/pack_experts.py`, the same as the 35B-A3B (21 min on the SSD;
+steps in `tools/model_layer/qwen3_next/README.md`). The shapes match
+the 35B-A3B's, so the tools and the engine need no changes.
+
+*Setup: as above, except: prefetch off, Safari open, 4-bit and 3-bit
+measured in the same session, 2026-11-07, build `4ff0303`.* This
+session's 4-bit numbers are lower than the first run's (3.70 vs 4.64
+tok/s at 6 GiB); the first run had more free memory.
+
+| Cap | Hot tier 4-bit / 3-bit | tok/s 4-bit | tok/s 3-bit | Prompt 4-bit | Prompt 3-bit | Peak memory (3-bit) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 6 GiB | 1,743 / 2,387 | 3.70 | **6.32** | 40.2 tok/s | 56.7 tok/s | 5.54 GiB |
+| 8 GiB | 2,956 / 3,947 | 4.55 | **7.90** | 39.4 tok/s | 57.2 tok/s | 7.54 GiB |
+| 9 GiB | 3,563 / 4,727 | 4.89 | **8.54** | 40.3 tok/s | 58.4 tok/s | 8.53 GiB |
+
+(979-token prompt, 48 tokens generated.) 3-bit gains far more here
+(+71% at 6 GiB) than on the 35B-A3B (11–14%): decode on this model
+waits on the SSD for about 60% of each token, and 3-bit both shrinks
+each read by 22% and lets the same cap hold 37% more experts, so fewer
+are read. A bigger cap helps either way; prompt speed doesn't depend
+on it.
+
+Quality against 4-bit (`tools/chat` `quality`, 4 forced texts of 204
+tokens and 6 scored generation tasks, 8 GiB cap):
+
+| | 4-bit | Packed 3-bit |
+| --- | --- | --- |
+| Scored tasks (arithmetic, fact, JSON, tool call, trick question, fact) | 6/6 | 6/6 |
+| Perplexity on the forced texts | 7.64 | 7.62 |
+| KL vs 4-bit / same top token | — | 0.048 / 93% |
+
+The KL matches the 35B-A3B's (0.048). Long answers stay on topic but
+the wording drifts: on the 979-token summary the first 11 tokens
+match, then 3-bit writes "poorly optimized pick routes" where 4-bit
+writes "inefficient pick routing".
 
 **Correctness.** On a tiny random-weight model with the same layout
 (fused projections, 8-bit router), against a pure-PyTorch port of the
@@ -590,8 +631,13 @@ M="/Volumes/External NVMe M2 PCIe 4.0/models/qwen3-next-80b-a3b"
 hf download mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit --local-dir "$M/mlx-4bit"   # 44.8 GB
 python3 -I tools/model_layer/qwen3_next/convert.py --source "$M/mlx-4bit" --out "$M"   # add --delete-source to drop shards as they're verified
 
+# optional: packed 3-bit experts (31.5 GiB more disk, ~1.7x faster at 6 GiB)
+python3 -I tools/requant_experts.py "$M/root" --layers 48 --out 3="$M/root-3bit-nibble"
+python3 -I tools/pack_experts.py "$M/root-3bit-nibble" "$M/root-3bit" && rm -r "$M/root-3bit-nibble"
+
 cd tools/chat && cargo run --release --no-default-features --features qnext -- \
-    --model "$M" --cap-gib 6 --n-ctx 4096 --no-vision --no-prefill-while-typing
+    --model "$M" --cap-gib 6 --n-ctx 4096 --no-vision --no-prefill-while-typing \
+    --prefetch 0 --guess prev --precision 3   # --precision 4 for the 4-bit experts
 ```
 
 Two downloads with `hf` stalled after the last byte and one left a
