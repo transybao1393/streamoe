@@ -18,7 +18,7 @@ use crate::riir::backend::gpu::MetalBackend;
 use crate::riir::io::expert_io::ExpertFiles;
 use crate::riir::io::expert_io_mode::ExpertIoMode;
 use crate::riir::io::hot_tier::HotTier;
-use crate::riir::io::prefetch::PrefetchState;
+use crate::riir::io::prefetch::{PrefetchGuess, PrefetchState};
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::variants::VARIANT;
 use crate::riir::{MetalContext, MtlWeightBuf};
@@ -50,12 +50,19 @@ fn experts(dir: &Path, hot_slots: usize) -> ExpertFiles {
     e
 }
 
-/// Prefetch reading `n` experts per layer (`None`: off).
+/// Prefetch reading `n` experts per layer (`None`: off), guessed the
+/// previous token's way.
 fn prefetch(n: Option<usize>, lookahead: bool) -> Option<PrefetchState> {
+    prefetch_with(n, lookahead, PrefetchGuess::PrevToken)
+}
+
+/// [`prefetch`] with the guess `guess`.
+fn prefetch_with(n: Option<usize>, lookahead: bool, guess: PrefetchGuess) -> Option<PrefetchState> {
     n.map(|n| {
         let mut p = PrefetchState::new(VARIANT.num_layers, ExpertIoMode::Pread);
         p.set_max_experts(n);
         p.set_lookahead(lookahead);
+        p.set_guess(guess);
         p
     })
 }
@@ -80,14 +87,20 @@ fn same_bits(a: &[Vec<f32>], b: &[Vec<f32>]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()))
 }
 
-/// The arms: (label, prefetch experts, lookahead, hot-tier slots).
-const ARMS: [(&str, Option<usize>, bool, usize); 6] = [
-    ("off", None, false, 0),
-    ("prefetch all", Some(16), false, 0),
-    ("prefetch 1 + lookahead", Some(1), true, 0),
-    ("hot tier", None, false, 12),
-    ("prefetch all + hot tier", Some(16), false, 12),
-    ("prefetch 1 + lookahead + hot tier", Some(1), true, 12),
+const PREV: PrefetchGuess = PrefetchGuess::PrevToken;
+const CROSS: PrefetchGuess = PrefetchGuess::CrossLayer;
+
+/// The arms: (label, prefetch experts, lookahead, hot-tier slots, guess).
+const ARMS: [(&str, Option<usize>, bool, usize, PrefetchGuess); 9] = [
+    ("off", None, false, 0, PREV),
+    ("prefetch all", Some(16), false, 0, PREV),
+    ("prefetch 1 + lookahead", Some(1), true, 0, PREV),
+    ("hot tier", None, false, 12, PREV),
+    ("prefetch all + hot tier", Some(16), false, 12, PREV),
+    ("prefetch 1 + lookahead + hot tier", Some(1), true, 12, PREV),
+    ("cross 2", Some(2), false, 0, CROSS),
+    ("cross all", Some(16), false, 0, CROSS),
+    ("cross 2 + hot tier", Some(2), false, 12, CROSS),
 ];
 
 /// Metal: every arm's logits equal the "off" arm's bit for bit; the
@@ -101,10 +114,11 @@ fn prefetch_and_hot_tier_do_not_change_logits_metal() {
     let gs = goldens(&dir);
     let wf = open_wf(&dir);
     let mut base: Option<Vec<Vec<f32>>> = None;
-    for (label, n, ahead, hot) in ARMS {
+    for (label, n, ahead, hot, guess) in ARMS {
         let ex = experts(&dir, hot);
         let mut b = metal(&dir);
-        let mut e = Q38Engine::with_prefetch(&mut b, &wf, &root(&dir), 64, ex.expert_size(), prefetch(n, ahead)).unwrap();
+        let pf = prefetch_with(n, ahead, guess);
+        let mut e = Q38Engine::with_prefetch(&mut b, &wf, &root(&dir), 64, ex.expert_size(), pf).unwrap();
         e.set_qsa_mode(QsaMode::Sparse);
         let rows = run_all(&mut e, &mut b, &wf, &ex, &gs);
         let (hits, misses) = e.prefetch_stats();
@@ -112,7 +126,8 @@ fn prefetch_and_hot_tier_do_not_change_logits_metal() {
         let h = st.hot.unwrap_or_default();
         eprintln!(
             "[q38 prefetch] {label}: prefetch hits {hits} misses {misses} (slots/set {}), prefetch reads {} \
-             (used {}), demand reads {}, hot hits {} misses {} admissions {} resident {}/{}, guess {}/{}",
+             (used {}), demand reads {}, hot hits {} misses {} admissions {} resident {}/{}, guess prev {}/{} \
+             cross {}/{}",
             e.prefetch_slots(),
             st.prefetch.reads,
             st.prefetch_hits,
@@ -124,7 +139,14 @@ fn prefetch_and_hot_tier_do_not_change_logits_metal() {
             h.capacity,
             st.guess_prev.correct,
             st.guess_prev.guessed,
+            st.guess_cross.correct,
+            st.guess_cross.guessed,
         );
+        if guess == CROSS {
+            assert!(st.guess_cross.guessed > 0, "{label}: cross guess never scored");
+        } else {
+            assert_eq!(st.guess_cross.guessed, 0, "{label}");
+        }
         if n.is_some() {
             assert!(hits > 0, "{label}: no prefetch hits");
             assert!(st.prefetch.reads > 0, "{label}: no prefetch reads");
@@ -151,15 +173,17 @@ fn prefetch_and_hot_tier_do_not_change_logits_cpu() {
     let gs: Vec<Golden> = goldens(&dir).into_iter().take(1).collect();
     let wf = open_wf(&dir);
     let mut out = Vec::new();
-    for (n, hot) in [(None, 0), (Some(16), 12)] {
+    for (n, hot, ahead, guess) in [(None, 0, true, PREV), (Some(16), 12, true, PREV), (Some(2), 12, false, CROSS)] {
         let ex = experts(&dir, hot);
         let mut b = CpuBackend::new(open_wf(&dir));
-        let mut e = Q38Engine::with_prefetch(&mut b, &wf, &root(&dir), 64, ex.expert_size(), prefetch(n, true)).unwrap();
+        let pf = prefetch_with(n, ahead, guess);
+        let mut e = Q38Engine::with_prefetch(&mut b, &wf, &root(&dir), 64, ex.expert_size(), pf).unwrap();
         e.set_qsa_mode(QsaMode::Sparse);
         out.push(run_all(&mut e, &mut b, &wf, &ex, &gs));
-        eprintln!("[q38 prefetch] cpu {n:?}: prefetch {:?}", e.prefetch_stats());
+        eprintln!("[q38 prefetch] cpu {n:?} {guess:?}: prefetch {:?}", e.prefetch_stats());
     }
     assert!(same_bits(&out[0], &out[1]), "CPU: prefetch + hot tier changed the logits");
+    assert!(same_bits(&out[0], &out[2]), "CPU: the cross-layer guess changed the logits");
 }
 
 /// The staging buffer the engine allocates is what the plan counts:
