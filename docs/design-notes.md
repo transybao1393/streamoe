@@ -19,6 +19,7 @@ external SSD (Kingston NV3 in a USB4 enclosure, ~2.3–2.6 GB/s) under a
 - [Experts a prompt drags in](#experts-a-prompt-drags-in)
 - [Prefill lifecycle](#prefill-lifecycle)
 - [Right and wrong guesses](#right-and-wrong-guesses)
+- [Cross-layer guess on Qwen3-Next and Flash-Next](#cross-layer-guess-on-qwen3-next-and-flash-next)
 - [Splitting expert math between CPU and GPU](#splitting-expert-math-between-cpu-and-gpu)
 - [Expert layout on disk](#expert-layout-on-disk)
 - [On a 128 GB DGX Spark](#on-a-128-gb-dgx-spark)
@@ -284,6 +285,107 @@ thinking off, `--prefetch 6`, cross-layer guess, three standard prompts
   `budget_cap` 11/11, `mlx_regression` 1/1, `batched_diff_oracle` 33/33
   (2026-11-06), as with them off.
 
+## Cross-layer guess on Qwen3-Next and Flash-Next
+
+**Replayed, then measured** (2026-11-07). The question: which guess
+lets decode prefetch read the next layer's experts early and have them
+used, on Qwen3-Next-80B-A3B and Qwen3.8-Flash-Next (512 experts, top
+10, 48 layers each)?
+
+**Why the previous-token guess fails here.** The engine drops guesses
+already in the hot tier, and the previous token's picks of a layer are
+by then mostly in the tier (they were just read and admitted). What is
+left is the rare pick, and it rarely repeats: on Qwen3-Next the
+previous-token guess reads ~5 experts per token and 17% of them are
+used (the "1.6%" in the first report was hits over all demand reads).
+Topping the guess up from the weaker picks (read the first N non-hot
+ones) doesn't help: 26% of those reads were used on Flash-Next and
+decode fell 1.01 → 0.42 tok/s. That top-up is kept for the cross guess
+only.
+
+**Replay.** `STREAMMOE_GUESS_TRACE` logs, per decode layer, the
+residual a guess starts from, the picks and the hot-tier residency;
+`tools/sim_prefetch_guess.py` replays guessers at N reads per layer,
+skipping hot-tier experts as the engine does. *Setup: 979-token prompt
+(`b.ids`), 47 greedy decode tokens, 6 GiB cap, layers 2–47; Qwen3-Next
+packed 3-bit (2,387 hot slots, 104 of 460 picks per token not hot),
+Flash-Next 4-bit (683 hot slots, 313 of 460 not hot).* hits / reads
+per token, and the share of non-hot picks covered:
+
+| Guess | N | Qwen3-Next | Flash-Next |
+| --- | --- | --- | --- |
+| previous token | 4 | 0.8 / 4.7 (17%), covers 1% | 44.8 / 167.9 (27%), 14% |
+| cross: L's router on L−1's residual | 1 | 34.0 / 46 (74%), 33% | 38.0 / 46 (83%), 12% |
+| cross | 2 | 57.6 / 92 (63%), 56% | 72.2 / 92 (79%), 23% |
+| cross | 4 | 83.2 / 184 (45%), 80% | 126.3 / 184 (69%), 40% |
+| cross | 6 | 94.0 / 276 (34%), 91% | 163.9 / 276 (59%), 52% |
+| cross from L−2 (two ahead) | 4 | 77.8 / 184 (42%), 75% | 107.0 / 184 (58%), 34% |
+| transition table learned online | 4 | 15.6 / 160 (10%), 15% | 59.2 / 181 (33%), 19% |
+| cross, router probability ≥ 0.01 | 6 | 84.2 / 133 (63%), 81% | 92.9 / 112 (83%), 30% |
+| perfect guess | 4 | 90.3 / 90.3, 87% | 176.6 / 176.6, 56% |
+
+In the engine the cross guess's top 10 overlaps the router's picks by
+85% on Qwen3-Next (previous token 38%) and 62% on Flash-Next (32%).
+Two layers ahead is nearly as good (more time to read, not tried in
+the engine); 47 tokens are too few for a transition table; boosting
+the previous token's picks inside the cross ranking only lost.
+
+**What runs.** Qwen3-Next (qwen3_5_moe path) already had
+`CrossLayerGuesser` on the CPU; it now ranks 16 candidates and reads
+the strongest `prefetch_experts` that are not in the hot tier (it used
+to drop resident ones from its top `prefetch_experts`, often leaving
+1–2), and its 512 × 2048 8-bit gate matvec is vectorized (1.49 →
+0.34 ms per layer, ~72 → ~16 ms per token). Flash-Next's engine runs
+layer L+1's router on layer L's MoE input on the GPU, in the router's
+command buffer (one more matvec, 4 KiB more readback), and issues the
+reads as soon as layer L's own reads land, so they also run under layer
+L's expert compute.
+
+**Measured.** *Setup: real models from the external SSD, 6 GiB cap,
+`b.ids` prompt, 48 greedy tokens, decode tok/s over steps 3–48, n_ctx
+4096, checkpoints off, runner `tmp/qnrun` / `tmp/q38run` (Ctx +
+`eval_token`); prefetch 4 per layer unless noted. The host was shared
+with other agents: single runs swing up to 2× (a pf0 run at 1.79 next
+to 5.83), so each cell lists every run and the comparison is the
+median; output tokens identical in every run of a model (19 Qwen3-Next
+3-bit, 15 4-bit, 13 Flash-Next runs).*
+
+| Model | Prefetch off | Previous token | Cross 4 | Cross 6 |
+| --- | --- | --- | --- | --- |
+| Qwen3-Next 3-bit | 4.69, 4.77, 5.83 → **4.77** | 4.82, 6.03, 4.86 → **4.86** | 5.43, 5.53, 6.36, 6.23, 6.26 → **6.23** | 4.94, 5.08 |
+| Qwen3-Next 4-bit | 4.03, 3.52, 4.07, 3.93, 3.96 → **3.96** | 3.99, 4.07, 3.98, 2.12, 2.01, 2.02 → **3.0** | 4.45, 4.39, 4.47, 3.54, 3.22, 4.53, 4.41, 4.44, 4.46, 4.46, 4.44 → **4.44** | 4.18 |
+| Flash-Next 4-bit | 1.01, 1.09, 1.17 → **1.09** | 0.80, 1.22 → ~1.0 | 1.34, 1.46, 1.46, 1.46 → **1.46** | 1.30, 1.23 |
+
+Left out as host-load outliers (a whole run at about half speed):
+Qwen3-Next 3-bit pf0 1.79 and cross 3.76, 4-bit pf0 2.70 (a build ran
+alongside) and cross 2.41. The 4-bit previous-token guess fell to ~2.0
+in 3 of 6 runs, in two different batches, while the arms around it
+held; it is kept in its median and is worth a closer look. Cross 4
+against prefetch off: **+31%** (3-bit), **+12%** (4-bit), **+34%**
+(Flash-Next). It reads more bytes than it
+saves (Qwen3-Next 3-bit: 7.3k prefetch reads, 4.1k used, demand reads
+5.8k → 1.6k per 46 tokens) but moves most reads off the critical
+path. Six guesses read too many wrong ones on these disks; 4 is the
+better setting. `STREAMMOE_PREFETCH_MIN_P=0.01` with 6 guesses read
+12% fewer bytes than cross 6 at the speed of cross 4 (5.44, one run).
+
+Tried and left opt-in (within noise): issuing the qwen3_5_moe path's
+cross prefetch right after a layer's expert dispatch instead of at the
+top of the next layer (`STREAMMOE_CROSS_EARLY=1`: 4.94 vs 5.08 tok/s,
+3-bit, cross 6), and a thread pool of the prefetch's own so demand
+reads never queue behind guesses (`STREAMMOE_PREFETCH_THREADS=4`:
+Qwen3-Next 4-bit cross 4.44 / 4.46 own vs 4.44 / 4.46 shared,
+previous token 4.07 / 3.98 vs 3.99; Flash-Next 1.460 vs 1.463).
+
+**The chat page's 8× slowdown** (0.4 vs 3.6 tok/s with its default
+`--prefetch 6`, cross guess; recorded without a setup or log) did not
+reproduce: in the decode runner the cross guess was faster than
+prefetch off in every clean batch, on both precisions. What the old
+code did cost: the serial gate matvec (~72 ms per token, now ~16) and
+6 guesses instead of 4 (−6% here). The half-speed runs above show the
+host alone can halve a run; a chat-page run with a server log is
+needed to say more.
+
 ## Splitting expert math between CPU and GPU
 
 **Estimated.** Not worth building for the 397B. Of a ~1.9 s token,
@@ -444,8 +546,13 @@ to its router; with `prefetch_lookahead`, layer L+1's go out right
 after layer L's router readback. A routed expert found in the set binds
 that slot directly. Settings and defaults are the context's (all K
 uncapped, 4 under a cap, `prefetch_experts = 0` turns it off); the plan
-counts the `2P` extra slots. Not used: the cross-layer guesser (GQA
-only) and switches A/B/C (on a separate branch, not merged here).
+counts the `2P` extra slots. With `PrefetchGuess::CrossLayer` (no
+lookahead) the guess for layer L+1 is layer L+1's router run on layer
+L's MoE input, on the GPU in layer L's router command buffer, and its
+reads go out as soon as layer L's own reads land: see [Cross-layer
+guess on Qwen3-Next and
+Flash-Next](#cross-layer-guess-on-qwen3-next-and-flash-next). Not
+used: switches A/B/C (on a separate branch, not merged here).
 Everything in flight is drained at the end of each token.
 
 Measured on the tiny model (4 layers × 8 experts, top 3; 13 + 8 tokens
