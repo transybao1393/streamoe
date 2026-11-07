@@ -471,6 +471,14 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// Expert groups per batched MoE layer whose staging overlaps the
     /// GPU ([`OpenConfig::resolved_prefill_overlap_groups`]); 0 = off.
     prefill_overlap_groups: usize,
+    /// Prefill chunks per layer-major window
+    /// ([`OpenConfig::layer_major`], resolved at open against `n_ctx`
+    /// and the cap); 0 = off.
+    layer_major_chunks: usize,
+    /// Layer-major prefill buffers ([`budget::Account::LayerMajor`]).
+    /// Built by [`Self::ensure_linear_resources`] when
+    /// `layer_major_chunks > 0`.
+    layer_major: Option<attn::linear_attn_forward::LayerMajorScratch>,
     /// Under a cap: the plan total less `runtime_overhead`, i.e. every
     /// byte the plan accounts for exactly. The open-time log reports
     /// the measured footprint above it as `unplanned`.
@@ -493,6 +501,195 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     #[cfg(feature = "model-qwen3-8-flash-next")]
     q38: q38_ctx::Q38Slot,
     // Future phases populate: vocab.
+}
+
+/// Copy `bytes` between two shared-storage pool buffers. Only while
+/// the GPU is idle on both (every batched-prefill graph commits and
+/// waits before the orchestrator moves rows).
+fn copy_buffer_bytes(src: &Buffer, src_off: usize, dst: &Buffer, dst_off: usize, bytes: usize) {
+    assert!(src_off + bytes <= src.length() as usize && dst_off + bytes <= dst.length() as usize);
+    // SAFETY: both ranges are inside live shared-storage buffers
+    // (checked above), no GPU work touches them, and distinct pool
+    // buffers never overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (src.contents() as *const u8).add(src_off),
+            (dst.contents() as *mut u8).add(dst_off),
+            bytes,
+        );
+    }
+}
+
+/// Batched-prefill head: the GPU embedding gather of `tokens` (at most
+/// one prefill chunk) into `hidden_out` — from the resident table, or
+/// with a streamed embedding from the rows read into `embed_rows`.
+fn embed_head(
+    wf: &WeightFile,
+    backend: &mut MetalBackend,
+    embed_rows: Option<BufId<EmbedRowsBuf>>,
+    head_tail_scratch: &attn::linear_attn_forward::HeadTailScratch,
+    io_pool: &rayon::ThreadPool,
+    tokens: &[i32],
+    hidden_a_id: BufId<backend::buftype::HiddenBuf>,
+) -> Result<(), RsError> {
+    let v = VARIANT;
+    let n = tokens.len();
+    let hidden_dim = v.hidden_dim;
+    let embed_off = |name: &str| -> Result<u64, RsError> {
+        wf.tensor_info(name)
+            .map(|t| t.offset)
+            .ok_or(RsError::EvalFailed)
+    };
+    // Streamed embedding: read the chunk's raw rows (cache or
+    // disk), upload them as `[weight | scales | biases]` rows,
+    // and gather from them with ids 0..n — the same kernel over
+    // the same bytes, so bit-identical to the resident table.
+    let (embed_weight, rows_id, ids): (WeightRef, Option<BufId<EmbedRowsBuf>>, std::borrow::Cow<'_, [i32]>) =
+        match wf.embed_stream() {
+            Some(stream) => {
+                let g = stream.geometry();
+                let rows_id = embed_rows.ok_or(RsError::EvalFailed)?;
+                let rb = g.row_bytes();
+                let mut raw = vec![0u8; n * rb];
+                stream
+                    .rows(tokens, &mut raw, Some(io_pool))
+                    .map_err(|_| RsError::EvalFailed)?;
+                // Interleaved rows → three planes.
+                let mut planes = vec![0u8; n * rb];
+                let (pw, ps) = planes.split_at_mut(n * g.w_row);
+                let (ps, pb) = ps.split_at_mut(n * g.sb_row);
+                for (t, row) in raw.chunks_exact(rb).enumerate() {
+                    pw[t * g.w_row..(t + 1) * g.w_row].copy_from_slice(&row[..g.w_row]);
+                    ps[t * g.sb_row..(t + 1) * g.sb_row]
+                        .copy_from_slice(&row[g.w_row..g.w_row + g.sb_row]);
+                    pb[t * g.sb_row..(t + 1) * g.sb_row].copy_from_slice(&row[g.w_row + g.sb_row..]);
+                }
+                backend
+                    .pool_mut()
+                    .upload(rows_id, &planes)
+                    .map_err(|_| RsError::EvalFailed)?;
+                let weight = WeightRef {
+                    w_off: 0,
+                    s_off: (n * g.w_row) as u64,
+                    b_off: (n * (g.w_row + g.sb_row)) as u64,
+                    bits: 4,
+                };
+                (weight, Some(rows_id), (0..n as i32).collect::<Vec<_>>().into())
+            }
+            None => {
+                let weight = WeightRef {
+                    w_off: embed_off("model.embed_tokens.weight")?,
+                    s_off: embed_off("model.embed_tokens.scales")?,
+                    b_off: embed_off("model.embed_tokens.biases")?,
+                    bits: 4,
+                };
+                (weight, None, tokens.into())
+            }
+        };
+    backend
+        .pool_mut()
+        .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(&ids))
+        .expect("pool upload token ids");
+    let mut g_head = Graph::new();
+    // The head writes the embedding-gather output into the
+    // run-lifetime `hidden_a` slot of the cross-layer double-
+    // buffer (`BufId<HiddenBuf>`). The Op's `hidden_out` slot is
+    // typed `BufId<EmbedOutBuf>` — same physical role at the
+    // top of the model, with a dedicated `From<HiddenBuf> for
+    // BufId<EmbedOutBuf>` impl that documents the bridge here.
+    g_head.push(Op::EmbedGatherNTokens {
+        label: "embed_gather",
+        token_ids: head_tail_scratch.token_ids,
+        weight: embed_weight,
+        rows: rows_id,
+        hidden_out: hidden_a_id.into(),
+        hidden_dim: hidden_dim as u32,
+        n_tokens: n as u32,
+    });
+    backend
+        .execute(&g_head, "graph_head")
+        .map_err(|_| RsError::EvalFailed)?;
+    Ok(())
+}
+
+/// Batched-prefill tail: final norm of the `n` rows in `hidden_a_id`
+/// into `hidden_b_id`, then the LM head on the last row into `logits`.
+fn lm_tail(
+    wf: &WeightFile,
+    backend: &mut MetalBackend,
+    head_tail_scratch: &attn::linear_attn_forward::HeadTailScratch,
+    hidden_a_id: BufId<backend::buftype::HiddenBuf>,
+    hidden_b_id: BufId<backend::buftype::HiddenBuf>,
+    n: usize,
+    logits: &mut [f32],
+) -> Result<(), RsError> {
+    let v = VARIANT;
+    let hidden_dim = v.hidden_dim;
+    let norm_off = wf
+        .tensor_info("model.norm.weight")
+        .map(|t| t.offset)
+        .ok_or(RsError::EvalFailed)?;
+    let lm_off = |name: &str| -> Result<u64, RsError> {
+        wf.tensor_info(name)
+            .map(|t| t.offset)
+            .ok_or(RsError::EvalFailed)
+    };
+    let lm_head_weight = WeightRef {
+        w_off: lm_off("lm_head.weight")?,
+        s_off: lm_off("lm_head.scales")?,
+        b_off: lm_off("lm_head.biases")?,
+        bits: 4,
+    };
+    let mut g_tail = Graph::new();
+    g_tail.push(Op::RmsNormBf16NTokens {
+        label: "final_norm",
+        // Last layer wrote into `hidden_a`; norm reads it
+        // (HiddenBuf → RmsNormIn) and writes the post-norm
+        // value into `hidden_b` (HiddenBuf → TailNormedBuf →
+        // RmsNormOut, via the union impl).
+        x: hidden_a_id.into(),
+        weight_off: norm_off,
+        out: {
+            // Two-step to RmsNormOut: HiddenBuf → TailNormedBuf
+            // → RmsNormOut. Documented in buftype.rs above
+            // the `HiddenBuf -> TailNormedBuf` impl.
+            let tail: crate::riir::backend::BufId<
+                crate::riir::backend::buftype::TailNormedBuf,
+            > = hidden_b_id.into();
+            tail.into()
+        },
+        dim: hidden_dim as u32,
+        n_tokens: n as u32,
+        eps: variants::RMS_NORM_EPS,
+    });
+    g_tail.push(Op::MatvecNTokens {
+        label: "lm_head",
+        weight: lm_head_weight,
+        // lm_head matvec reads the tail-normed buffer (we just
+        // wrote it through `final_norm`). HiddenBuf →
+        // TailNormedBuf → MatvecIn via the `TailNormedBuf ->
+        // MatvecIn` union impl.
+        input: {
+            let tail: crate::riir::backend::BufId<
+                crate::riir::backend::buftype::TailNormedBuf,
+            > = hidden_b_id.into();
+            tail.into()
+        },
+        input_off: ((n - 1) * hidden_dim * std::mem::size_of::<f32>()) as u64,
+        output: head_tail_scratch.logits.into(),
+        output_off: 0,
+        in_dim: hidden_dim as u32,
+        out_dim: v.vocab_size as u32,
+        n_tokens: 1,
+    });
+    backend
+        .execute(&g_tail, "graph_tail")
+        .map_err(|_| RsError::EvalFailed)?;
+    backend
+        .pool()
+        .download(head_tail_scratch.logits, bytemuck::cast_slice_mut(logits))
+        .expect("pool download logits");
+    Ok(())
 }
 
 /// Probe a freshly-opened [`WeightFile`] against the compile-time
@@ -694,6 +891,16 @@ impl RsCtx<MetalBackend> {
         // The family engine's prefill settings, fitted to the cap.
         #[cfg(feature = "model-qwen3-8-flash-next")]
         let mut q38_io = None;
+        // Layer-major prefill: only where a prompt can span chunks.
+        let mut layer_major_chunks = match config.resolved_layer_major_chunks() {
+            _ if VARIANT.attn_kind == variants::AttnKind::Mla => 0,
+            // This family prefills through its own engine (`q38_ctx`).
+            _ if cfg!(feature = "model-qwen3-8-flash-next") => 0,
+            c => {
+                let fit = n_ctx.div_ceil(prefill_chunk);
+                if fit < 2 { 0 } else { c.min(fit) }
+            }
+        };
         if let Some(cap) = config.mem_cap {
             let weights_bytes = io::weight_file::filtered_bytes(weights, manifest, keep)
                 .map_err(|_| RsError::InitFailed)?;
@@ -753,6 +960,32 @@ impl RsCtx<MetalBackend> {
                         "[budget] staging all {} experts of a layer does not fit the cap; \
                          prefill stages {bounded} at a time",
                         VARIANT.num_experts
+                    );
+                }
+            }
+            // Layer-major window: yields to everything above — lowered,
+            // then off, when it does not fit.
+            if layer_major_chunks >= 2 {
+                let bounded = expert_io_mode.is_pread() && prefill_staging_experts < VARIANT.num_experts;
+                let wanted = layer_major_chunks;
+                loop {
+                    let bytes = budget::layer_major_bytes(VARIANT, prefill_chunk, layer_major_chunks, bounded);
+                    plan.set(budget::Account::LayerMajor, bytes);
+                    if plan.check(cap).is_ok() {
+                        break;
+                    }
+                    if layer_major_chunks > 2 {
+                        layer_major_chunks -= 1;
+                    } else {
+                        layer_major_chunks = 0;
+                        plan.set(budget::Account::LayerMajor, 0);
+                        break;
+                    }
+                }
+                if layer_major_chunks != wanted {
+                    eprintln!(
+                        "[budget] layer-major prefill: a window of {wanted} chunks does not fit the cap; {}",
+                        if layer_major_chunks == 0 { "off".to_string() } else { format!("{layer_major_chunks} chunks") }
                     );
                 }
             }
@@ -912,6 +1145,8 @@ impl RsCtx<MetalBackend> {
             prefill_chunk,
             prefill_staging_experts,
             prefill_overlap_groups: config.resolved_prefill_overlap_groups(),
+            layer_major_chunks,
+            layer_major: None,
             planned_exact,
             runtime_overhead: config.runtime_overhead,
             baseline_peak,
@@ -2176,6 +2411,21 @@ impl RsCtx<MetalBackend> {
             add(pool.handle(s.token_ids));
             add(pool.handle(s.logits));
         }
+        if let Some(s) = &self.layer_major {
+            add(pool.handle(s.window));
+            for m in &s.moe_chunks {
+                for b in [
+                    pool.handle(m.h_mid),
+                    pool.handle(m.h_post),
+                    pool.handle(m.shared_gate),
+                    pool.handle(m.routing_indices),
+                    pool.handle(m.routing_weights),
+                    pool.handle(m.bucket_input),
+                ] {
+                    add(b);
+                }
+            }
+        }
         out
     }
 
@@ -2299,6 +2549,13 @@ impl RsCtx<MetalBackend> {
                         .map_err(|_| RsError::InitFailed)?,
                 );
             }
+        }
+        if self.layer_major.is_none() && self.layer_major_chunks >= 2 {
+            let Self { backend, moe_graph_scratch, layer_major, layer_major_chunks, .. } = self;
+            let pool = backend.as_mut().expect("just-set").pool_mut();
+            let moe = moe_graph_scratch.as_ref().expect("just-set");
+            *layer_major =
+                Some(attn::linear_attn_forward::LayerMajorScratch::new(pool, moe, chunk, *layer_major_chunks));
         }
         if self.moe_buffers.is_none() {
             let layout = self.experts.layout();
@@ -2625,6 +2882,29 @@ impl RsCtx<MetalBackend> {
         // The scratch holds `prefill_chunk` tokens; a test override can
         // only go smaller.
         let chunk_size = batched_chunk_size().min(self.prefill_chunk);
+        // Layer-major prefill (`OpenConfig::layer_major`): a prompt
+        // longer than a chunk runs in windows of `layer_major_chunks`
+        // chunks, each layer over all of a window's chunks before the
+        // next layer. A window of one chunk is the chunk path.
+        if self.layer_major_chunks >= 2 && n > chunk_size {
+            let window = self.layer_major_chunks * chunk_size;
+            let mut w_start = 0usize;
+            let mut chunk_idx = 0usize;
+            while w_start < n {
+                let w_end = (w_start + window).min(n);
+                let w_in = input.rows(w_start..w_end);
+                let w_out = output.rows(w_start..w_end, n);
+                let w_pos = start_pos + w_start as i32;
+                if w_end - w_start > chunk_size {
+                    self.step_internal_layer_major(w_in, w_pos, w_out, chunk_size)?;
+                } else {
+                    self.step_internal_batched_gqa(w_in, w_pos, w_out, chunk_idx)?;
+                }
+                chunk_idx += (w_end - w_start).div_ceil(chunk_size);
+                w_start = w_end;
+            }
+            return Ok(());
+        }
         let mut chunk_start = 0usize;
         let mut chunk_idx = 0usize;
         while chunk_start < n {
@@ -2674,7 +2954,6 @@ impl RsCtx<MetalBackend> {
 
         let v = VARIANT;
         let n = input.n_tokens().ok_or(RsError::EvalFailed)?;
-        let hidden_dim = v.hidden_dim;
 
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
@@ -2796,80 +3075,7 @@ impl RsCtx<MetalBackend> {
             }
         }
         if !tokens.is_empty() {
-            let embed_off = |name: &str| -> Result<u64, RsError> {
-                wf.tensor_info(name)
-                    .map(|t| t.offset)
-                    .ok_or(RsError::EvalFailed)
-            };
-            // Streamed embedding: read the chunk's raw rows (cache or
-            // disk), upload them as `[weight | scales | biases]` rows,
-            // and gather from them with ids 0..n — the same kernel over
-            // the same bytes, so bit-identical to the resident table.
-            let (embed_weight, rows_id, ids): (WeightRef, Option<BufId<EmbedRowsBuf>>, std::borrow::Cow<'_, [i32]>) =
-                match wf.embed_stream() {
-                    Some(stream) => {
-                        let g = stream.geometry();
-                        let rows_id = embed_rows.ok_or(RsError::EvalFailed)?;
-                        let rb = g.row_bytes();
-                        let mut raw = vec![0u8; n * rb];
-                        stream
-                            .rows(tokens, &mut raw, Some(io_pool))
-                            .map_err(|_| RsError::EvalFailed)?;
-                        // Interleaved rows → three planes.
-                        let mut planes = vec![0u8; n * rb];
-                        let (pw, ps) = planes.split_at_mut(n * g.w_row);
-                        let (ps, pb) = ps.split_at_mut(n * g.sb_row);
-                        for (t, row) in raw.chunks_exact(rb).enumerate() {
-                            pw[t * g.w_row..(t + 1) * g.w_row].copy_from_slice(&row[..g.w_row]);
-                            ps[t * g.sb_row..(t + 1) * g.sb_row]
-                                .copy_from_slice(&row[g.w_row..g.w_row + g.sb_row]);
-                            pb[t * g.sb_row..(t + 1) * g.sb_row].copy_from_slice(&row[g.w_row + g.sb_row..]);
-                        }
-                        backend
-                            .pool_mut()
-                            .upload(rows_id, &planes)
-                            .map_err(|_| RsError::EvalFailed)?;
-                        let weight = WeightRef {
-                            w_off: 0,
-                            s_off: (n * g.w_row) as u64,
-                            b_off: (n * (g.w_row + g.sb_row)) as u64,
-                            bits: 4,
-                        };
-                        (weight, Some(rows_id), (0..n as i32).collect::<Vec<_>>().into())
-                    }
-                    None => {
-                        let weight = WeightRef {
-                            w_off: embed_off("model.embed_tokens.weight")?,
-                            s_off: embed_off("model.embed_tokens.scales")?,
-                            b_off: embed_off("model.embed_tokens.biases")?,
-                            bits: 4,
-                        };
-                        (weight, None, tokens.into())
-                    }
-                };
-            backend
-                .pool_mut()
-                .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(&ids))
-                .expect("pool upload token ids");
-            let mut g_head = Graph::new();
-            // The head writes the embedding-gather output into the
-            // run-lifetime `hidden_a` slot of the cross-layer double-
-            // buffer (`BufId<HiddenBuf>`). The Op's `hidden_out` slot is
-            // typed `BufId<EmbedOutBuf>` — same physical role at the
-            // top of the model, with a dedicated `From<HiddenBuf> for
-            // BufId<EmbedOutBuf>` impl that documents the bridge here.
-            g_head.push(Op::EmbedGatherNTokens {
-                label: "embed_gather",
-                token_ids: head_tail_scratch.token_ids,
-                weight: embed_weight,
-                rows: rows_id,
-                hidden_out: hidden_a_id.into(),
-                hidden_dim: hidden_dim as u32,
-                n_tokens: n as u32,
-            });
-            backend
-                .execute(&g_head, "graph_head")
-                .map_err(|_| RsError::EvalFailed)?;
+            embed_head(wf, backend, *embed_rows, head_tail_scratch, io_pool, tokens, hidden_a_id)?;
         }
 
         for layer_idx in range {
@@ -2907,6 +3113,7 @@ impl RsCtx<MetalBackend> {
                     hidden_b_id,
                     full_attn_graph_scratch,
                     moe_graph_scratch,
+                    true,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             } else {
@@ -2948,6 +3155,7 @@ impl RsCtx<MetalBackend> {
                     hidden_b_id,
                     linear_attn_graph_scratch,
                     moe_graph_scratch,
+                    true,
                 )
                 .map_err(|_| RsError::EvalFailed)?;
             }
@@ -2984,73 +3192,288 @@ impl RsCtx<MetalBackend> {
                 .download(hidden_a_id, bytemuck::cast_slice_mut(h))
                 .map_err(|_| RsError::EvalFailed)?;
         } else if let StageOutput::Logits(logits) = output {
-            let norm_off = wf
-                .tensor_info("model.norm.weight")
-                .map(|t| t.offset)
-                .ok_or(RsError::EvalFailed)?;
-            let lm_off = |name: &str| -> Result<u64, RsError> {
-                wf.tensor_info(name)
-                    .map(|t| t.offset)
-                    .ok_or(RsError::EvalFailed)
-            };
-            let lm_head_weight = WeightRef {
-                w_off: lm_off("lm_head.weight")?,
-                s_off: lm_off("lm_head.scales")?,
-                b_off: lm_off("lm_head.biases")?,
-                bits: 4,
-            };
-            let mut g_tail = Graph::new();
-            g_tail.push(Op::RmsNormBf16NTokens {
-                label: "final_norm",
-                // Last layer wrote into `hidden_a`; norm reads it
-                // (HiddenBuf → RmsNormIn) and writes the post-norm
-                // value into `hidden_b` (HiddenBuf → TailNormedBuf →
-                // RmsNormOut, via the union impl).
-                x: hidden_a_id.into(),
-                weight_off: norm_off,
-                out: {
-                    // Two-step to RmsNormOut: HiddenBuf → TailNormedBuf
-                    // → RmsNormOut. Documented in buftype.rs above
-                    // the `HiddenBuf -> TailNormedBuf` impl.
-                    let tail: crate::riir::backend::BufId<
-                        crate::riir::backend::buftype::TailNormedBuf,
-                    > = hidden_b_id.into();
-                    tail.into()
-                },
-                dim: hidden_dim as u32,
-                n_tokens: n as u32,
-                eps: variants::RMS_NORM_EPS,
-            });
-            g_tail.push(Op::MatvecNTokens {
-                label: "lm_head",
-                weight: lm_head_weight,
-                // lm_head matvec reads the tail-normed buffer (we just
-                // wrote it through `final_norm`). HiddenBuf →
-                // TailNormedBuf → MatvecIn via the `TailNormedBuf ->
-                // MatvecIn` union impl.
-                input: {
-                    let tail: crate::riir::backend::BufId<
-                        crate::riir::backend::buftype::TailNormedBuf,
-                    > = hidden_b_id.into();
-                    tail.into()
-                },
-                input_off: ((n - 1) * hidden_dim * std::mem::size_of::<f32>()) as u64,
-                output: head_tail_scratch.logits.into(),
-                output_off: 0,
-                in_dim: hidden_dim as u32,
-                out_dim: v.vocab_size as u32,
-                n_tokens: 1,
-            });
-            backend
-                .execute(&g_tail, "graph_tail")
-                .map_err(|_| RsError::EvalFailed)?;
-            backend
-                .pool()
-                .download(head_tail_scratch.logits, bytemuck::cast_slice_mut(logits))
-                .expect("pool download logits");
+            lm_tail(wf, backend, head_tail_scratch, hidden_a_id, hidden_b_id, n, logits)?;
         }
         // Release transient BufIds so the pool doesn't grow across
         // steps. The head/tail graphs use only persistent BufIds.
+        backend.pool_mut().reset_transient();
+        Ok(())
+    }
+
+    /// Layer-major prefill of one window ([`OpenConfig::layer_major`]):
+    /// `input` spans 2..=`layer_major_chunks` chunks of `chunk_size`
+    /// tokens. Each layer runs every chunk of the window, in order,
+    /// before the next layer starts; the chunks' hidden rows wait in
+    /// the window buffer between layers. A layer only depends on its
+    /// own state from the earlier chunks (KV rows, linear-attn
+    /// recurrence), which still advances chunk by chunk, so every
+    /// chunk sees exactly the inputs it sees chunk-major.
+    ///
+    /// Expert reads: with full staging the layer's staged experts stay
+    /// in the staging buffer across its chunks and each chunk stages
+    /// only those not yet there ([`MoeGraphScratch::keep_staged`]);
+    /// with bounded staging the chunks' attention runs first and
+    /// [`attn::linear_attn_forward::moe_window_forward`] stages the
+    /// union of their experts once, in groups, running each group for
+    /// every chunk. Either way each routed expert of a layer is read
+    /// once per window, and the logits and state are bit-identical to
+    /// chunk-major prefill.
+    ///
+    /// [`MoeGraphScratch::keep_staged`]: attn::linear_attn_forward::MoeGraphScratch::keep_staged
+    fn step_internal_layer_major(
+        &mut self,
+        input: StageInput<'_>,
+        start_pos: i32,
+        output: StageOutput<'_>,
+        chunk_size: usize,
+    ) -> Result<(), RsError> {
+        let t0 = std::time::Instant::now();
+        let n = input.n_tokens().unwrap_or(0) as u64;
+        // The window records its picks layer by layer; decay waits for
+        // the whole window (`HotTier::hold_decay`).
+        if let Some(h) = self.experts.hot_tier() {
+            h.hold_decay();
+        }
+        let r = self.step_internal_layer_major_inner(input, start_pos, output, chunk_size);
+        if let Some(h) = self.experts.hot_tier() {
+            h.release_decay();
+        }
+        if r.is_ok() {
+            self.experts.counters().record_prefill(n, t0.elapsed().as_nanos() as u64);
+        }
+        r
+    }
+
+    fn step_internal_layer_major_inner(
+        &mut self,
+        input: StageInput<'_>,
+        start_pos: i32,
+        output: StageOutput<'_>,
+        chunk_size: usize,
+    ) -> Result<(), RsError> {
+        use attn::full_attn_forward::batched_full_attn_layer_forward;
+        use attn::linear_attn_forward::{MoeGraphScratch, moe_window_forward};
+
+        let v = VARIANT;
+        let n = input.n_tokens().ok_or(RsError::EvalFailed)?;
+        let row_bytes = v.hidden_dim * std::mem::size_of::<f32>();
+        self.ensure_linear_resources()?;
+        let k_active = self.k_active;
+        let range = self.layer_range.clone();
+        // The window's chunks: `[a, b)` token rows each.
+        let bounds: Vec<(usize, usize)> =
+            (0..n).step_by(chunk_size).map(|a| (a, (a + chunk_size).min(n))).collect();
+        let ns: Vec<usize> = bounds.iter().map(|&(a, b)| b - a).collect();
+        // Each chunk's `[t, h, w]` rows when running `eval_stage_mrope`.
+        let ropes: Vec<Option<Vec<i32>>> = bounds
+            .iter()
+            .map(|&(a, b)| {
+                self.rope_override.as_ref().map(|(base, rows)| {
+                    let off = (start_pos + a as i32 - base) as usize;
+                    rows[off..off + (b - a)].iter().flatten().copied().collect()
+                })
+            })
+            .collect();
+        if let StageInput::Tokens(tokens) = input {
+            // The gather kernel does not range-check token ids.
+            if tokens.iter().any(|&t| t < 0 || t as usize >= v.vocab_size) {
+                return Err(RsError::EvalFailed);
+            }
+        }
+
+        let Self {
+            wf,
+            backend,
+            moe_buffers,
+            experts,
+            layer_states,
+            layer_caches,
+            linear_buffers,
+            linear_attn_graph_scratch,
+            full_attn_graph_scratch,
+            moe_graph_scratch,
+            hidden_double_buffer,
+            head_tail_scratch,
+            embed_rows,
+            deferred,
+            prefetch,
+            io_pool,
+            layer_major,
+            ..
+        } = self;
+        let io_pool: &rayon::ThreadPool = &*io_pool;
+        let backend = backend.as_mut().expect("ensure_linear_resources");
+        let layer_caches = layer_caches.as_ref().expect("ensure_linear_resources");
+        let linear_buffers = linear_buffers.as_mut().expect("ensure_linear_resources");
+        let linear_attn_graph_scratch = linear_attn_graph_scratch.as_ref().expect("ensure_linear_resources");
+        let full_attn_graph_scratch = full_attn_graph_scratch.as_ref().expect("ensure_linear_resources");
+        let moe0 = moe_graph_scratch.as_ref().expect("ensure_linear_resources");
+        let hidden_double_buffer = hidden_double_buffer.as_ref().expect("ensure_linear_resources");
+        let head_tail_scratch = head_tail_scratch.as_ref().expect("ensure_linear_resources");
+        let moe_buffers = moe_buffers.as_mut().expect("ensure_linear_resources");
+        let lm = layer_major.as_ref().ok_or(RsError::EvalFailed)?;
+        let bounded = moe0.bounded();
+        if bounds.len() > lm.chunks || (bounded && lm.moe_chunks.len() + 1 < bounds.len()) {
+            return Err(RsError::EvalFailed);
+        }
+        // Chunk `c`'s MoE boundary set (bounded: its own; else shared).
+        let chunk_moes: Vec<&MoeGraphScratch> =
+            std::iter::once(moe0).chain(lm.moe_chunks.iter()).take(bounds.len()).collect();
+
+        // As in `step_internal_batched_gqa_inner`.
+        moe::deferred::discard_deferred_experts_in(deferred);
+        prefetch.drain();
+
+        let (hidden_a_id, hidden_b_id) = (hidden_double_buffer.hidden_a, hidden_double_buffer.hidden_b);
+        let (window_buf, a_buf, b_buf) = {
+            let pool = backend.pool();
+            (pool.handle(lm.window).clone(), pool.handle(hidden_a_id).clone(), pool.handle(hidden_b_id).clone())
+        };
+
+        // Head: every chunk's layer input into the window.
+        match input {
+            StageInput::Tokens(tokens) => {
+                for &(a, b) in &bounds {
+                    embed_head(wf, backend, *embed_rows, head_tail_scratch, io_pool, &tokens[a..b], hidden_a_id)?;
+                    copy_buffer_bytes(&a_buf, 0, &window_buf, a * row_bytes, (b - a) * row_bytes);
+                }
+            }
+            StageInput::Hidden(h) => {
+                backend
+                    .pool_mut()
+                    .upload_at(lm.window, 0, bytemuck::cast_slice(h))
+                    .map_err(|_| RsError::EvalFailed)?;
+            }
+        }
+
+        // Full staging: a layer's chunks share what they staged. The
+        // staging buffer was reclaimed from the hot tier for this
+        // prefill, so nothing in it is known yet.
+        struct KeepStaged<'a>(&'a MoeGraphScratch);
+        impl Drop for KeepStaged<'_> {
+            fn drop(&mut self) {
+                self.0.keep_staged.set(false);
+                self.0.forget_staged();
+            }
+        }
+        moe0.forget_staged();
+        moe0.keep_staged.set(!bounded && moe0.expert_base.is_some());
+        let _keep = KeepStaged(moe0);
+
+        for layer_idx in range {
+            let is_full = v.layer_kind(layer_idx) == variants::LayerKind::FullAttn;
+            for (c, &(a, b)) in bounds.iter().enumerate() {
+                backend.begin_layer(c, layer_idx);
+                let nc = b - a;
+                copy_buffer_bytes(&window_buf, a * row_bytes, &a_buf, 0, nc * row_bytes);
+                if let Some(rows) = &ropes[c] {
+                    let pos_id = full_attn_graph_scratch.positions.ok_or(RsError::EvalFailed)?;
+                    backend
+                        .pool_mut()
+                        .upload(pos_id, bytemuck::cast_slice(rows))
+                        .map_err(|_| RsError::EvalFailed)?;
+                }
+                // Bounded: attention only; the window's MoE runs below.
+                let moe_c = if bounded { chunk_moes[c] } else { moe0 };
+                if is_full {
+                    let kv_state = full_kv_mut(layer_states, layer_idx)?;
+                    batched_full_attn_layer_forward(
+                        backend,
+                        wf,
+                        &layer_caches[layer_idx],
+                        layer_idx,
+                        start_pos + a as i32,
+                        ropes[c].is_some(),
+                        nc,
+                        k_active,
+                        experts,
+                        io_pool,
+                        &mut *moe_buffers,
+                        kv_state,
+                        None,
+                        hidden_a_id,
+                        hidden_b_id,
+                        full_attn_graph_scratch,
+                        moe_c,
+                        !bounded,
+                    )
+                    .map_err(|_| RsError::EvalFailed)?;
+                } else {
+                    let layer_state = match &mut layer_states[layer_idx] {
+                        LayerState::LinearAttn(la) => la,
+                        LayerState::FullAttn(_) | LayerState::Mla(_) => {
+                            return Err(RsError::EvalFailed);
+                        }
+                    };
+                    attn::linear_attn_forward::batched_linear_attn_layer_forward(
+                        backend,
+                        wf,
+                        &layer_caches[layer_idx],
+                        linear_buffers,
+                        layer_idx,
+                        nc,
+                        k_active,
+                        experts,
+                        io_pool,
+                        &mut *moe_buffers,
+                        layer_state,
+                        None,
+                        hidden_a_id,
+                        hidden_b_id,
+                        linear_attn_graph_scratch,
+                        moe_c,
+                        !bounded,
+                    )
+                    .map_err(|_| RsError::EvalFailed)?;
+                }
+                if !bounded {
+                    copy_buffer_bytes(&b_buf, 0, &window_buf, a * row_bytes, nc * row_bytes);
+                }
+            }
+            if bounded {
+                // The chunks' inputs are consumed (their residuals are
+                // in their own `h_mid`), so each chunk's output can
+                // take its window rows as soon as it is combined.
+                moe_window_forward(
+                    backend,
+                    &chunk_moes,
+                    &ns,
+                    wf,
+                    &layer_caches[layer_idx],
+                    layer_idx,
+                    k_active,
+                    experts,
+                    io_pool,
+                    hidden_b_id,
+                    &mut |_, c| {
+                        copy_buffer_bytes(&b_buf, 0, &window_buf, bounds[c].0 * row_bytes, ns[c] * row_bytes);
+                        Ok(())
+                    },
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            }
+        }
+        if gpu_capture::config().is_some() {
+            gpu_capture::stop();
+        }
+
+        match output {
+            StageOutput::Hidden(h) => {
+                let bytes = h.len() * std::mem::size_of::<f32>();
+                assert!(bytes <= window_buf.length() as usize);
+                // SAFETY: `bytes` of the idle, shared-storage window
+                // (checked above) into the caller's `h`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(window_buf.contents() as *const u8, h.as_mut_ptr() as *mut u8, bytes);
+                }
+            }
+            StageOutput::Logits(logits) => {
+                let &(a, b) = bounds.last().expect("n > 0");
+                copy_buffer_bytes(&window_buf, a * row_bytes, &a_buf, 0, (b - a) * row_bytes);
+                lm_tail(wf, backend, head_tail_scratch, hidden_a_id, hidden_b_id, b - a, logits)?;
+            }
+            StageOutput::Discard => {}
+        }
         backend.pool_mut().reset_transient();
         Ok(())
     }

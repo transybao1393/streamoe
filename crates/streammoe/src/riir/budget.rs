@@ -106,6 +106,10 @@ pub enum Account {
     /// the row cache plus one prefill chunk of row staging. The table
     /// itself leaves [`Account::Weights`].
     EmbedCache,
+    /// Layer-major prefill ([`crate::riir::OpenConfig::layer_major`],
+    /// [`layer_major_bytes`]): the window's hidden rows, plus each
+    /// extra chunk's MoE boundary rows with bounded staging.
+    LayerMajor,
 }
 
 impl Account {
@@ -125,6 +129,7 @@ impl Account {
             Account::HotTier => "hot_tier",
             Account::HostBuffers => "host_buffers",
             Account::EmbedCache => "embed_cache",
+            Account::LayerMajor => "layer_major",
         }
     }
 }
@@ -292,6 +297,30 @@ pub fn prefill_scratch_bytes(v: Variant, chunk: usize) -> u64 {
     let hts = chunk + v.vocab_size;
 
     ((linear + full + moe + hdb + hts) * f32b) as u64
+}
+
+/// Bytes one extra chunk's MoE boundary set takes in a bounded
+/// layer-major window (`MoeGraphScratch::chunk_view`): `h_mid`,
+/// `h_post`, the shared-expert gate, the router ids and weights, and
+/// the `[chunk, k]` expert rows (`down_mid`).
+pub fn layer_major_chunk_bytes(v: Variant, chunk: usize) -> u64 {
+    let rows = 2 * v.hidden_dim + 1 + 2 * MAX_K + v.num_experts_per_tok * v.hidden_dim;
+    (chunk * rows * std::mem::size_of::<f32>()) as u64
+}
+
+/// [`Account::LayerMajor`] for a window of `chunks` prefill chunks of
+/// `chunk` tokens: the window's hidden rows, and with `bounded`
+/// staging a [`layer_major_chunk_bytes`] set for every chunk past the
+/// first (the first uses the prefill scratch's own). 0 when `chunks`
+/// < 2 or for MLA variants (no batched prefill).
+/// `layer_major_matches_pool` keeps it in step with the pool.
+pub fn layer_major_bytes(v: Variant, chunk: usize, chunks: usize, bounded: bool) -> u64 {
+    if chunks < 2 || v.attn_kind == AttnKind::Mla {
+        return 0;
+    }
+    let window = (chunks * chunk * v.hidden_dim * std::mem::size_of::<f32>()) as u64;
+    let extra = if bounded { (chunks - 1) as u64 * layer_major_chunk_bytes(v, chunk) } else { 0 };
+    window + extra
 }
 
 impl BudgetPlan {
@@ -664,6 +693,43 @@ mod tests {
             fmt_gib(p.total()),
             p.breakdown()
         );
+    }
+
+    /// `layer_major_bytes` equals what `LayerMajorScratch` requests
+    /// from a real Metal pool, full and bounded staging.
+    #[test]
+    fn layer_major_matches_pool() {
+        use crate::riir::attn::linear_attn_forward::{LayerMajorScratch, MoeGraphScratch};
+        use crate::riir::backend::MetalBufferPool;
+
+        let v = VARIANT;
+        if v.attn_kind == AttnKind::Mla {
+            assert_eq!(layer_major_bytes(v, 512, 4, true), 0);
+            return;
+        }
+        let device = metal::Device::system_default().expect("Metal device");
+        let chunk = 37;
+        for (chunks, staging) in [(2, v.num_experts), (4, v.num_experts), (3, 16)] {
+            let mut pool = MetalBufferPool::new(device.clone());
+            let moe = MoeGraphScratch::new_with_staging(
+                &mut pool,
+                v.num_experts_per_tok,
+                ExpertIoMode::Pread,
+                chunk,
+                v.expert_size_4bit(),
+                staging,
+            );
+            let before = pool.requested_bytes();
+            let lm = LayerMajorScratch::new(&mut pool, &moe, chunk, chunks);
+            let bounded = staging < v.num_experts;
+            assert_eq!(lm.moe_chunks.len(), if bounded { chunks - 1 } else { 0 });
+            assert_eq!(
+                pool.requested_bytes() - before,
+                layer_major_bytes(v, chunk, chunks, bounded),
+                "{chunks} chunks, {staging} slots"
+            );
+        }
+        assert_eq!(layer_major_bytes(v, 512, 1, true), 0);
     }
 
     /// `multi_decode_bytes` equals what `MultiDecodeBuffers` requests

@@ -364,19 +364,22 @@ experts), same setup, 32 tokens per answer, identical answers:
 | Defaults + prefill while typing (chat page default) | 13.9–14.5 s on prompts 2–3 | 0.55 | 23–25% |
 | Defaults + `--spec` | 20.4 s | 0.52 | 19–23% |
 
-**Long prompts.** Layer-major prefill (opt-in,
-`STREAMMOE_LAYER_MAJOR=1`, branch `98a6263`) runs each layer over the
-whole prompt before the next layer, so each layer's experts are read
-once per prompt instead of once per 512-token chunk. Same setup, a
-2,062-token prompt + 4 tokens, one run each, 2026-11-06, same answer:
+**Long prompts.** Layer-major prefill (the default since 2026-11-07;
+`STREAMMOE_LAYER_MAJOR=0` turns it off) runs each layer over up to
+2,048 tokens of the prompt before the next layer, so each layer's
+experts are read once per window instead of once per 512-token chunk.
+
+*Setup: M3 Pro 18 GB, model on the same external SSD, 4-bit experts,
+9 GiB cap, n_ctx 4096, a 2,062-token prompt + 4 tokens, one run each,
+2026-11-06, build `98a6263` (opt-in then). Same answer.*
 
 | | First word | Prompt speed | tok/s | Hot tier | Peak memory |
 | --- | --- | --- | --- | --- | --- |
 | Chunk by chunk (default) | 368 s | 5.6 tok/s | 0.43 | 305 experts | 8.64 GiB |
 | **Layer-major** | **135 s (2.7× sooner)** | 15.3 tok/s | 0.42 | 257 experts | 8.61 GiB |
 
-Its 0.31 GiB window comes out of the hot tier, so it pays only for
-prompts longer than 512 tokens.
+Its 0.31 GiB window comes out of the hot tier's plan (lent back
+during decode), so it pays only for prompts longer than 512 tokens.
 
 #### With a bigger cap (predicted)
 
@@ -585,7 +588,7 @@ Against the other large models on the same drive:
 | Cap | 6 GiB | 6 GiB | 9 GiB |
 | Hot tier | 1,743 experts | 675 | 305 |
 | tok/s | **4.64** | 1.41 | 0.54 |
-| Long-prompt speed | **46 tok/s** | 22 tok/s | 5.6 tok/s (15.3 layer-major) |
+| Long-prompt speed | **46 tok/s** (3-bit, 2,000 tokens: 118) | 22 tok/s | 15.3 tok/s (5.6 chunk by chunk) |
 
 - **Small experts are why it's fast.** Each token reads at most 480
   experts of 1.69 MiB, 58% of Flash-Next's bytes, and the same
@@ -636,6 +639,27 @@ the wording drifts: on the 979-token summary the first 11 tokens
 match, then 3-bit writes "poorly optimized pick routes" where 4-bit
 writes "inefficient pick routing".
 
+**Long prompts.** Layer-major prefill (default since 2026-11-07)
+reads each layer's experts once per 2,048-token window instead of once
+per 512-token chunk, so a long prompt is processed about twice as fast,
+with the same output.
+
+*Setup: standard (M3 Pro 18 GB), except: model on the same external
+SSD, packed 3-bit experts, 6 GiB cap, prefetch off, no checkpoints,
+n_ctx 4096, greedy, 32 tokens generated; the 979-token warehouse text and a
+1,998-token one (the start of `docs/known-issues.md`, "summarize in two
+sentences"); 3–6 runs per arm, alternating, 2026-11-07, builds
+`9c67937` / `4966de6`.* Output tokens identical in all 18 runs.
+
+| Prompt | Chunk by chunk | Layer-major | Prefill disk reads | Decode (last pair) |
+| --- | --- | --- | --- | --- |
+| 979 tokens | 18.2 s (53.7 tok/s) | **12.2 s (80.4 tok/s)** | 33.2 → 19.7 GiB | 5.37 → 6.18 tok/s |
+| 1,998 tokens | 36.1 s (55.3 tok/s) | **17.0 s (118 tok/s)** | 64.3 → 21.0 GiB | 4.98 → 5.13 tok/s |
+
+Decode is unchanged: the same number of experts come from the hot
+tier (decode speed on the shared test host swings with other jobs, so
+only the last, quiet pair is shown).
+
 **Correctness.** On a tiny random-weight model with the same layout
 (fused projections, 8-bit router), against a pure-PyTorch port of the
 transformers code: every row within 1.7e-5 one token at a time, and
@@ -673,9 +697,10 @@ empty think block for it).
 
 - **Faster time to first word**: layer-major prefill, which reads each
   layer's experts once per prompt instead of once per 512-token chunk
-  (built and opt-in; on a 2,062-token prompt −45% prefill on the 35B,
-  first word 368 → 135 s on the 397B); stage layer L+1's experts while the
-  GPU computes layer L.
+  (default since 2026-11-07; on a 2,062-token prompt −45% prefill on
+  the 35B, first word 368 → 135 s on the 397B, 36 → 17 s on Qwen3-Next
+  for 2,000 tokens); next, stage layer L+1's experts while the GPU
+  computes layer L.
 - **Qwen3.8-Flash-Next**: runs ([above](#running-qwen38-flash-next-in-6-gib));
   next are images, earlier expert reads, a better expert guess and
   layer-major prefill ([notes](docs/design-notes.md#qwen38-flash-next)).

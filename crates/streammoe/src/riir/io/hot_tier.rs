@@ -132,6 +132,9 @@ struct Inner {
     /// Popularity per `layer * num_experts + expert`.
     counts: Vec<u32>,
     picks: u64,
+    /// `Some(picks)` while decay is held ([`HotTier::hold_decay`]):
+    /// the pick total when the hold began.
+    decay_held_at: Option<u64>,
     epoch: u64,
     /// xorshift state for victim sampling.
     rng: u64,
@@ -230,6 +233,7 @@ impl HotTier {
                 last_bound: vec![0; capacity],
                 counts: vec![0; num_layers * num_experts],
                 picks: 0,
+                decay_held_at: None,
                 epoch: 1,
                 rng: 0x9E37_79B9_7F4A_7C15,
                 stats: HotTierStats {
@@ -374,10 +378,43 @@ impl HotTier {
         g.counts[i] = g.counts[i].saturating_add(n);
         let before = g.picks;
         g.picks += n as u64;
-        for _ in before / self.decay_every..g.picks / self.decay_every {
-            for c in g.counts.iter_mut() {
-                *c >>= 1;
-            }
+        if g.decay_held_at.is_none() {
+            let halvings = g.picks / self.decay_every - before / self.decay_every;
+            Self::halve(&mut g.counts, halvings);
+        }
+    }
+
+    /// Hold decay: picks still count, but the halvings they would
+    /// trigger wait for [`Self::release_decay`]. Layer-major prefill
+    /// records a window's picks layer by layer — each layer's picks
+    /// for every chunk at once — so decay firing as they arrive would
+    /// cool the window's early layers by many periods more than its
+    /// late ones, and the tier would end the prompt holding mostly
+    /// late-layer experts. Held, every layer of the window is compared
+    /// on the same footing, as chunk by chunk.
+    pub fn hold_decay(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.decay_held_at.is_none() {
+            g.decay_held_at = Some(g.picks);
+        }
+    }
+
+    /// End a [`Self::hold_decay`]: apply the halvings the picks
+    /// recorded since crossed.
+    pub fn release_decay(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(at) = g.decay_held_at.take() {
+            let halvings = g.picks / self.decay_every - at / self.decay_every;
+            Self::halve(&mut g.counts, halvings);
+        }
+    }
+
+    fn halve(counts: &mut [u32], times: u64) {
+        if times == 0 {
+            return;
+        }
+        for c in counts.iter_mut() {
+            *c = c.checked_shr(times.min(32) as u32).unwrap_or(0);
         }
     }
 
@@ -687,6 +724,25 @@ mod tests {
         // 13 → 15 crosses nothing.
         t.record_picks(1, 2, 2);
         assert_eq!(count(&t, 10), 4);
+    }
+
+    #[test]
+    fn held_decay_applies_on_release() {
+        let mut t = tier(1);
+        t.decay_every = 4;
+        let count = |t: &HotTier, i: usize| t.counts()[i];
+        t.hold_decay();
+        // 0 → 9 crosses 4 and 8, but the counts wait.
+        t.record_picks(0, 0, 9);
+        t.record_picks(1, 2, 8);
+        assert_eq!((count(&t, 0), count(&t, 10)), (9, 8));
+        // 9 → 17 crossed 4 boundaries (4, 8, 12, 16) in all.
+        t.release_decay();
+        assert_eq!((count(&t, 0), count(&t, 10)), (0, 0));
+        t.record_picks(0, 0, 2); // 17 → 19: nothing crossed
+        assert_eq!(count(&t, 0), 2);
+        t.release_decay(); // not held: no-op
+        assert_eq!(count(&t, 0), 2);
     }
 
     #[test]
