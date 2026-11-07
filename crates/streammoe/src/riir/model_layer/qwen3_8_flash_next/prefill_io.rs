@@ -102,6 +102,25 @@ pub fn plan_prefill_batches(
     cap: usize,
     max_read: usize,
 ) -> Vec<PrefillBatch> {
+    plan_prefill_batches_rows(ids, is_hot, merge_gaps, cap, max_read, &[], usize::MAX)
+}
+
+/// [`plan_prefill_batches`] with at most `max_rows` assignment rows per
+/// batch (the bucket scratch's rows): bucket `i` has `rows[i]` rows
+/// (`rows` empty: no row limit). A bucket alone over `max_rows` still
+/// gets a batch of its own. A batch cut by rows inside a span reads the
+/// span again in the next batch (rare: a layer-major window's batch of
+/// 32 experts holds ~1,500 of the 5,120 rows).
+pub fn plan_prefill_batches_rows(
+    ids: &[i32],
+    is_hot: impl Fn(usize) -> bool,
+    merge_gaps: bool,
+    cap: usize,
+    max_read: usize,
+    rows: &[u32],
+    max_rows: usize,
+) -> Vec<PrefillBatch> {
+    debug_assert!(rows.is_empty() || rows.len() == ids.len());
     debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "bucket experts ascend");
     let cap = cap.max(1) as u32;
     let lim = (max_read.max(1) as u32).min(cap);
@@ -125,6 +144,7 @@ pub fn plan_prefill_batches(
     let mut si = 0usize;
     // The span `si` and its slot in `cur`, once placed.
     let mut placed: Option<u32> = None;
+    let mut cur_rows = 0usize;
     for (bi, &e) in ids.iter().enumerate() {
         let e = e as u32;
         while si < spans.len() && spans[si].0 + spans[si].1 <= e {
@@ -132,12 +152,20 @@ pub fn plan_prefill_batches(
             placed = None;
         }
         let covered = si < spans.len() && spans[si].0 <= e;
+        let r = rows.get(bi).map_or(0, |&r| r as usize);
+        let over_rows = bi > cur.b0 && cur_rows + r > max_rows;
+        if over_rows {
+            // The next batch places the span again.
+            placed = None;
+        }
         let need = if covered { if placed.is_some() { 0 } else { spans[si].1 } } else { 1 };
-        if need > 0 && cur.used + need > cap {
+        if over_rows || (need > 0 && cur.used + need > cap) {
             cur.b1 = bi;
             let next = PrefillBatch { b0: bi, b1: bi, slots: Vec::new(), reads: Vec::new(), hot: Vec::new(), used: 0 };
             out.push(std::mem::replace(&mut cur, next));
+            cur_rows = 0;
         }
+        cur_rows += r;
         if covered {
             let base = match placed {
                 Some(s) => s,
@@ -187,6 +215,9 @@ pub struct PrefillIoStats {
     pub bytes: u64,
     /// Expert batches (one permute-fuse each).
     pub batches: u64,
+    /// Experts read early (before the router readback; counted in
+    /// `experts_read` too).
+    pub early: u64,
     /// Time the host waited on reads / on the GPU, and the chunks' wall
     /// time.
     pub io_wait_ns: u64,
@@ -207,6 +238,7 @@ impl PrefillIoStats {
         self.preads += o.preads;
         self.bytes += o.bytes;
         self.batches += o.batches;
+        self.early += o.early;
         self.io_wait_ns += o.io_wait_ns;
         self.gpu_wait_ns += o.gpu_wait_ns;
         self.wall_ns += o.wall_ns;
@@ -222,7 +254,7 @@ impl PrefillIoStats {
         let ms = |ns: u64| ns as f64 / 1e6;
         format!(
             "{} tok, {} layers ({} whole-layer), experts {} (hot {}), read {} (+{} through) in {} preads, \
-             {:.1} MiB, avg {:.0} KiB, {} batches; io wait {:.1} ms, gpu wait {:.1} ms, wall {:.1} ms",
+             {:.1} MiB, avg {:.0} KiB, {} batches, {} early; io wait {:.1} ms, gpu wait {:.1} ms, wall {:.1} ms",
             self.tokens,
             self.layers,
             self.layer_reads,
@@ -234,6 +266,7 @@ impl PrefillIoStats {
             self.bytes as f64 / (1u64 << 20) as f64,
             self.avg_read() as f64 / 1024.0,
             self.batches,
+            self.early,
             ms(self.io_wait_ns),
             ms(self.gpu_wait_ns),
             ms(self.wall_ns),
@@ -310,5 +343,20 @@ mod tests {
             }
         }
         assert!(plan_prefill_batches(&[], |_| false, true, 4, 4).is_empty());
+    }
+
+    #[test]
+    fn batches_respect_row_cap() {
+        let ids: Vec<i32> = (0..40).filter(|e| e % 5 != 2).collect();
+        let rows: Vec<u32> = ids.iter().map(|&e| 1 + (e as u32 * 7) % 13).collect();
+        for (merge, cap, max_rows) in [(false, 64, 20), (true, 64, 20), (true, 8, 30), (true, 64, 1), (false, 3, 1000)] {
+            let b = plan_prefill_batches_rows(&ids, |e| e % 11 == 0, merge, cap, 16, &rows, max_rows);
+            covered(&b, &ids);
+            for x in &b {
+                let r: u32 = rows[x.b0..x.b1].iter().sum();
+                assert!(r as usize <= max_rows || x.b1 - x.b0 == 1, "{merge} {cap} {max_rows}: {r} rows");
+                assert!(x.used as usize <= cap);
+            }
+        }
     }
 }

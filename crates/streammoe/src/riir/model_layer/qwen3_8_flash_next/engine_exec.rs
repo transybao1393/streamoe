@@ -21,6 +21,8 @@
 //! - `dst += src` ([`FamOp::Add`], the PLE addition).
 //! - the MoE row gather ([`FamOp::GatherRows`]: each expert assignment
 //!   row from its token's row, on the GPU);
+//! - a plain copy at offsets ([`FamOp::CopyRows`]: a layer-major
+//!   window's rows in and out of the chunk buffers);
 //! - QSA past the budget ([`FamOp::SparseRows`]: attention over host-
 //!   selected cache rows, `qsa::gpu` on Metal).
 //!
@@ -96,6 +98,9 @@ pub enum FamOp {
     /// `dst[r, :] = src[idx[r], :]` for `n_rows` rows of `width` (`idx`
     /// i32: the MoE assignment rows from the token rows, on the GPU).
     GatherRows { src: FBuf, idx: FBuf, dst: FBuf, width: u32, n_rows: u32 },
+    /// `dst[dst_off + i] = src[src_off + i]` for `n` values (offsets in
+    /// floats; the layer-major window, [`super::engine`]).
+    CopyRows { src: FBuf, src_off: u64, dst: FBuf, dst_off: u64, n: u32 },
     /// QSA over the budget: gated attention of `n_tokens` queries (`q` /
     /// `gate` `[n, q_dim]`) over the cache rows of the last
     /// [`Q38Exec::fam_set_rows`] lists, into `out` `[n, q_dim]`. Metal:
@@ -230,6 +235,15 @@ kernel void q38e_add(
     if (i < n) dst[i] += src[i];
 }
 
+kernel void q38e_copy(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < n) dst[i] = src[i];
+}
+
 // dst[r, :] = src[idx[r], :] over total = n_rows * width.
 kernel void q38e_gather_rows(
     device const float* src   [[buffer(0)]],
@@ -252,6 +266,7 @@ pub struct Q38EngineKernels {
     pub gated_norm_sigmoid: ComputePipelineState,
     pub add: ComputePipelineState,
     pub gather_rows: ComputePipelineState,
+    pub copy: ComputePipelineState,
     pub ple: super::ple_gpu::PleGpuKernels,
 }
 
@@ -283,6 +298,7 @@ impl Q38EngineKernels {
             gated_norm_sigmoid: p("q38e_gated_rms_norm_sigmoid")?,
             add: p("q38e_add")?,
             gather_rows: p("q38e_gather_rows")?,
+            copy: p("q38e_copy")?,
             ple: super::ple_gpu::PleGpuKernels::new(device)?,
         })
     }
@@ -352,6 +368,21 @@ impl Q38EngineKernels {
         enc.set_compute_pipeline_state(&self.add);
         enc.set_buffer(0, Some(dst), 0);
         enc.set_buffer(1, Some(src), 0);
+        set_u32(enc, 2, n);
+        let (g, t) = grid1(n, 256);
+        enc.dispatch_thread_groups(g, t);
+        enc.end_encoding();
+    }
+
+    /// `dst[dst_off..][..n] = src[src_off..][..n]` (offsets in floats).
+    pub fn encode_copy(&self, cmdbuf: &CommandBufferRef, src: &BufferRef, src_off: u64, dst: &BufferRef, dst_off: u64, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let enc = cmdbuf.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.copy);
+        enc.set_buffer(0, Some(src), (src_off * 4) as NSUInteger);
+        enc.set_buffer(1, Some(dst), (dst_off * 4) as NSUInteger);
         set_u32(enc, 2, n);
         let (g, t) = grid1(n, 256);
         enc.dispatch_thread_groups(g, t);
@@ -456,6 +487,7 @@ impl Q38Exec for MetalBackend {
             FamOp::GatherRows { src, idx, dst, width, n_rows } => {
                 fam.eng.encode_gather_rows(cmd, h(src), h(idx), h(dst), width, n_rows)
             }
+            FamOp::CopyRows { src, src_off, dst, dst_off, n } => fam.eng.encode_copy(cmd, h(src), src_off, h(dst), dst_off, n),
             FamOp::SparseRows { q, gate, k_cache, v_cache, out, n_tokens } => {
                 let r = &fam.rows;
                 debug_assert_eq!(r.n_tokens, n_tokens as usize, "SparseRows: row lists of another chunk");
@@ -624,6 +656,11 @@ impl Q38Exec for CpuBackend {
                     let s = iv[r] as usize;
                     row.copy_from_slice(&sv[s * w..(s + 1) * w]);
                 }
+            }
+            FamOp::CopyRows { src, src_off, dst, dst_off, n } => {
+                let (so, d, n) = (src_off as usize, dst_off as usize, n as usize);
+                let sv = f32s(pool.handle(src))[so..so + n].to_vec();
+                f32s_mut(pool.handle(dst))[d..d + n].copy_from_slice(&sv);
             }
             FamOp::SparseRows { q, gate, k_cache, v_cache, out, n_tokens } => {
                 let (s, r) = (&fam.qsa, &fam.rows);
