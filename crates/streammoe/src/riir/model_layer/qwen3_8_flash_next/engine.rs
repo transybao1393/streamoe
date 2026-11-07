@@ -90,8 +90,9 @@
 //! halves so one batch's reads run while the GPU computes the previous
 //! batch (committed without waiting).
 //!
-//! **Layer-major windows** (`STREAMMOE_Q38_LAYER_MAJOR=1`, window
-//! `STREAMMOE_Q38_WINDOW` tokens, default 4096): a prompt longer than a
+//! **Layer-major windows** (default; `STREAMMOE_Q38_LAYER_MAJOR=0`
+//! turns them off; window `STREAMMOE_Q38_WINDOW` tokens, default
+//! 4096): a prompt longer than a
 //! chunk runs in windows; each layer runs the window's chunks in order
 //! (attention, router) before its experts run once for every window
 //! row ([`Q38Engine::forward_window`]), so a layer is read once per
@@ -258,17 +259,18 @@ pub fn prefill_chunk(n_ctx: usize) -> usize {
         .max(1)
 }
 
-/// Default tokens of a layer-major window (`STREAMMOE_Q38_WINDOW`) when
-/// `STREAMMOE_Q38_LAYER_MAJOR=1`: eight 512-token chunks.
+/// Default tokens of a layer-major window (`STREAMMOE_Q38_WINDOW`):
+/// eight 512-token chunks.
 pub const DEFAULT_LAYER_MAJOR_WINDOW: usize = 4096;
 
-/// Tokens of a layer-major prefill window from the environment: 0 (off)
-/// unless `STREAMMOE_Q38_LAYER_MAJOR=1`; then `STREAMMOE_Q38_WINDOW`
-/// or [`DEFAULT_LAYER_MAJOR_WINDOW`] (the engine clamps it,
-/// [`Q38PrefillIo::window_rows`]).
+/// Tokens of a layer-major prefill window from the environment:
+/// `STREAMMOE_Q38_WINDOW` or [`DEFAULT_LAYER_MAJOR_WINDOW`] (the engine
+/// clamps it, [`Q38PrefillIo::window_rows`]); 0 (off) with
+/// `STREAMMOE_Q38_LAYER_MAJOR=0`. On by default: on the real model a
+/// 1,908-token prompt prefilled in 39 s instead of 106 s, same output
+/// (docs/design-notes.md).
 pub fn layer_major_window_from_env() -> usize {
-    let on = std::env::var("STREAMMOE_Q38_LAYER_MAJOR").is_ok_and(|v| v == "1");
-    if !on {
+    if std::env::var("STREAMMOE_Q38_LAYER_MAJOR").is_ok_and(|v| v == "0") {
         return 0;
     }
     env_usize("STREAMMOE_Q38_WINDOW").unwrap_or(DEFAULT_LAYER_MAJOR_WINDOW)

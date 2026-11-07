@@ -173,8 +173,9 @@ fn ctx_checkpoints_round_trip() {
 }
 
 /// The default prefill settings through the context under a cap: a
-/// 560-token prompt runs as a 512-token chunk plus 48 (prefill staging
-/// at the padded stride, whole-layer reads, reads overlapping the GPU),
+/// 560-token prompt runs as one layer-major window of a 512-token chunk
+/// plus 48 (prefill staging at the padded stride, whole-layer reads,
+/// reads overlapping the GPU),
 /// matches `eval_token` row by row on its last row within the Metal
 /// tolerance, and the footprint stays under the cap; with the hot
 /// tier, bit for bit the same logits as without.

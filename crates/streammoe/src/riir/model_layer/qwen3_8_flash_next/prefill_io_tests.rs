@@ -78,6 +78,8 @@ fn io(dir: &Path, es: usize) -> Q38PrefillIo {
     let mut io = Q38PrefillIo::for_root(&root(dir), N_CTX, es);
     io.chunk = 512;
     io.slots = 64;
+    // Chunk-major (layer-major arms set their window, `io_lm`).
+    io.window = 0;
     io
 }
 
